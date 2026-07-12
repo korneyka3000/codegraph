@@ -8,7 +8,7 @@ dependencies = [
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "rich>=13.7",
-    "protobuf>=5.26",
+    "protobuf>=7.35,<8",
     "falkordb>=1.0.10",
 ]
 
