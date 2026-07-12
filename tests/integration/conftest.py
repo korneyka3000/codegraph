@@ -1,15 +1,19 @@
-"""Общие хелперы для интеграционных тестов."""
+"""Общие фикстуры для интеграционных тестов."""
 
 from __future__ import annotations
+
+import pytest
 
 from codegraph.config.models import FalkorDBConfig
 from codegraph.stores.falkordb.connection import StoreUnavailable, ping
 
 
-def falkordb_available() -> bool:
-    """True, если FalkorDB отвечает на дефолтный host:port из конфига."""
+@pytest.fixture
+def falkordb_cfg() -> FalkorDBConfig:
+    """Конфиг живого FalkorDB; skip, если инстанс недоступен."""
+    cfg = FalkorDBConfig()
     try:
-        ping(FalkorDBConfig())
-        return True
+        ping(cfg)
     except StoreUnavailable:
-        return False
+        pytest.skip("FalkorDB not running")
+    return cfg
