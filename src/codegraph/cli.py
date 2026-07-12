@@ -60,6 +60,101 @@ def doctor(
     raise typer.Exit(0 if ok else 1)
 
 
+STAGES = [
+    ("S1", "discover", "конфиг / zero-config, валидация путей"),
+    ("S2", "scan", "обход .py, sha256"),
+    ("S3", "resolve", "scip-python per service"),
+    ("S4", "read-scip", "protobuf → defs/refs"),
+    ("S5", "parse+extract", "tree-sitter, идиомы → claims"),
+    ("S6", "join", "SCIP refs × call-sites → CALLS"),
+    ("S7", "link", "каналы, роуты, NEXT_SEGMENT, процессы"),
+    ("S8", "chunk+embed", "AST-чанки + эмбеддинги"),
+    ("S9", "load", "UNWIND-батчи → FalkorDB (blue/green)"),
+    ("S10", "report", "качество графа"),
+]
+
+TEMPLATE = Path(__file__).parent.parent.parent / "codegraph.example.yaml"
+
+
+@app.command()
+def index(
+    target: Path = typer.Argument(Path.cwd()),  # noqa: B008 -- typer marker call, idiomatic
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Построить граф workspace (M0: только --dry-run)."""
+    cfg = load_workspace(target)
+    if not dry_run:
+        console.print("[yellow]index is not implemented until M1; use --dry-run[/]")
+        raise typer.Exit(2)
+    from codegraph.config.loader import effective_idioms
+
+    stage_table = Table(title=f"pipeline plan · graph={cfg.graph_name}")
+    stage_table.add_column("stage")
+    stage_table.add_column("name")
+    stage_table.add_column("what")
+    for sid, name, what in STAGES:
+        stage_table.add_row(sid, name, what)
+    console.print(stage_table)
+
+    svc_table = Table(title="services")
+    for col in ("service", "path", "producers", "consumers", "http_clients"):
+        svc_table.add_column(col)
+    for svc in cfg.services:
+        idioms = effective_idioms(cfg, svc)
+        svc_table.add_row(
+            svc.name, str(svc.path),
+            str(len(idioms.producers)), str(len(idioms.consumers)),
+            str(len(idioms.http_clients)),
+        )
+    console.print(svc_table)
+
+
+@app.command()
+def init(target: Path = typer.Argument(Path.cwd())) -> None:  # noqa: B008 -- typer marker call, idiomatic
+    """Создать codegraph.yaml из прокомментированного шаблона."""
+    dest = target / "codegraph.yaml"
+    if dest.exists():
+        console.print(f"[red]{dest} already exists[/]")
+        raise typer.Exit(1)
+    dest.write_text(TEMPLATE.read_text())
+    console.print(f"created {dest}")
+
+
+def _stub(milestone: str) -> None:
+    console.print(f"[yellow]planned for {milestone}[/]")
+    raise typer.Exit(2)
+
+
+@app.command()
+def stats() -> None:
+    """Статистика графа (M1)."""
+    _stub("M1")
+
+
+@app.command()
+def load() -> None:
+    """Загрузка в FalkorDB из staging (M1)."""
+    _stub("M1")
+
+
+@app.command()
+def trace() -> None:
+    """Трассировка бизнес-процесса (M2)."""
+    _stub("M2")
+
+
+@app.command()
+def serve() -> None:
+    """MCP-сервер (M1: v0)."""
+    _stub("M1")
+
+
+@app.command()
+def eval() -> None:
+    """Оценка качества графа/retrieval (M2)."""
+    _stub("M2")
+
+
 def main() -> None:
     app()
 
