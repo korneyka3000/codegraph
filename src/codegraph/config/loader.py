@@ -56,7 +56,7 @@ def load_workspace(target: Path) -> WorkspaceConfig:
     try:
         resolve_builtins(cfg.builtin_idioms)
     except KeyError as e:
-        raise ConfigError(str(e)) from e
+        raise ConfigError(e.args[0]) from e
     return cfg
 
 

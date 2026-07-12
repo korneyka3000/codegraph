@@ -31,7 +31,7 @@ def _cmd_version(name: str, args: list[str], timeout: int = 30) -> CheckResult:
         out = subprocess.run(
             args, capture_output=True, text=True, timeout=timeout, check=True
         )
-        return CheckResult(name, True, out.stdout.strip().splitlines()[0])
+        return CheckResult(name, True, (out.stdout.strip().splitlines() or ["<no stdout>"])[0])
     except (subprocess.SubprocessError, OSError) as e:
         return CheckResult(name, False, str(e))
 

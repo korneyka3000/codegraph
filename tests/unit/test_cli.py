@@ -43,7 +43,9 @@ def test_init_defaults_to_cwd(tmp_path, monkeypatch):
 
 
 def test_stub_commands_exit_2():
-    for cmd, milestone in [("stats", "M1"), ("trace", "M2"), ("serve", "M1"), ("eval", "M2")]:
+    for cmd, milestone in [
+        ("stats", "M1"), ("load", "M1"), ("trace", "M2"), ("serve", "M1"), ("eval", "M2")
+    ]:
         result = runner.invoke(app, [cmd])
         assert result.exit_code == 2, cmd
         assert milestone in result.output

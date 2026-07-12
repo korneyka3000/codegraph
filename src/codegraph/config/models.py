@@ -22,7 +22,7 @@ DEFAULT_BUILTIN_IDIOMS = [
 
 
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class ValueSpec(_Strict):
