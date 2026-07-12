@@ -1,0 +1,17 @@
+services:
+  falkordb:
+    image: falkordb/falkordb:v4.18.11
+    container_name: codegraph-falkordb
+    ports:
+      - "6379:6379"
+      - "3000:3000"   # FalkorDB Browser (визуальный обзор графа)
+    volumes:
+      - falkordb-data:/var/lib/falkordb/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  falkordb-data:
