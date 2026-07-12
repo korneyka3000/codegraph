@@ -33,6 +33,15 @@ def test_init_writes_template_and_refuses_overwrite(tmp_path):
     assert "exists" in again.output
 
 
+def test_init_defaults_to_cwd(tmp_path, monkeypatch):
+    # Регрессия: Path.cwd() должен вычисляться при вызове команды, а не при
+    # импорте модуля (typer вычисляет default-выражения один раз при импорте).
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "codegraph.yaml").exists()
+
+
 def test_stub_commands_exit_2():
     for cmd, milestone in [("stats", "M1"), ("trace", "M2"), ("serve", "M1"), ("eval", "M2")]:
         result = runner.invoke(app, [cmd])

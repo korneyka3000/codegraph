@@ -78,11 +78,14 @@ TEMPLATE = Path(__file__).parent.parent.parent / "codegraph.example.yaml"
 
 @app.command()
 def index(
-    target: Path = typer.Argument(Path.cwd()),  # noqa: B008 -- typer marker call, idiomatic
+    target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     """Построить граф workspace (M0: только --dry-run)."""
-    cfg = load_workspace(target)
+    # Path.cwd() читается здесь, а не в default параметра: default-выражения
+    # typer вычисляются один раз при импорте модуля, а не при каждом вызове
+    # (см. комментарий в doctor).
+    cfg = load_workspace(target if target is not None else Path.cwd())
     if not dry_run:
         console.print("[yellow]index is not implemented until M1; use --dry-run[/]")
         raise typer.Exit(2)
@@ -110,9 +113,10 @@ def index(
 
 
 @app.command()
-def init(target: Path = typer.Argument(Path.cwd())) -> None:  # noqa: B008 -- typer marker call, idiomatic
+def init(target: Path | None = typer.Argument(None)) -> None:  # noqa: B008 -- typer marker call, idiomatic
     """Создать codegraph.yaml из прокомментированного шаблона."""
-    dest = target / "codegraph.yaml"
+    # Path.cwd() — в теле функции, не в default (см. комментарий в doctor).
+    dest = (target if target is not None else Path.cwd()) / "codegraph.yaml"
     if dest.exists():
         console.print(f"[red]{dest} already exists[/]")
         raise typer.Exit(1)
