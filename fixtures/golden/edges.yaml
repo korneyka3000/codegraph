@@ -1,0 +1,58 @@
+# Эталонные рёбра, размеченные вручную по коду fixtures/services.
+# При изменении фикстур — обновлять синхронно. Формат dst: symbol XOR channel.
+version: 1
+edges:
+  # --- orders-api: внутрисервисные CALLS и DI ---
+  - src: {service: orders-api, symbol: app.routes.orders.create_order}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.services.order.OrderService.place}
+  - src: {service: orders-api, symbol: app.routes.orders.create_order}
+    type: DEPENDS_ON
+    dst: {service: orders-api, symbol: app.db.session.get_db}
+  - src: {service: orders-api, symbol: app.routes.orders.get_order}
+    type: DEPENDS_ON
+    dst: {service: orders-api, symbol: app.db.session.get_db}
+  - src: {service: orders-api, symbol: app.services.order.OrderService.place}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.services.order.OrderService._persist}
+  - src: {service: orders-api, symbol: app.services.order.OrderService.place}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.db.outbox.OutboxRepository.add_event}
+  # --- outbox producer → канал типа события ---
+  - src: {service: orders-api, symbol: app.services.order.OrderService.place}
+    type: PRODUCES
+    dst: {channel: "chan:event_type:OrderCreated"}
+  # --- kyc-worker: consumer, temporal, http-клиент ---
+  - src: {service: kyc-worker, symbol: app.consumers.orders.handle_order_created}
+    type: CONSUMES
+    dst: {channel: "chan:event_type:OrderCreated"}
+  - src: {service: kyc-worker, symbol: app.consumer_main.run_consumer}
+    type: CONSUMES
+    dst: {channel: "chan:kafka_topic:orders.events"}
+  - src: {service: kyc-worker, symbol: app.consumers.orders.handle_order_created}
+    type: CALLS
+    dst: {service: kyc-worker, symbol: app.workflows.kyc.KycWorkflow.run}
+  - src: {service: kyc-worker, symbol: app.workflows.kyc.KycWorkflow.run}
+    type: INVOKES_ACTIVITY
+    dst: {service: kyc-worker, symbol: app.activities.documents.verify_documents}
+  - src: {service: kyc-worker, symbol: app.activities.documents.verify_documents}
+    type: CALLS
+    dst: {service: kyc-worker,
+          symbol: app.clients.document_management_client.DocumentManagementClient.get_document}
+  - src: {service: kyc-worker,
+          symbol: app.clients.document_management_client.DocumentManagementClient.get_document}
+    type: CALLS_HTTP
+    dst: {channel: "chan:http:document-management:GET /documents/{doc_id}"}
+  # --- document-management: HANDLES и builtin aiokafka producer ---
+  - src: {service: document-management, symbol: app.routes.documents.get_document}
+    type: HANDLES
+    dst: {channel: "chan:http:document-management:GET /documents/{doc_id}"}
+  - src: {service: document-management, symbol: app.routes.documents.create_document}
+    type: CALLS
+    dst: {service: document-management, symbol: app.events.producer.emit_document_indexed}
+  - src: {service: document-management, symbol: app.events.producer.emit_document_indexed}
+    type: PRODUCES
+    dst: {channel: "chan:kafka_topic:documents.indexed"}
+channels:
+  - id: "chan:kafka_topic:orders.events"
+    contains: ["chan:event_type:OrderCreated"]

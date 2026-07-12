@@ -1,0 +1,13 @@
+version: 1
+traces:
+  - entrypoint: "orders-api:POST /orders"
+    segments:
+      - service: orders-api
+        entry: {symbol: app.routes.orders.create_order}
+        via_channel: null
+      - service: kyc-worker
+        entry: {symbol: app.consumers.orders.handle_order_created}
+        via_channel: "chan:event_type:OrderCreated"
+      - service: document-management
+        entry: {symbol: app.routes.documents.get_document}
+        via_channel: "chan:http:document-management:GET /documents/{doc_id}"
