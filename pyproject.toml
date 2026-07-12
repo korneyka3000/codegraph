@@ -1,0 +1,45 @@
+[project]
+name = "codegraph"
+version = "0.1.0"
+description = "Code knowledge graph RAG for Python microservices: CLI indexer + MCP server"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+    "protobuf>=5.26",
+    "falkordb>=1.0.10",
+]
+
+[project.scripts]
+codegraph = "codegraph.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.5",
+    "grpcio-tools>=1.64",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codegraph"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "falkordb: requires a running FalkorDB instance (docker compose up -d)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["fixtures"]  # код-как-данные для индексации, не линтим
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
