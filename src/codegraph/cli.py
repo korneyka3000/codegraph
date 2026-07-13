@@ -11,8 +11,20 @@ from rich.table import Table
 from codegraph.config.loader import ConfigError, load_workspace
 from codegraph.config.models import WorkspaceConfig
 from codegraph.doctor import run_env_checks, run_store_probes
+from codegraph.pipeline.analyze import analyze_service
+from codegraph.pipeline.load import load_graph
+from codegraph.pipeline.report import build_report, print_report, write_report
 from codegraph.pipeline.stages import STAGES
+from codegraph.stores.falkordb.store import FalkorStore
+from codegraph.stores.staging import Staging
 
+# analyze_service/load_graph/FalkorStore/Staging импортированы по имени (не через
+# module-алиас) НАМЕРЕННО: юнит-тесты (tests/unit/test_cli_m1b.py) monkeypatch'ат
+# ровно эти module-level имена (`codegraph.cli.analyze_service` и т.д.), подставляя
+# фейки вместо реального SCIP/FalkorDB -- сработает только если имя резолвится из
+# ГЛОБАЛЬНОГО namespace codegraph.cli на момент вызова, а не из локального импорта
+# внутри тела команды (см. существующий паттерн лениво импортируемого `connect` в
+# doctor() -- та же техника здесь была бы непатчибельной).
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 console = Console()
 
@@ -50,6 +62,22 @@ def _load(target: Path) -> WorkspaceConfig:
         raise typer.Exit(1) from e
 
 
+def _workspace_dir(cfg: WorkspaceConfig, target: Path) -> Path:
+    """Каталог для `.codegraph/` (staging.db, scip-кэш, report.json): та же
+    директория, что config.loader.load_workspace использует как базу для
+    относительных путей сервисов -- рядом с codegraph.yaml, если target на него
+    указывает (напрямую или через каталог, где он лежит), иначе (zero-config)
+    корень индексируемого репозитория. cfg сейчас не читается (нет config-поля,
+    переопределяющего расположение workspace), параметр зарезервирован под
+    контракт из брифа m1b-task-6 и возможное будущее переопределение."""
+    target = target.resolve()
+    return target if target.is_dir() else target.parent
+
+
+def _resolve_graph_name(cfg: WorkspaceConfig, graph: str | None) -> str:
+    return graph if graph is not None else cfg.graph_name
+
+
 @app.command()
 def doctor(
     config: Path | None = typer.Option(None, "--config", "-c"),  # noqa: B008 -- typer marker call, idiomatic
@@ -79,36 +107,57 @@ TEMPLATE = Path(__file__).parent.parent.parent / "codegraph.example.yaml"
 def index(
     target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
     dry_run: bool = typer.Option(False, "--dry-run"),
+    graph: str | None = typer.Option(None, "--graph"),
 ) -> None:
-    """Построить граф workspace (M0: только --dry-run)."""
+    """Построить граф workspace: scan → resolve → extract → join → load → report
+    (`--dry-run` — только план пайплайна, без записи)."""
     # Path.cwd() читается здесь, а не в default параметра: default-выражения
     # typer вычисляются один раз при импорте модуля, а не при каждом вызове
     # (см. комментарий в doctor).
-    cfg = _load(target if target is not None else Path.cwd())
-    if not dry_run:
-        console.print("[yellow]index is not implemented until M1; use --dry-run[/]")
-        raise typer.Exit(2)
-    from codegraph.config.loader import effective_idioms
+    target_path = target if target is not None else Path.cwd()
+    cfg = _load(target_path)
+    graph_name = _resolve_graph_name(cfg, graph)
 
-    stage_table = Table(title=f"pipeline plan · graph={cfg.graph_name}")
-    stage_table.add_column("stage")
-    stage_table.add_column("name")
-    stage_table.add_column("what")
-    for sid, name, what in STAGES:
-        stage_table.add_row(sid, name, what)
-    console.print(stage_table)
+    if dry_run:
+        from codegraph.config.loader import effective_idioms
 
-    svc_table = Table(title="services")
-    for col in ("service", "path", "producers", "consumers", "http_clients"):
-        svc_table.add_column(col)
-    for svc in cfg.services:
-        idioms = effective_idioms(cfg, svc)
-        svc_table.add_row(
-            svc.name, str(svc.path),
-            str(len(idioms.producers)), str(len(idioms.consumers)),
-            str(len(idioms.http_clients)),
+        stage_table = Table(title=f"pipeline plan · graph={graph_name}")
+        stage_table.add_column("stage")
+        stage_table.add_column("name")
+        stage_table.add_column("what")
+        for sid, name, what in STAGES:
+            stage_table.add_row(sid, name, what)
+        console.print(stage_table)
+
+        svc_table = Table(title="services")
+        for col in ("service", "path", "producers", "consumers", "http_clients"):
+            svc_table.add_column(col)
+        for svc in cfg.services:
+            idioms = effective_idioms(cfg, svc)
+            svc_table.add_row(
+                svc.name, str(svc.path),
+                str(len(idioms.producers)), str(len(idioms.consumers)),
+                str(len(idioms.http_clients)),
+            )
+        console.print(svc_table)
+        return
+
+    # полный прогон: S1–S6 (analyze_service, per service) → S9 (load_graph,
+    # blue/green) → S10 (report). Деградация отдельных сервисов (SCIP недоступен →
+    # эвристический fallback) НЕ валит exit — print_report печатает жёлтый блок,
+    # но код возврата остаётся 0 (см. self-review брифа m1b-task-6).
+    codegraph_dir = _workspace_dir(cfg, target_path) / ".codegraph"
+    with Staging(codegraph_dir / "staging.db") as staging:
+        per_service = [
+            analyze_service(svc, staging, codegraph_dir / "scip") for svc in cfg.services
+        ]
+        load_stats = load_graph(
+            staging, lambda name: FalkorStore(cfg.storage.falkordb, name), graph_name
         )
-    console.print(svc_table)
+
+    report = build_report(per_service, load_stats)
+    write_report(report, codegraph_dir / "report.json")
+    print_report(report, console)
 
 
 @app.command()
@@ -129,15 +178,75 @@ def _stub(milestone: str) -> None:
 
 
 @app.command()
-def stats() -> None:
-    """Статистика графа (M1)."""
-    _stub("M1")
+def stats(
+    target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
+    graph: str | None = typer.Option(None, "--graph"),
+) -> None:
+    """Статистика графа: узлы по kind, рёбра по type (FalkorStore.stats())."""
+    cfg = _load(target if target is not None else Path.cwd())
+    graph_name = _resolve_graph_name(cfg, graph)
+    store = FalkorStore(cfg.storage.falkordb, graph_name)
+    try:
+        data = store.stats()
+    except Exception as e:
+        # На пиненной версии FalkorDB (см. connection.py/store.py) stats() на
+        # никогда не индексированном графе не падает -- отдаёт честные нули
+        # (GRAPH.QUERY молча создаёт пустой граф-ключ, как и любой MATCH). Ветка
+        # ниже — защитная страховка на случай другого поведения (другая версия
+        # FalkorDB, обрыв соединения): один красный однострочник, без traceback.
+        console.print(
+            f"[red]graph {graph_name!r} not found or unreachable — "
+            f"run 'codegraph index' first ({e})[/]"
+        )
+        raise typer.Exit(1) from e
+
+    nodes_table = Table(title=f"nodes by kind · graph={graph_name}")
+    nodes_table.add_column("kind")
+    nodes_table.add_column("count", justify="right")
+    for kind, count in sorted(data.get("nodes", {}).items()):
+        nodes_table.add_row(kind, str(count))
+    console.print(nodes_table)
+
+    edges_table = Table(title="edges by type")
+    edges_table.add_column("type")
+    edges_table.add_column("count", justify="right")
+    for edge_type, count in sorted(data.get("edges", {}).items()):
+        edges_table.add_row(edge_type, str(count))
+    console.print(edges_table)
 
 
 @app.command()
-def load() -> None:
-    """Загрузка в FalkorDB из staging (M1)."""
-    _stub("M1")
+def load(
+    target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
+    graph: str | None = typer.Option(None, "--graph"),
+) -> None:
+    """Загрузить существующий staging (SQLite, из предыдущего `index`) в FalkorDB
+    (blue/green), без повторного анализа."""
+    target_path = target if target is not None else Path.cwd()
+    cfg = _load(target_path)
+    staging_path = _workspace_dir(cfg, target_path) / ".codegraph" / "staging.db"
+    if not staging_path.exists():
+        console.print(
+            f"[red]no staging DB at {staging_path}; run 'codegraph index' first[/]"
+        )
+        raise typer.Exit(1)
+
+    graph_name = _resolve_graph_name(cfg, graph)
+    with Staging(staging_path) as staging:
+        load_stats = load_graph(
+            staging, lambda name: FalkorStore(cfg.storage.falkordb, name), graph_name
+        )
+
+    table = Table(title=f"load · graph={graph_name}")
+    table.add_column("nodes_written")
+    table.add_column("edges_written")
+    table.add_column("edges_dropped")
+    table.add_row(
+        str(load_stats.get("nodes_written", 0)),
+        str(load_stats.get("edges_written", 0)),
+        str(load_stats.get("edges_dropped_missing_endpoint", 0)),
+    )
+    console.print(table)
 
 
 @app.command()

@@ -17,10 +17,18 @@ def test_index_dry_run_lists_stages_and_services():
     assert "kyc-worker" in result.output
 
 
-def test_index_without_dry_run_not_implemented():
-    result = runner.invoke(app, ["index", str(FIXTURES_WS)])
-    assert result.exit_code == 2
-    assert "M1" in result.output
+# test_index_without_dry_run_not_implemented (M0-era: asserted exit_code==2 + "M1" in
+# output) removed in M1b Task 6 -- `index` without --dry-run now does a REAL full
+# pipeline run (scan/resolve/extract/join/load/report), which needs a live FalkorDB
+# and either network+npx or the degraded heuristic fallback; that contract is no
+# longer expressible as a fast, hermetic assertion in this file. Real-pipeline
+# coverage moved to tests/unit/test_cli_m1b.py (monkeypatched analyze_service/
+# load_graph/FalkorStore) and tests/integration/test_e2e_index.py (markers scip +
+# falkordb, real pipeline on a tmp_path fixture copy). Running the old assertion
+# as-is against this repo's live FalkorDB actually executed the full pipeline
+# against fixtures/workspace.yaml -- leaving `.codegraph/` inside fixtures/ and a
+# stray "fixtures" graph on the shared FalkorDB instance; both were cleaned up by
+# hand while diagnosing this (see m1b-task-6-report.md).
 
 
 def test_init_writes_template_and_refuses_overwrite(tmp_path):
@@ -43,9 +51,9 @@ def test_init_defaults_to_cwd(tmp_path, monkeypatch):
 
 
 def test_stub_commands_exit_2():
-    for cmd, milestone in [
-        ("stats", "M1"), ("load", "M1"), ("trace", "M2"), ("serve", "M1"), ("eval", "M2")
-    ]:
+    # stats/load left this list in M1b Task 6 -- both are real commands now (see
+    # tests/unit/test_cli_m1b.py); trace/eval stay M2, serve stays a stub until Task 7.
+    for cmd, milestone in [("trace", "M2"), ("serve", "M1"), ("eval", "M2")]:
         result = runner.invoke(app, [cmd])
         assert result.exit_code == 2, cmd
         assert milestone in result.output
