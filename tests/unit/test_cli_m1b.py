@@ -13,9 +13,20 @@ from typer.testing import CliRunner
 
 from codegraph.cli import app
 from codegraph.config.models import FalkorDBConfig
+from codegraph.stores.falkordb.connection import StoreError
 from codegraph.stores.staging import Staging
 
 runner = CliRunner()
+
+
+def test_store_error_is_redis_error_alias():
+    """Граница импортов: cli ловит redis-ошибки ТОЛЬКО через алиас
+    connection.StoreError (cli не импортирует redis напрямую) -- алиас обязан
+    оставаться идентичен redis.exceptions.RedisError, базовому классу всех
+    ошибок redis-py (включая ConnectionError/TimeoutError)."""
+    import redis.exceptions
+
+    assert StoreError is redis.exceptions.RedisError
 
 
 def _write_workspace(tmp_path: Path, n_services: int = 1, graph_name: str = "wsgraph") -> Path:
@@ -188,6 +199,22 @@ def test_index_dry_run_does_not_touch_codegraph_dir_or_call_pipeline(tmp_path, m
     assert not (root / ".codegraph").exists()
 
 
+def test_index_store_unreachable_is_red_error_exit_1(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
+
+    def unreachable_load_graph(staging, store_factory, graph_name):
+        raise StoreError("Connection refused")
+
+    monkeypatch.setattr("codegraph.cli.analyze_service", _fake_analyze_service([]))
+    monkeypatch.setattr("codegraph.cli.load_graph", unreachable_load_graph)
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeFalkorStore)
+
+    result = runner.invoke(app, ["index", str(root)])
+    assert result.exit_code == 1
+    assert "falkordb unreachable" in result.output
+    assert "Traceback" not in result.output
+
+
 # -- load: только load_graph из существующего staging --
 
 
@@ -228,6 +255,21 @@ def test_load_graph_option_overrides_config_graph_name(tmp_path, monkeypatch):
     assert load_calls[0]["graph_name"] == "override999"
 
 
+def test_load_store_unreachable_is_red_error_exit_1(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
+    Staging(root / ".codegraph" / "staging.db").close()
+
+    def unreachable_load_graph(staging, store_factory, graph_name):
+        raise StoreError("Connection refused")
+
+    monkeypatch.setattr("codegraph.cli.load_graph", unreachable_load_graph)
+
+    result = runner.invoke(app, ["load", str(root)])
+    assert result.exit_code == 1
+    assert "falkordb unreachable" in result.output
+    assert "Traceback" not in result.output
+
+
 # -- stats: FalkorStore.stats() -> rich-таблицы --
 
 
@@ -235,6 +277,9 @@ class _FakeStatsStore:
     def __init__(self, cfg, name):
         self.cfg = cfg
         self.name = name
+
+    def graph_exists(self):
+        return True
 
     def stats(self):
         return {"nodes": {"Function": 3, "Module": 2}, "edges": {"CALLS": 4}}
@@ -259,6 +304,9 @@ def test_stats_uses_graph_option_over_config_default(tmp_path, monkeypatch):
             captured["cfg"] = cfg
             captured["name"] = name
 
+        def graph_exists(self):
+            return True
+
         def stats(self):
             return {"nodes": {}, "edges": {}}
 
@@ -270,8 +318,15 @@ def test_stats_uses_graph_option_over_config_default(tmp_path, monkeypatch):
 
 
 class _FakeEmptyStatsStore:
+    """Граф-ключ СУЩЕСТВУЕТ (после index), но пуст -- отличается от «не индексировали
+    вовсе» (_FakeMissingGraphStore ниже): пустой существующий граф -- честные нули,
+    exit 0; несуществующий -- ошибка «not found», exit 1."""
+
     def __init__(self, cfg, name):
         pass
+
+    def graph_exists(self):
+        return True
 
     def stats(self):
         return {"nodes": {}, "edges": {}}
@@ -285,18 +340,60 @@ def test_stats_empty_graph_is_honest_zeros_not_an_error(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
 
 
-class _FakeFailingStatsStore:
+class _FakeMissingGraphStore:
+    stats_called = False  # class-level: инстанс создаёт сам cli, тест видит класс
+
     def __init__(self, cfg, name):
         pass
 
+    def graph_exists(self):
+        return False
+
     def stats(self):
-        raise RuntimeError("boom")
+        type(self).stats_called = True
+        raise AssertionError(
+            "stats() must not be called when the graph does not exist -- "
+            "GRAPH.QUERY would auto-vivify an empty graph key as a side effect"
+        )
 
 
-def test_stats_store_failure_is_red_error_exit_1(tmp_path, monkeypatch):
-    root = _write_workspace(tmp_path, n_services=1)
-    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeFailingStatsStore)
+def test_stats_never_indexed_graph_is_not_found_exit_1(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeMissingGraphStore)
+    monkeypatch.setattr(_FakeMissingGraphStore, "stats_called", False)
 
     result = runner.invoke(app, ["stats", str(root)])
     assert result.exit_code == 1
+    assert "not found" in result.output
+    assert "codegraph index" in result.output
+    # выделенное not-found сообщение, НЕ ветка недоступности store
+    assert "unreachable" not in result.output
+    assert "Traceback" not in result.output
+    # существование проверено ДО первого GRAPH.QUERY: stats() не звался вовсе
+    # (иначе сам запрос auto-vivify'ил бы пустой граф-ключ как побочный эффект)
+    assert _FakeMissingGraphStore.stats_called is False
+
+
+class _FakeUnreachableStore:
+    # test_stats_store_failure_is_red_error_exit_1 (broad `except Exception` around
+    # stats(), RuntimeError fake) replaced by this + the narrow-boundary contract:
+    # cli catches ONLY (StoreError, StoreUnavailable); any other exception is a real
+    # bug and must propagate as a traceback, not be masked by a friendly message.
+    def __init__(self, cfg, name):
+        pass
+
+    def graph_exists(self):
+        raise StoreError("Connection refused")
+
+    def stats(self):
+        raise StoreError("Connection refused")
+
+
+def test_stats_store_unreachable_is_red_error_exit_1(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, n_services=1)
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeUnreachableStore)
+
+    result = runner.invoke(app, ["stats", str(root)])
+    assert result.exit_code == 1
+    assert "falkordb unreachable" in result.output
     assert "Traceback" not in result.output

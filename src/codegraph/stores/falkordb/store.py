@@ -117,6 +117,16 @@ class FalkorStore:
         edges = self._g.query("MATCH ()-[e]->() RETURN type(e), count(e)")
         return {"nodes": dict(nodes.result_set), "edges": dict(edges.result_set)}
 
+    def graph_exists(self) -> bool:
+        """True, если граф-ключ self.graph_name существует (membership в GRAPH.LIST).
+
+        Единственный read-only способ спросить о существовании: любой GRAPH.QUERY
+        (включая безобидный MATCH из stats()) auto-vivify'ит пустой граф-ключ как
+        побочный эффект (наблюдалось живьём на v4.18.11 в T6) -- поэтому cli.stats
+        проверяет существование ИМЕННО этим методом ДО первого запроса, и redis-вызов
+        остаётся внутри stores/falkordb/ (граница импортов)."""
+        return self.graph_name in self._connect().list_graphs()
+
     def swap_in(self, build_name: str) -> None:
         """Blue/green: атомарный Redis `RENAME build_name self.graph_name` --
         перезаписывает существующий self.graph_name целиком, если он был (стандартная

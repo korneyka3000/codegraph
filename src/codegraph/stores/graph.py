@@ -36,6 +36,8 @@ class GraphStore(Protocol):
 
     def stats(self) -> dict: ...
 
+    def graph_exists(self) -> bool: ...  # граф-ключ существует; read-only (без auto-vivify)
+
     def swap_in(self, build_name: str) -> None: ...  # blue/green: RENAME build_name -> self
 
     def delete_graph(self) -> None: ...  # удалить СВОЙ граф-ключ, если есть (идемпотентно)

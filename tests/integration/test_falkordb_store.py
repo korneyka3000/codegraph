@@ -138,3 +138,24 @@ def test_neighbors_on_nonexistent_node_returns_empty(falkordb_cfg):
         assert store.neighbors("no-such-id", None, "both", limit=10) == []
     finally:
         _cleanup(falkordb_cfg, EMPTY)
+
+
+EXISTS = "__t6exists__"
+
+
+def test_graph_exists_is_read_only_and_flips_after_write(falkordb_cfg):
+    """graph_exists() (M1b T6 fix A): False для никогда не индексированного имени,
+    и -- критично -- БЕЗ auto-vivify побочного эффекта (в отличие от GRAPH.QUERY,
+    который создаёт пустой граф-ключ даже на чистом MATCH; живьём наблюдалось в T6
+    при stats()-пробе несуществующего графа). После первой записи -- True."""
+    store = FalkorStore(falkordb_cfg, EXISTS)
+    try:
+        assert store.graph_exists() is False
+        # read-only доказательство: сам вызов graph_exists не создал ключ
+        assert EXISTS not in connect(falkordb_cfg).list_graphs()
+        assert store.graph_exists() is False
+
+        store.upsert_nodes(("Service",), [{"id": "svc:t6e", "props": {"kind": "Service"}}])
+        assert store.graph_exists() is True
+    finally:
+        _cleanup(falkordb_cfg, EXISTS)

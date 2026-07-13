@@ -15,6 +15,7 @@ from codegraph.pipeline.analyze import analyze_service
 from codegraph.pipeline.load import load_graph
 from codegraph.pipeline.report import build_report, print_report, write_report
 from codegraph.pipeline.stages import STAGES
+from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
 from codegraph.stores.falkordb.store import FalkorStore
 from codegraph.stores.staging import Staging
 
@@ -76,6 +77,19 @@ def _workspace_dir(cfg: WorkspaceConfig, target: Path) -> Path:
 
 def _resolve_graph_name(cfg: WorkspaceConfig, graph: str | None) -> str:
     return graph if graph is not None else cfg.graph_name
+
+
+def _store_guard(fn):
+    """Единая граница store-недоступности для команд, трогающих FalkorDB
+    (index/load: load_graph; stats: graph_exists/stats): недостижимый инстанс ->
+    красный однострочник + exit 1. Except УЗКИЙ -- ровно (StoreError=redis.
+    RedisError, StoreUnavailable): любое другое исключение -- настоящий баг и
+    обязано падать traceback'ом, а не маскироваться дружелюбным сообщением."""
+    try:
+        return fn()
+    except (StoreError, StoreUnavailable) as e:
+        console.print(f"[red]falkordb unreachable:[/] {e}")
+        raise typer.Exit(1) from e
 
 
 @app.command()
@@ -151,9 +165,9 @@ def index(
         per_service = [
             analyze_service(svc, staging, codegraph_dir / "scip") for svc in cfg.services
         ]
-        load_stats = load_graph(
+        load_stats = _store_guard(lambda: load_graph(
             staging, lambda name: FalkorStore(cfg.storage.falkordb, name), graph_name
-        )
+        ))
 
     report = build_report(per_service, load_stats)
     write_report(report, codegraph_dir / "report.json")
@@ -186,19 +200,16 @@ def stats(
     cfg = _load(target if target is not None else Path.cwd())
     graph_name = _resolve_graph_name(cfg, graph)
     store = FalkorStore(cfg.storage.falkordb, graph_name)
-    try:
-        data = store.stats()
-    except Exception as e:
-        # На пиненной версии FalkorDB (см. connection.py/store.py) stats() на
-        # никогда не индексированном графе не падает -- отдаёт честные нули
-        # (GRAPH.QUERY молча создаёт пустой граф-ключ, как и любой MATCH). Ветка
-        # ниже — защитная страховка на случай другого поведения (другая версия
-        # FalkorDB, обрыв соединения): один красный однострочник, без traceback.
+    # Существование проверяется ДО первого GRAPH.QUERY: (a) «не индексировали вовсе»
+    # отличается от «индексировали, но граф пуст» (пустой существующий -- честные
+    # нули ниже, exit 0); (b) сам stats()-запрос на несуществующем имени auto-vivify'ил
+    # бы пустой граф-ключ как побочный эффект (см. FalkorStore.graph_exists docstring).
+    if not _store_guard(store.graph_exists):
         console.print(
-            f"[red]graph {graph_name!r} not found or unreachable — "
-            f"run 'codegraph index' first ({e})[/]"
+            f"[red]graph {graph_name!r} not found — run 'codegraph index' first[/]"
         )
-        raise typer.Exit(1) from e
+        raise typer.Exit(1)
+    data = _store_guard(store.stats)
 
     nodes_table = Table(title=f"nodes by kind · graph={graph_name}")
     nodes_table.add_column("kind")
@@ -233,9 +244,9 @@ def load(
 
     graph_name = _resolve_graph_name(cfg, graph)
     with Staging(staging_path) as staging:
-        load_stats = load_graph(
+        load_stats = _store_guard(lambda: load_graph(
             staging, lambda name: FalkorStore(cfg.storage.falkordb, name), graph_name
-        )
+        ))
 
     table = Table(title=f"load · graph={graph_name}")
     table.add_column("nodes_written")
