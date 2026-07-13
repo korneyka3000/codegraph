@@ -8,6 +8,8 @@
 #     "#" или ".__init__" — сам класс, а не его метод;
 #   - self-методы (self.foo()) и методы переменных с известным (аннотированным
 #     или выведенным из конструктора) типом → CALLS на qualified имя метода;
+#   - первопартийные вызовы на уровне модуля (import-time, вне функций/методов) —
+#     тоже рёбра; src.symbol = qualified имя МОДУЛЯ (например app.consumers.orders);
 #   - вызовы внешних пакетов и stdlib (fastapi/aiokafka/temporalio/aiohttp/
 #     pydantic/os/json/...) — НЕ рёбра;
 #   - динамические вызовы (например handler(event) через словарь-диспетчер
@@ -56,13 +58,16 @@ edges:
   - src: {service: orders-api, symbol: app.services.order.OrderService.place}
     type: PRODUCES
     dst: {channel: "chan:event_type:OrderCreated"}
-  # --- orders-api: типизированные переменные (self._db: Session) → Session.execute; get_db ctor ---
+  # --- orders-api: типизированные переменные (self._db: Session) → Session.execute; ctor Order в get; get_db ctor ---
   - src: {service: orders-api, symbol: app.services.order.OrderService._persist}
     type: CALLS
     dst: {service: orders-api, symbol: app.db.session.Session.execute}
   - src: {service: orders-api, symbol: app.services.order.OrderService.get}
     type: CALLS
     dst: {service: orders-api, symbol: app.db.session.Session.execute}
+  - src: {service: orders-api, symbol: app.services.order.OrderService.get}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.models.Order}
   - src: {service: orders-api, symbol: app.db.outbox.OutboxRepository.add_event}
     type: CALLS
     dst: {service: orders-api, symbol: app.db.session.Session.execute}
@@ -70,6 +75,10 @@ edges:
     type: CALLS
     dst: {service: orders-api, symbol: app.db.session.Session}
   # --- kyc-worker: consumer, temporal, http-клиент ---
+  # module-level вызов register_handlers({...}) при импорте: src = узел модуля
+  - src: {service: kyc-worker, symbol: app.consumers.orders}
+    type: CALLS
+    dst: {service: kyc-worker, symbol: app.consumers.base.register_handlers}
   - src: {service: kyc-worker, symbol: app.consumers.orders.handle_order_created}
     type: CONSUMES
     dst: {channel: "chan:event_type:OrderCreated"}
