@@ -63,11 +63,11 @@ def test_scip_lookup_takes_precedence():
 
 def test_contains_edge_endpoints_match_node_ids_with_partial_scip():
     ctx = _ctx()
-    cls_sym = "scip-python python orders-api 0.1 `app.services.order`/OrderService#"
     ctx2 = FileContext(
         service=ctx.service, relpath=ctx.relpath, source=ctx.source, facts=ctx.facts,
-        # класс — через scip, методы — структурно
-        def_symbol_lookup=lambda rp, sb: cls_sym
+        # класс — локальный scip-символ (его node id расходится со структурным
+        # дескриптором), методы — структурно: рекомпутация endpoint'а провалит тест
+        def_symbol_lookup=lambda rp, sb: "local 99"
         if ctx.source[sb:sb + 12] == b"OrderService" else None,
         module_exists=lambda d: False,
     )
@@ -76,6 +76,9 @@ def test_contains_edge_endpoints_match_node_ids_with_partial_scip():
     for e in res.edges:
         if e.type == "CONTAINS" and e.src.startswith("sym:"):
             assert e.src in node_ids and e.dst in node_ids, e
+    local_cls = "sym:orders-api:app/services/order.py:local99"
+    assert local_cls in node_ids
+    assert any(e.dst == local_cls for e in res.edges if e.type == "CONTAINS")
 
 
 def test_relative_import_in_init_resolves_to_own_package():
