@@ -59,3 +59,48 @@ def test_scip_lookup_takes_precedence():
     res = extract(ctx2)
     cls = next(n for n in res.nodes if n.kind == "Class")
     assert cls.id == "sym:orders-api:`app.services.order`/OrderService#"
+
+
+def test_contains_edge_endpoints_match_node_ids_with_partial_scip():
+    ctx = _ctx()
+    cls_sym = "scip-python python orders-api 0.1 `app.services.order`/OrderService#"
+    ctx2 = FileContext(
+        service=ctx.service, relpath=ctx.relpath, source=ctx.source, facts=ctx.facts,
+        # класс — через scip, методы — структурно
+        def_symbol_lookup=lambda rp, sb: cls_sym
+        if ctx.source[sb:sb + 12] == b"OrderService" else None,
+        module_exists=lambda d: False,
+    )
+    res = extract(ctx2)
+    node_ids = {n.id for n in res.nodes}
+    for e in res.edges:
+        if e.type == "CONTAINS" and e.src.startswith("sym:"):
+            assert e.src in node_ids and e.dst in node_ids, e
+
+
+def test_relative_import_in_init_resolves_to_own_package():
+    src = b"from . import order\n"
+    relpath = "app/services/__init__.py"
+    ctx = FileContext(
+        service="orders-api", relpath=relpath, source=src,
+        facts=build_file_facts(relpath, src),
+        def_symbol_lookup=lambda rp, sb: None,
+        module_exists=lambda d: d == "app.services.order",
+    )
+    res = extract(ctx)
+    imports = {e.dst for e in res.edges if e.type == "IMPORTS"}
+    assert "sym:orders-api:`app.services.order`/" in imports
+
+
+def test_relative_import_in_regular_module_unchanged():
+    src = b"from . import sibling\n"
+    relpath = "app/services/order.py"
+    ctx = FileContext(
+        service="orders-api", relpath=relpath, source=src,
+        facts=build_file_facts(relpath, src),
+        def_symbol_lookup=lambda rp, sb: None,
+        module_exists=lambda d: d == "app.services.sibling",
+    )
+    res = extract(ctx)
+    imports = {e.dst for e in res.edges if e.type == "IMPORTS"}
+    assert "sym:orders-api:`app.services.sibling`/" in imports
