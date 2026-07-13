@@ -25,11 +25,13 @@ def test_fixture_workspace_loads():
 def test_golden_edges_wellformed():
     data = yaml.safe_load((FIXTURES / "golden" / "edges.yaml").read_text())
     assert data["version"] == 1
-    assert len(data["edges"]) >= 12
+    assert len(data["edges"]) >= 28
     for e in data["edges"]:
         assert e["type"] in EDGE_TYPES, e
         assert "service" in e["src"] and "symbol" in e["src"]
         assert ("channel" in e["dst"]) != ("symbol" in e["dst"])  # ровно одно
+        if "mechanism" in e:
+            assert isinstance(e["mechanism"], str) and e["mechanism"]
 
 
 def test_golden_traces_reference_channels_from_edges():

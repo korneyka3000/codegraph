@@ -1,8 +1,29 @@
 # Эталонные рёбра, размеченные вручную по коду fixtures/services.
 # При изменении фикстур — обновлять синхронно. Формат dst: symbol XOR channel.
+#
+# Политика разметки golden CALLS (M1b Task 8; истина — код фикстур, не этот файл):
+#   - первопартийные вызовы (внутри fixtures/services/*) размечаются как CALLS;
+#   - конструктор (Foo(...)) → CALLS на узел класса; dst.symbol = qualified имя
+#     класса (например app.services.order.OrderService), БЕЗ суффиксов вида
+#     "#" или ".__init__" — сам класс, а не его метод;
+#   - self-методы (self.foo()) и методы переменных с известным (аннотированным
+#     или выведенным из конструктора) типом → CALLS на qualified имя метода;
+#   - вызовы внешних пакетов и stdlib (fastapi/aiokafka/temporalio/aiohttp/
+#     pydantic/os/json/...) — НЕ рёбра;
+#   - динамические вызовы (например handler(event) через словарь-диспетчер
+#     EVENT_HANDLERS) — НЕ рёбра;
+#   - исключение для Temporal: client.start_workflow(KycWorkflow.run, ...) —
+#     формально вызов внешнего SDK (temporalio.client.Client), но целевой
+#     воркфлоу передаётся первым аргументом; размечается ОДНИМ CALLS-ребром
+#     handle_order_created → KycWorkflow.run с доп. ключом mechanism:
+#     temporal_start (эта связь — не прямой Python-вызов, а Temporal-старт;
+#     механизм фиксируется для M2, eval M1 такие рёбра фильтрует).
 version: 1
 edges:
-  # --- orders-api: внутрисервисные CALLS и DI ---
+  # --- orders-api: routes → OrderService (ctor + вызовы методов) ---
+  - src: {service: orders-api, symbol: app.routes.orders.create_order}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.services.order.OrderService}
   - src: {service: orders-api, symbol: app.routes.orders.create_order}
     type: CALLS
     dst: {service: orders-api, symbol: app.services.order.OrderService.place}
@@ -10,11 +31,24 @@ edges:
     type: DEPENDS_ON
     dst: {service: orders-api, symbol: app.db.session.get_db}
   - src: {service: orders-api, symbol: app.routes.orders.get_order}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.services.order.OrderService}
+  - src: {service: orders-api, symbol: app.routes.orders.get_order}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.services.order.OrderService.get}
+  - src: {service: orders-api, symbol: app.routes.orders.get_order}
     type: DEPENDS_ON
     dst: {service: orders-api, symbol: app.db.session.get_db}
+  # --- orders-api: OrderService.place — ctor Order, self-методы, outbox ---
+  - src: {service: orders-api, symbol: app.services.order.OrderService.place}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.models.Order}
   - src: {service: orders-api, symbol: app.services.order.OrderService.place}
     type: CALLS
     dst: {service: orders-api, symbol: app.services.order.OrderService._persist}
+  - src: {service: orders-api, symbol: app.services.order.OrderService.place}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.db.outbox.OutboxRepository}
   - src: {service: orders-api, symbol: app.services.order.OrderService.place}
     type: CALLS
     dst: {service: orders-api, symbol: app.db.outbox.OutboxRepository.add_event}
@@ -22,6 +56,19 @@ edges:
   - src: {service: orders-api, symbol: app.services.order.OrderService.place}
     type: PRODUCES
     dst: {channel: "chan:event_type:OrderCreated"}
+  # --- orders-api: типизированные переменные (self._db: Session) → Session.execute; get_db ctor ---
+  - src: {service: orders-api, symbol: app.services.order.OrderService._persist}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.db.session.Session.execute}
+  - src: {service: orders-api, symbol: app.services.order.OrderService.get}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.db.session.Session.execute}
+  - src: {service: orders-api, symbol: app.db.outbox.OutboxRepository.add_event}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.db.session.Session.execute}
+  - src: {service: orders-api, symbol: app.db.session.get_db}
+    type: CALLS
+    dst: {service: orders-api, symbol: app.db.session.Session}
   # --- kyc-worker: consumer, temporal, http-клиент ---
   - src: {service: kyc-worker, symbol: app.consumers.orders.handle_order_created}
     type: CONSUMES
@@ -31,10 +78,18 @@ edges:
     dst: {channel: "chan:kafka_topic:orders.events"}
   - src: {service: kyc-worker, symbol: app.consumers.orders.handle_order_created}
     type: CALLS
+    dst: {service: kyc-worker, symbol: app.consumers.orders._temporal}
+  - src: {service: kyc-worker, symbol: app.consumers.orders.handle_order_created}
+    type: CALLS
     dst: {service: kyc-worker, symbol: app.workflows.kyc.KycWorkflow.run}
+    mechanism: temporal_start
   - src: {service: kyc-worker, symbol: app.workflows.kyc.KycWorkflow.run}
     type: INVOKES_ACTIVITY
     dst: {service: kyc-worker, symbol: app.activities.documents.verify_documents}
+  - src: {service: kyc-worker, symbol: app.activities.documents.verify_documents}
+    type: CALLS
+    dst: {service: kyc-worker,
+          symbol: app.clients.document_management_client.DocumentManagementClient}
   - src: {service: kyc-worker, symbol: app.activities.documents.verify_documents}
     type: CALLS
     dst: {service: kyc-worker,
@@ -48,9 +103,24 @@ edges:
   - src: {service: document-management, symbol: app.routes.documents.get_document}
     type: HANDLES
     dst: {channel: "chan:http:document-management:GET /documents/{doc_id}"}
+  - src: {service: document-management, symbol: app.routes.documents.get_document}
+    type: CALLS
+    dst: {service: document-management, symbol: app.services.documents.DocumentService}
+  - src: {service: document-management, symbol: app.routes.documents.get_document}
+    type: CALLS
+    dst: {service: document-management, symbol: app.services.documents.DocumentService.fetch}
+  - src: {service: document-management, symbol: app.routes.documents.create_document}
+    type: CALLS
+    dst: {service: document-management, symbol: app.services.documents.DocumentService}
+  - src: {service: document-management, symbol: app.routes.documents.create_document}
+    type: CALLS
+    dst: {service: document-management, symbol: app.services.documents.DocumentService.store}
   - src: {service: document-management, symbol: app.routes.documents.create_document}
     type: CALLS
     dst: {service: document-management, symbol: app.events.producer.emit_document_indexed}
+  - src: {service: document-management, symbol: app.events.producer.emit_document_indexed}
+    type: CALLS
+    dst: {service: document-management, symbol: app.events.producer.get_producer}
   - src: {service: document-management, symbol: app.events.producer.emit_document_indexed}
     type: PRODUCES
     dst: {channel: "chan:kafka_topic:documents.indexed"}
