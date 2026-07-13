@@ -33,7 +33,7 @@ class ScipRunner:
     def run(self, service_name: str, service_path: Path, venv: Path | None,
             cache_dir: Path, tree_hash: str) -> ScipRunResult:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        out = cache_dir / f"{service_name}-{tree_hash}.scip"
+        out = (cache_dir / f"{service_name}-{tree_hash}.scip").resolve()
         if out.exists():
             return ScipRunResult(scip_path=out, from_cache=True)
 
@@ -57,11 +57,13 @@ class ScipRunner:
             except ProcessLookupError:
                 pass
             proc.wait()
+            out.unlink(missing_ok=True)
             raise ScipRunError(
                 f"scip-python timeout after {self.timeout_s}s for {service_name!r}"
             ) from None
         if proc.returncode != 0 or not out.exists():
             tail = (output or "")[-2000:]
+            out.unlink(missing_ok=True)
             raise ScipRunError(
                 f"scip-python failed for {service_name!r} "
                 f"(exit {proc.returncode}):\n{tail}"

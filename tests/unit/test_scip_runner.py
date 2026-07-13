@@ -1,5 +1,6 @@
 import stat
 import time
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,17 @@ FAKE_FAIL = """#!/usr/bin/env python3
 import sys
 print("boom: cannot resolve environment")
 sys.exit(3)
+"""
+
+FAKE_WRITE_THEN_FAIL = """#!/usr/bin/env python3
+import sys, pathlib
+args = sys.argv[1:]
+out = args[args.index("--output") + 1]
+pathlib.Path(out).write_bytes(b"PARTIAL")
+marker = pathlib.Path(__file__).parent / "invocations.log"
+marker.open("a").write("run\\n")
+print("crashed mid-write")
+sys.exit(5)
 """
 
 
@@ -93,3 +105,26 @@ pathlib.Path(out).write_text(os.environ.get("VIRTUAL_ENV", "") + "|" +
     res = ScipRunner(npx=str(probe)).run("svc", svc, venv, tmp_path / "c", "h")
     env_dump = res.scip_path.read_text()
     assert str(venv) in env_dump and str(venv / "bin") in env_dump
+
+
+def test_output_path_absolute_with_relative_cache_dir(tmp_path, monkeypatch):
+    fake = _mk_fake(tmp_path, FAKE_OK)
+    svc = tmp_path / "svc"
+    svc.mkdir()
+    monkeypatch.chdir(tmp_path)
+    res = ScipRunner(npx=str(fake)).run("svc", svc, None, Path("cachedir"), "h1")
+    assert res.scip_path.is_absolute()
+    assert res.scip_path.read_bytes() == b"FAKE-SCIP"
+
+
+def test_failed_run_does_not_poison_cache(tmp_path):
+    fake = _mk_fake(tmp_path, FAKE_WRITE_THEN_FAIL)
+    svc = tmp_path / "svc"
+    svc.mkdir()
+    r = ScipRunner(npx=str(fake))
+    with pytest.raises(ScipRunError):
+        r.run("svc", svc, None, tmp_path / "cache", "h1")
+    assert not (tmp_path / "cache" / "svc-h1.scip").exists()
+    with pytest.raises(ScipRunError):  # повторный запуск снова ЗАПУСКАЕТ, а не отдаёт кэш
+        r.run("svc", svc, None, tmp_path / "cache", "h1")
+    assert (tmp_path / "invocations.log").read_text().count("run") == 2
