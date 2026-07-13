@@ -1,8 +1,7 @@
 """S10 report: build_report агрегирует per-service отчёты analyze_service + load_stats
 (load_graph) в единый JSON-совместимый dict; write_report/print_report — соответственно
 запись на диск и rich-печать. per_service элементы — dict'ы формы analyze_service()
-report + добавленный вызывающей стороной ключ "service" (сам analyze_service имени
-сервиса не знает — см. m1b-task-5-report §per_service contract)."""
+report (ключ "service" analyze_service отдаёт сам, первым ключом)."""
 
 from __future__ import annotations
 

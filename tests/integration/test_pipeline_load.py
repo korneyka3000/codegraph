@@ -150,3 +150,34 @@ def test_load_graph_writes_labels_edges_drops_ghost_and_swaps(falkordb_cfg, tmp_
         assert final_store.get_nodes([GHOST_ID]) == []
     finally:
         _cleanup(falkordb_cfg, BUILD_NAME, GRAPH_NAME)
+
+
+STALE_GRAPH = "__t5x__"
+STALE_BUILD = f"{STALE_GRAPH}__build"
+
+
+def test_load_graph_resets_stale_build_graph_from_crashed_run(falkordb_cfg, tmp_path):
+    """Регрессия дыры корректности из первичного ревью T5: предыдущий прогон, упавший
+    ПОСЛЕ частичной записи в build-граф, но ДО swap_in, оставляет мусор под build-ключом
+    (RENAME не состоялся -- ключ жив). load_graph обязан начинать с чистого build-графа
+    (build_store.delete_graph() первым делом), иначе мусор протекает в финальный граф
+    после swap -- живьём воспроизведено до фикса (см. m1b-task-5-report §Fix)."""
+    db = connect(falkordb_cfg)
+    # симулируем упавший прогон: непустой build-ключ с посторонним узлом
+    db.select_graph(STALE_BUILD).query(
+        "MERGE (n:Junk {id: 'stale-from-crash'}) SET n.kind = 'Junk'"
+    )
+
+    st = _staging(tmp_path)
+    try:
+        stats = load_graph(st, lambda name: FalkorStore(falkordb_cfg, name), STALE_GRAPH)
+
+        final_store = FalkorStore(falkordb_cfg, STALE_GRAPH)
+        # мусор упавшего прогона НЕ протёк в финальный граф
+        assert final_store.get_nodes(["stale-from-crash"]) == []
+        # а реальное содержимое staging -- протекло целиком и ровно оно
+        assert stats["nodes_written"] == 3
+        rows = final_store.raw("MATCH (n) RETURN n.id").result_set
+        assert {r[0] for r in rows} == {NODE_A_ID, NODE_B_ID, SERVICE_NODE.id}
+    finally:
+        _cleanup(falkordb_cfg, STALE_BUILD, STALE_GRAPH)

@@ -138,6 +138,25 @@ class FalkorStore:
         self._connect().connection.execute_command("RENAME", build_name, self.graph_name)
         self._graph = None
 
+    def delete_graph(self) -> None:
+        """Удаляет граф-ключ self.graph_name, если он существует; идемпотентно.
+
+        Несуществующий граф: GRAPH.DELETE отвечает `ResponseError("Invalid graph
+        operation on empty key")` (замерено живьём на v4.18.11, тот же маркер, что
+        наблюдался в swap_in-тестах T3) -- глотаем подстрочно, по образцу
+        ddl._swallow_ddl_errors; любая другая ошибка пробрасывается. Кэшированная
+        Graph-обёртка сбрасывается в None в обоих исходах (тот же довод, что в
+        swap_in: схемный кэш клиента не переживает смену данных под ключом --
+        следующий пользователь этого store-объекта должен получить свежий handle).
+        """
+        try:
+            self._g.delete()
+        except Exception as e:
+            if "empty key" not in str(e).lower():
+                raise
+        finally:
+            self._graph = None
+
     def raw(self, cypher: str, params: dict | None = None) -> Any:
         """Internal-only, не для MCP: тонкий проброс в g.query(cypher, params)."""
         return self._g.query(cypher, params)

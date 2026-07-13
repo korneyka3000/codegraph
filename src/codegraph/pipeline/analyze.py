@@ -111,8 +111,10 @@ def analyze_service(
         resolution=resolution, confidence=confidence,
     )
 
-    # 7. отчёт
+    # 7. отчёт ("service" -- первым ключом: report.build_report ожидает его в каждом
+    # per_service-элементе, и его источник -- сам analyze_service, не вызывающая сторона)
     return {
+        "service": svc.name,
         "files": len(relpaths),
         "defs": defs_count,
         "refs": refs_count,

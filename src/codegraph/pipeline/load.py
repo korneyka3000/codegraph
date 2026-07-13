@@ -24,13 +24,19 @@ known_ids собирается ПОКА обходим все узлы (один
 null. Живой пробой (см. отчёт m1b-task-5) подтверждено: FalkorDB `SET n += {k:
 null}` для НИКОГДА не существовавшего свойства -- no-op (ключ не появляется);
 для УЖЕ существующего -- СТИРАЕТ его (открытая семантика Cypher `+=`). Обе ветки
-безопасны сами по себе, но проще и однозначнее просто не посылать null: тогда
-свойство либо отсутствует (первая запись), либо остаётся тем, что было (WARNING:
-при повторной загрузке в непересозданный build-граф с исчезнувшим на источнике
-значением это оставит устаревшее значение -- см. Concerns в отчёте). Списки строк
-(decorators) и bool (is_async) отправляются как есть -- живой пробой подтверждено,
-что FalkorDB хранит и возвращает python list/bool без искажений через UNWIND/SET +=
-(json-string fallback из плана не понадобился).
+безопасны сами по себе, но проще и однозначнее просто не посылать null. Списки
+строк (decorators) и bool (is_async) отправляются как есть -- живой пробой
+подтверждено, что FalkorDB хранит и возвращает python list/bool без искажений
+через UNWIND/SET += (json-string fallback из плана не понадобился).
+
+Crash-recovery: build-граф сбрасывается (delete_graph) ПЕРВЫМ действием каждого
+прогона. Успешный прогон и так потребляет build-ключ через RENAME, но прогон,
+упавший ПОСЛЕ частичной записи и ДО swap_in, оставляет ключ жить -- без сброса
+этот мусор протёк бы в финальный граф при следующем успешном прогоне (живьём
+воспроизведено в первичном ревью T5; регрессия -- test_load_graph_resets_stale_
+build_graph_from_crashed_run). Заодно сброс снимает и след-риск уровня свойств:
+None-omission (выше) не стирает устаревшее значение на переиспользуемом узле,
+но переиспользуемых узлов теперь не бывает -- build всегда стартует пустым.
 """
 
 from __future__ import annotations
@@ -79,10 +85,14 @@ def load_graph(
     store_factory: Callable[[str], GraphStore],
     graph_name: str,
 ) -> dict:
-    """staging -> `<graph_name>__build` -> ensure_schema -> upsert (nodes then edges,
-    grouped) -> swap_in в graph_name. Возврат -- счётчики для report.build_report."""
+    """staging -> `<graph_name>__build` (предварительно сброшенный) -> ensure_schema ->
+    upsert (nodes then edges, grouped) -> swap_in в graph_name. Возврат -- счётчики
+    для report.build_report."""
     build_name = f"{graph_name}__build"
     build_store = store_factory(build_name)
+    # crash-recovery: снести возможный мусор от прогона, упавшего до swap_in
+    # (см. модульный докстринг) -- ДО ensure_schema, чтобы схема легла на пустой граф
+    build_store.delete_graph()
     build_store.ensure_schema()
 
     # -- 1. nodes: сгруппировать по labels-набору, попутно собрать known_ids --

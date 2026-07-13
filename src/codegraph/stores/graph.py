@@ -38,6 +38,8 @@ class GraphStore(Protocol):
 
     def swap_in(self, build_name: str) -> None: ...  # blue/green: RENAME build_name -> self
 
+    def delete_graph(self) -> None: ...  # удалить СВОЙ граф-ключ, если есть (идемпотентно)
+
     def raw(self, cypher: str, params: dict | None = None) -> Any:
         """Internal-only: тонкий проброс в g.query. НЕ экспонируется в MCP (см.
         m1b-serving.md Global Constraints: "GraphStore.raw() — internal-only, в MCP

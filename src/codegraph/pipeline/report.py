@@ -1,6 +1,6 @@
-"""S10 report: агрегирует per-service отчёты (analyze.analyze_service, дополненные
-вызывающей стороной ключом "service" -- сам analyze_service имени сервиса не
-возвращает) и load_stats (load.load_graph) в единый JSON-совместимый dict.
+"""S10 report: агрегирует per-service отчёты (analyze.analyze_service -- каждый
+уже содержит ключ "service") и load_stats (load.load_graph) в единый
+JSON-совместимый dict.
 
 build_report -- чистая агрегация (без side-effects); write_report -- JSON на диск;
 print_report -- rich-таблицы для CLI (`index`/`load`). "Не изобретай много" (бриф
@@ -24,7 +24,7 @@ def _pct(numerator: int, denominator: int) -> float:
 
 
 def build_report(per_service: list[dict], load_stats: dict) -> dict:
-    """per_service: список dict'ов вида analyze_service()-report + ключ "service".
+    """per_service: список dict'ов analyze_service()-report (ключ "service" включён).
     load_stats: возврат load.load_graph() (nodes_written/edges_written/
     edges_dropped_missing_endpoint + by-type/by-label разбивки).
 

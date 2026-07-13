@@ -46,11 +46,12 @@ def test_analyze_degraded_report_dict_fields(tmp_path):
     report = analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
 
     expected_keys = {
-        "files", "defs", "refs", "malformed_ranges", "nodes", "edges",
+        "service", "files", "defs", "refs", "malformed_ranges", "nodes", "edges",
         "imports_external", "calls_joined", "calls_unresolved", "calls_external",
         "degraded", "reason", "from_cache",
     }
     assert expected_keys <= report.keys()
+    assert report["service"] == "document-management"
     assert report["files"] == 8
     assert report["degraded"] is True
     assert report["reason"]  # непустая строка-причина
