@@ -10,6 +10,9 @@ dependencies = [
     "rich>=13.7",
     "protobuf>=7.35,<8",
     "falkordb>=1.0.10",
+    "tree-sitter>=0.23",
+    "tree-sitter-python>=0.23",
+    "pathspec>=0.12",
 ]
 
 [project.scripts]
@@ -34,6 +37,7 @@ testpaths = ["tests"]
 addopts = "-q"
 markers = [
     "falkordb: requires a running FalkorDB instance (docker compose up -d)",
+    "scip: needs node/npx and network (runs real scip-python)",
 ]
 
 [tool.ruff]

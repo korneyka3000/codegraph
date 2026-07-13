@@ -8,8 +8,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from codegraph.config.loader import load_workspace
+from codegraph.config.loader import ConfigError, load_workspace
+from codegraph.config.models import WorkspaceConfig
 from codegraph.doctor import run_env_checks, run_store_probes
+from codegraph.pipeline.stages import STAGES
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 console = Console()
@@ -40,6 +42,14 @@ def _render(results, title: str) -> bool:
     return all_ok
 
 
+def _load(target: Path) -> WorkspaceConfig:
+    try:
+        return load_workspace(target)
+    except ConfigError as e:
+        console.print(f"[red]config error:[/] {e}")
+        raise typer.Exit(1) from e
+
+
 @app.command()
 def doctor(
     config: Path | None = typer.Option(None, "--config", "-c"),  # noqa: B008 -- typer marker call, idiomatic
@@ -50,7 +60,7 @@ def doctor(
     # Path.cwd() читается здесь, а не в default параметра: default-выражения
     # typer вычисляются один раз при импорте модуля (ruff B008), а не при
     # каждом вызове команды.
-    cfg = load_workspace(config if config is not None else Path.cwd())
+    cfg = _load(config if config is not None else Path.cwd())
     ok = _render(run_env_checks(cfg.scip, probe_scip=probe_scip), "environment")
     if not skip_store:
         from codegraph.stores.falkordb.connection import connect
@@ -61,19 +71,6 @@ def doctor(
         )
     raise typer.Exit(0 if ok else 1)
 
-
-STAGES = [
-    ("S1", "discover", "конфиг / zero-config, валидация путей"),
-    ("S2", "scan", "обход .py, sha256"),
-    ("S3", "resolve", "scip-python per service"),
-    ("S4", "read-scip", "protobuf → defs/refs"),
-    ("S5", "parse+extract", "tree-sitter, идиомы → claims"),
-    ("S6", "join", "SCIP refs × call-sites → CALLS"),
-    ("S7", "link", "каналы, роуты, NEXT_SEGMENT, процессы"),
-    ("S8", "chunk+embed", "AST-чанки + эмбеддинги"),
-    ("S9", "load", "UNWIND-батчи → FalkorDB (blue/green)"),
-    ("S10", "report", "качество графа"),
-]
 
 TEMPLATE = Path(__file__).parent.parent.parent / "codegraph.example.yaml"
 
@@ -87,7 +84,7 @@ def index(
     # Path.cwd() читается здесь, а не в default параметра: default-выражения
     # typer вычисляются один раз при импорте модуля, а не при каждом вызове
     # (см. комментарий в doctor).
-    cfg = load_workspace(target if target is not None else Path.cwd())
+    cfg = _load(target if target is not None else Path.cwd())
     if not dry_run:
         console.print("[yellow]index is not implemented until M1; use --dry-run[/]")
         raise typer.Exit(2)

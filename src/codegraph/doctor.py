@@ -9,10 +9,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from codegraph.config.models import ScipConfig
+from codegraph.constants import SCIP_PYTHON_VERSION
 
-# Актуальная опубликованная версия на момент реализации (npm view
-# @sourcegraph/scip-python version / registry.npmjs.org).
-SCIP_PYTHON_VERSION = "0.6.6"
 PROBE_GRAPH = "__codegraph_probe__"
 
 
