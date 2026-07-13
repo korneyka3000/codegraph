@@ -27,9 +27,6 @@ def nesting_chain(defs: list[DefFact], d: DefFact) -> list[tuple[str, str]]:
     return list(reversed(chain))
 
 
-_nesting = nesting_chain  # alias for internal call sites below; public name is nesting_chain
-
-
 def _resolve_relative(package: str, target: str) -> str:
     """Резолвинг относительного импорта против СОДЕРЖАЩЕГО ПАКЕТА (семантика Python):
     один лидирующий '.' — сам package, каждая следующая точка — уровень выше.
@@ -56,7 +53,9 @@ def _def_id(ctx: FileContext, d: DefFact, dotted: str) -> str:
     sym = ctx.def_symbol_lookup(ctx.relpath, d.name_start_byte)
     if sym is not None:
         return symbol_to_node_id(ctx.service, ctx.relpath, sym)
-    return ids.node_id(ctx.service, ids.structural_descriptor(dotted, _nesting(ctx.facts.defs, d)))
+    return ids.node_id(
+        ctx.service, ids.structural_descriptor(dotted, nesting_chain(ctx.facts.defs, d))
+    )
 
 
 def _line_count(source: bytes) -> int:
@@ -107,7 +106,7 @@ def extract(ctx: FileContext) -> ExtractionResult:
     def_ids = {d.index: _def_id(ctx, d, dotted) for d in facts.defs}
     for d in facts.defs:
         nid = def_ids[d.index]
-        nesting = _nesting(facts.defs, d)
+        nesting = nesting_chain(facts.defs, d)
         nodes.append(NodeRec(
             id=nid,
             kind="Class" if d.kind == "class" else "Function",

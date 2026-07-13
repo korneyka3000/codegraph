@@ -5,8 +5,10 @@ byte position (exact dict hit) or, failing that, the ref whose [start_byte, end_
 span contains it (sorted-list bisect fallback — covers small span-conversion drift).
 A global ref symbol from a different package than the current service is external
 (counted, not joined: cross-service edges are forbidden by staging, see
-`Staging.upsert_edges`); a local symbol is always first-party. Calls that match no ref
-at all (fully dynamic/unresolved) are counted unresolved. Matched first-party calls are
+`Staging.upsert_edges`); a local symbol is first-party — unless `local_defs_for_file`
+is given and the symbol has no def in that same file, in which case it is unresolved
+(pyright degrades unresolved 3rd-party refs to 'local N'). Calls that match no ref at
+all (fully dynamic) are likewise counted unresolved. Matched first-party calls are
 aggregated per (src, dst) into one CALLS edge with a callsite_count and evidence from
 the first call site encountered.
 """
@@ -71,6 +73,7 @@ def build_calls(
     staging: Staging,
     facts_by_file: dict[str, FileFacts],
     def_symbol_lookup: Callable[[str, int], str | None],
+    local_defs_for_file: Callable[[str], set[str]] | None = None,
     resolution: str = "static",
     confidence: float = 1.0,
 ) -> JoinStats:
@@ -96,6 +99,10 @@ def build_calls(
             # ВНИМАНИЕ (M1b): pyright деградирует нерезолвленные 3rd-party в 'local N' — такие
             # "first-party" локалы без def-occurrence в том же документе на деле unresolved
             # (см. m1a-task-10-report §2).
+            if (parsed.is_local and local_defs_for_file is not None
+                    and ref.symbol not in local_defs_for_file(relpath)):
+                calls_unresolved += 1
+                continue
             if not parsed.is_local and parsed.package != service:
                 calls_external += 1
                 continue

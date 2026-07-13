@@ -45,6 +45,7 @@ class ReaderStats:
     defs: int
     refs: int
     skipped_documents: int
+    malformed_ranges: int = 0
 
 
 def _clamp_line(line0: int, li: LineIndex) -> int:
@@ -53,11 +54,16 @@ def _clamp_line(line0: int, li: LineIndex) -> int:
     return max(0, min(line0, li.line_count - 1))
 
 
-def _normalize_range(occ: scip_pb2.Occurrence) -> tuple[int, int, int, int]:
+def _normalize_range(occ: scip_pb2.Occurrence) -> tuple[int, int, int, int] | None:
+    """None means malformed: a well-formed SCIP range has 3 (single-line) or 4
+    (multi-line) components; anything else is external-data corruption the reader
+    must skip rather than crash on."""
     r = list(occ.range)
     if len(r) == 3:
         return r[0], r[1], r[0], r[2]
-    return r[0], r[1], r[2], r[3]
+    if len(r) == 4:
+        return r[0], r[1], r[2], r[3]
+    return None
 
 
 def read_scip_into_staging(
@@ -70,6 +76,7 @@ def read_scip_into_staging(
     total_defs = 0
     total_refs = 0
     skipped_documents = 0
+    malformed_ranges = 0
 
     for doc in idx.documents:
         documents += 1
@@ -85,7 +92,11 @@ def read_scip_into_staging(
         defs: list[DefRow] = []
         refs: list[RefRow] = []
         for occ in doc.occurrences:
-            sl, sc, el, ec = _normalize_range(occ)
+            normalized = _normalize_range(occ)
+            if normalized is None:
+                malformed_ranges += 1
+                continue
+            sl, sc, el, ec = normalized
             sl_clamped = _clamp_line(sl, li)
             start_byte = li.to_byte(sl_clamped, sc, encoding)
             end_byte = li.to_byte(_clamp_line(el, li), ec, encoding)
@@ -107,4 +118,5 @@ def read_scip_into_staging(
         total_refs += len(refs)
 
     return ReaderStats(documents=documents, defs=total_defs, refs=total_refs,
-                        skipped_documents=skipped_documents)
+                        skipped_documents=skipped_documents,
+                        malformed_ranges=malformed_ranges)

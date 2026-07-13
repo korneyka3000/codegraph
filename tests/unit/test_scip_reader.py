@@ -109,3 +109,16 @@ def test_reader_unspecified_encoding_defaults_to_utf16(tmp_path):
     # occ character=14 (utf-16 units); correctly converted to byte offset 20 (verified
     # directly via LineIndex.to_byte). A buggy utf-8 default would instead give 14.
     assert st.def_symbol_at("svc", "m.py", 20) == "S_DEF_Y"
+
+
+def test_reader_skips_malformed_range(tmp_path):
+    (tmp_path / "m.py").write_bytes(b"x = 1\n")
+    doc = scip_pb2.Document()
+    doc.relative_path = "m.py"
+    _occ(doc, "S_BAD", [5])  # длина 1 — малформ
+    _occ(doc, "S_OK", [0, 0, 1])
+    scip = tmp_path / "x.scip"
+    _write_index(scip, [doc])
+    st = Staging(tmp_path / "s.db")
+    stats = read_scip_into_staging(scip, "svc", tmp_path, st)
+    assert stats.malformed_ranges == 1 and stats.refs == 1

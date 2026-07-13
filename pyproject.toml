@@ -13,6 +13,7 @@ dependencies = [
     "tree-sitter>=0.23",
     "tree-sitter-python>=0.23",
     "pathspec>=0.12",
+    "fastmcp>=2.14,<3",
 ]
 
 [project.scripts]

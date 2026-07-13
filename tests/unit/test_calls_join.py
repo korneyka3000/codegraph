@@ -82,3 +82,16 @@ def test_containment_fallback_when_exact_miss(tmp_path):
                                r.end_byte, r.start_line, r.roles) for r in refs])
     stats = build_calls("svc", st, facts_by_file, lookup)
     assert stats.calls_joined >= 2  # containment всё ещё сшивает
+
+
+def test_local_ref_without_local_def_is_unresolved(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    src = b"def f():\n    ghost()\n"
+    facts = build_file_facts("m.py", src)
+    call = facts.calls[0]
+    st.add_refs("svc", [RefRow("m.py", "local 5", call.callee_start_byte,
+                               call.callee_end_byte, 2, 0)])  # def-а local 5 в файле НЕТ
+    stats = build_calls("svc", st, {"m.py": facts}, lambda rp, sb: None,
+                        local_defs_for_file=lambda rp: st.local_def_symbols("svc", rp))
+    assert stats.calls_unresolved == 1 and stats.calls_joined == 0

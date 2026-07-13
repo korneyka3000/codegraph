@@ -74,3 +74,32 @@ def test_meta(tmp_path):
     st.set_meta("schema_version", "1")
     assert st.get_meta("schema_version") == "1"
     assert st.get_meta("nope") is None
+
+
+def test_svc_to_foreign_sym_edge_forbidden(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    with pytest.raises(InvariantError):
+        st.upsert_edges([EdgeRec("svc:a", "sym:b:`m`/", "CONTAINS", "static", 1.0, "x")])
+
+
+def test_def_symbol_at_deterministic_on_collision(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.add_defs("a", [DefRow("m.py", "SYM_B", 10, 12, 1), DefRow("m.py", "SYM_A", 10, 12, 1)])
+    assert st.def_symbol_at("a", "m.py", 10) == "SYM_A"  # ORDER BY symbol
+
+
+def test_schema_version_mismatch_raises(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.set_meta("schema_version", "999")
+    st.close()
+    with pytest.raises(InvariantError, match="schema_version"):
+        Staging(tmp_path / "s.db")
+
+
+def test_local_def_symbols(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.add_defs("a", [DefRow("m.py", "local 1", 0, 1, 1),
+                      DefRow("m.py", "scip-python python a 0.1 `m`/f().", 5, 6, 1)])
+    assert st.local_def_symbols("a", "m.py") == {"local 1"}

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from codegraph.core import ids
 from codegraph.core.errors import InvariantError
-from codegraph.core.schema import EdgeRec, NodeRec
+from codegraph.core.schema import SCHEMA_VERSION, EdgeRec, NodeRec
 from codegraph.resolvers.base import DefRow, RefRow
 
 _DDL = """
@@ -56,10 +56,22 @@ class Staging:
         self._db = sqlite3.connect(path)
         self._db.execute("PRAGMA journal_mode=WAL")
         self.ensure_schema()
+        self._check_schema_version()
 
     def ensure_schema(self) -> None:
         self._db.executescript(_DDL)
         self._db.commit()
+
+    def _check_schema_version(self) -> None:
+        current = self.get_meta("schema_version")
+        if current is None:
+            self.set_meta("schema_version", str(SCHEMA_VERSION))
+        elif current != str(SCHEMA_VERSION):
+            raise InvariantError(
+                f"schema_version mismatch: staging has {current!r}, expected "
+                f"{SCHEMA_VERSION!r} — recreate the staging DB (delete the file and "
+                "re-run indexing from scratch)"
+            )
 
     def close(self) -> None:
         self._db.close()
@@ -78,6 +90,7 @@ class Staging:
             cur.execute(f"DELETE FROM {t} WHERE service=?", (service,))  # noqa: S608
         cur.execute("DELETE FROM nodes WHERE service=?", (service,))
         cur.execute("DELETE FROM edges WHERE src_service=?", (service,))
+        cur.execute("DELETE FROM edges WHERE src_service IS NULL")  # страховка от накопления
         self._db.commit()
 
     def add_files(self, service: str, rows: list[tuple[str, str, int]]) -> None:
@@ -117,10 +130,9 @@ class Staging:
         prepared = []
         for e in rows:
             ss, ds = _id_service(e.src), _id_service(e.dst)
-            if (e.src.startswith("sym:") and e.dst.startswith("sym:")
-                    and ss and ds and ss != ds):
+            if ss and ds and ss != ds:
                 raise InvariantError(
-                    f"cross-service code edge forbidden: {e.src} -{e.type}-> {e.dst}"
+                    f"cross-service edge forbidden: {e.src} -{e.type}-> {e.dst}"
                 )
             prepared.append((e.src, e.dst, e.type, e.resolution, e.confidence,
                              e.extractor, e.evidence_file, e.evidence_line,
@@ -143,10 +155,18 @@ class Staging:
 
     def def_symbol_at(self, service: str, relpath: str, start_byte: int) -> str | None:
         cur = self._db.execute(
-            "SELECT symbol FROM scip_defs WHERE service=? AND relpath=? AND start_byte=?",
+            "SELECT symbol FROM scip_defs WHERE service=? AND relpath=? AND start_byte=? "
+            "ORDER BY symbol LIMIT 1",
             (service, relpath, start_byte))
         row = cur.fetchone()
         return row[0] if row else None
+
+    def local_def_symbols(self, service: str, relpath: str) -> set[str]:
+        cur = self._db.execute(
+            "SELECT symbol FROM scip_defs WHERE service=? AND relpath=? "
+            "AND symbol LIKE 'local %'",
+            (service, relpath))
+        return {row[0] for row in cur.fetchall()}
 
     def refs_for_file(self, service: str, relpath: str) -> list[RefRow]:
         cur = self._db.execute(
