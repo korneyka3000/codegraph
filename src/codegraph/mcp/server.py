@@ -74,7 +74,8 @@ def build_server(cfg: WorkspaceConfig, graph_name: str) -> FastMCP:
         limit: int = 50,
     ) -> dict:
         """BFS-обход соседей узла (depth клампится к 1..3), суммарно не более limit
-        hops; truncated=true, если реальных соседей было больше."""
+        hops; truncated=true, если реальных соседей было больше. edge_types=None и
+        edge_types=[] эквивалентны -- оба означают "без фильтра, любой тип ребра"."""
         return query.expand_neighbors(
             node_id, edge_types=edge_types, direction=direction, depth=depth, limit=limit
         )

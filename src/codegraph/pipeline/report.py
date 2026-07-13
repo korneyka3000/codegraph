@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 _TOTAL_FIELDS = ("files", "nodes", "edges", "calls_joined", "calls_unresolved", "calls_external")
@@ -124,4 +125,9 @@ def print_report(report: dict, console: Console) -> None:
             f"{d['service']} ({d['reason']})" if d.get("reason") else str(d["service"])
             for d in degraded_services
         )
-        console.print(f"[yellow]degraded services: {detail}[/]")
+        # detail -- rendered service/reason text, ЛЮБОЕ из которых может прийти из
+        # эвристики/исключения scip-python (произвольный текст, потенциально с "["/"]")
+        # -- escape() ОБЯЗАН обернуть его целиком перед интерполяцией в markup-строку
+        # ниже, иначе "[...]"-подстрока либо валит Console.print MarkupError, либо
+        # молча съедается как (невалидный) style-тег (live-verified).
+        console.print(f"[yellow]degraded services: {escape(detail)}[/]")

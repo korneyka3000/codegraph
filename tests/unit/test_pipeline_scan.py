@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import warnings
 
 from codegraph.pipeline.scan import scan_service
 
@@ -76,3 +77,29 @@ def test_tree_hash_changes_when_file_set_changes(tmp_path):
     (root / "app" / "new_mod.py").write_text("C = 3\n")
     _, hash_after = scan_service(root, [])
     assert hash_before != hash_after
+
+
+def test_scan_default_excludes_match_nested_not_only_root(tmp_path):
+    # live-verified leak: unprefixed DEFAULT_EXCLUDES patterns (e.g. ".venv/**") only
+    # matched a dir named ".venv" at the service root -- a nested ".venv" a few levels
+    # down (e.g. inside a sub-package checked out its own vendored copy) slipped
+    # through unfiltered. "**/"-prefixed patterns must match at any depth.
+    (tmp_path / "svc" / "sub" / ".venv" / "lib").mkdir(parents=True)
+    (tmp_path / "svc" / "sub" / ".venv" / "lib" / "x.py").write_text("VENDORED = 1\n")
+    (tmp_path / "svc" / "sub" / "app.py").write_text("A = 1\n")
+
+    rows, _ = scan_service(tmp_path, [])
+    relpaths = [r for r, _, _ in rows]
+    assert "svc/sub/.venv/lib/x.py" not in relpaths
+    assert "svc/sub/app.py" in relpaths
+
+
+def test_scan_uses_gitignore_pathspec_factory_no_deprecation_warning(tmp_path):
+    # regression: PathSpec.from_lines("gitwildmatch", ...) raises pathspec's
+    # DeprecationWarning ("'gitwildmatch' is deprecated ... use 'gitignore' instead")
+    # on every single scan_service() call -- switching the factory name to
+    # "gitignore" must make scanning warning-free.
+    root = _tree(tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        scan_service(root, [])  # must not raise

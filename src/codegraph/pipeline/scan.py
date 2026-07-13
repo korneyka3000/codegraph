@@ -1,7 +1,9 @@
 """S1 discover / S2 scan: обход .py-файлов сервиса с pathspec-фильтрацией.
 
-DEFAULT_EXCLUDES применяются всегда (venv/vcs/кэши/state), поверх них слоятся .gitignore
-сервиса (если есть, корневой файл, gitwildmatch) и явные excludes из конфига сервиса.
+DEFAULT_EXCLUDES применяются всегда (venv/vcs/кэши/state, паттерны "**/"-префиксные --
+матчатся на любой глубине, не только в корне сервиса), поверх них слоятся .gitignore
+сервиса (если есть, корневой файл, gitignore-синтаксис через pathspec) и явные excludes
+из конфига сервиса.
 relpath'ы отсортированы — единственный источник детерминизма для всех последующих стадий
 (facts/extract/join итерируют файлы в этом же порядке, см. analyze.py); tree_hash — вход
 для кэша ScipRunner (S3): sha256 по отсортированному списку "relpath:sha256" пар, поэтому
@@ -16,7 +18,7 @@ from pathlib import Path
 import pathspec
 
 DEFAULT_EXCLUDES = [
-    ".venv/**", ".git/**", "__pycache__/**", ".codegraph/**", "node_modules/**",
+    "**/.venv/**", "**/.git/**", "**/__pycache__/**", "**/.codegraph/**", "**/node_modules/**",
 ]
 
 
@@ -31,7 +33,7 @@ def scan_service(
     path: Path, excludes: list[str]
 ) -> tuple[list[tuple[str, str, int]], str]:
     spec = pathspec.PathSpec.from_lines(
-        "gitwildmatch", [*_gitignore_lines(path), *excludes, *DEFAULT_EXCLUDES]
+        "gitignore", [*_gitignore_lines(path), *excludes, *DEFAULT_EXCLUDES]
     )
 
     rows: list[tuple[str, str, int]] = []

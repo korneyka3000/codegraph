@@ -216,6 +216,25 @@ def test_index_store_unreachable_is_red_error_exit_1(tmp_path, monkeypatch):
     assert "Traceback" not in result.output
 
 
+def test_index_store_unreachable_message_with_brackets_renders_literally(tmp_path, monkeypatch):
+    # live-verified bug: _store_guard's `console.print(f"[red]falkordb unreachable:[/]
+    # {e}")` treated any "["-bearing exception text as rich markup -- escape() must
+    # make it survive verbatim instead of crashing or being silently eaten.
+    root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
+
+    def unreachable_load_graph(staging, store_factory, graph_name):
+        raise StoreError("Connection refused [errno=111]")
+
+    monkeypatch.setattr("codegraph.cli.analyze_service", _fake_analyze_service([]))
+    monkeypatch.setattr("codegraph.cli.load_graph", unreachable_load_graph)
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeFalkorStore)
+
+    result = runner.invoke(app, ["index", str(root)])
+    assert result.exit_code == 1
+    assert "[errno=111]" in result.output
+    assert "Traceback" not in result.output
+
+
 # -- load: только load_graph из существующего staging --
 
 

@@ -145,6 +145,9 @@ class GraphQuery:
         depth: int = 1,
         limit: int = 50,
     ) -> dict:
+        """edge_types=None и edge_types=[] эквивалентны -- оба означают "без фильтра по
+        типу ребра" (store._one_way делает `if edge_types:` перед добавлением `WHERE
+        type(e) IN $types`, пустой список falsy -- та же ветка, что и None)."""
         depth = max(_DEPTH_MIN, min(_DEPTH_MAX, depth))
         try:
             store = self.store_factory()

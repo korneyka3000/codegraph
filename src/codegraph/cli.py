@@ -6,6 +6,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from codegraph.config.loader import ConfigError, load_workspace
@@ -60,7 +61,11 @@ def _load(target: Path) -> WorkspaceConfig:
     try:
         return load_workspace(target)
     except ConfigError as e:
-        console.print(f"[red]config error:[/] {e}")
+        # escape(): ConfigError-текст может содержать необработанное сообщение
+        # pydantic ValidationError (`str(e)` включает "[type=missing, ...]"-подобные
+        # фрагменты) -- без escape() такая "["-подстрока либо валит Console.print
+        # MarkupError, либо молча съедается как (невалидный) style-тег (live-verified).
+        console.print(f"[red]config error:[/] {escape(str(e))}")
         raise typer.Exit(1) from e
 
 
@@ -89,7 +94,10 @@ def _store_guard(fn):
     try:
         return fn()
     except (StoreError, StoreUnavailable) as e:
-        console.print(f"[red]falkordb unreachable:[/] {e}")
+        # escape(): redis/StoreUnavailable-текст -- сообщение из внешней библиотеки,
+        # не наш контролируемый литерал -- та же live-verified markup-ловушка, что и
+        # в _load выше (bracketed substring -> MarkupError либо тихая потеря текста).
+        console.print(f"[red]falkordb unreachable:[/] {escape(str(e))}")
         raise typer.Exit(1) from e
 
 

@@ -147,6 +147,19 @@ def test_print_report_smoke_shows_degraded_block_when_present():
     assert "scip-python timeout" in text
 
 
+def test_print_report_degraded_reason_with_markup_renders_literally():
+    # live-verified bug: an unescaped "["-bearing reason either crashes Console.print
+    # with rich.errors.MarkupError (e.g. a stray "[/bad]" closing tag) or silently
+    # swallows the bracketed text as an unrecognized style tag -- escape() must make
+    # it render as inert literal text instead, with no exception.
+    service_degraded_markup = {**SERVICE_DEGRADED, "reason": "[/bad]markup[bold]"}
+    report = build_report([SERVICE_OK, service_degraded_markup], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise MarkupError
+    text = console.export_text()
+    assert "[/bad]markup[bold]" in text
+
+
 def test_print_report_smoke_no_degraded_block_when_absent():
     report = build_report([SERVICE_OK], LOAD_STATS)
     console = Console(record=True, width=200)

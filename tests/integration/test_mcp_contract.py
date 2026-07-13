@@ -21,6 +21,7 @@ from fastmcp import Client
 from codegraph.config.models import FalkorDBConfig, ServiceConfig, StorageConfig, WorkspaceConfig
 from codegraph.core.schema import EdgeRec, NodeRec, make_service_node
 from codegraph.mcp.schemas import (
+    ErrorOutput,
     ExpandNeighborsOutput,
     GetSourceOutput,
     GraphStatsOutput,
@@ -148,7 +149,8 @@ def test_mcp_contract_list_tools_and_live_tool_calls(falkordb_cfg, tmp_path):
                     "get_source", {"node_id": f"sym:{SERVICE}:does-not-exist"}
                 )
                 assert missing_res.is_error is False
-                assert "error" in missing_res.data
+                missing_out = ErrorOutput(**missing_res.data)  # схема валидна
+                assert "does-not-exist" in missing_out.error
 
         asyncio.run(_run())
     finally:

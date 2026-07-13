@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ErrorOutput(BaseModel):
@@ -64,7 +64,14 @@ class GetSourceOutput(BaseModel):
 
 class ExpandNeighborsInput(BaseModel):
     node_id: str
-    edge_types: list[str] | None = None
+    edge_types: list[str] | None = Field(
+        default=None,
+        description=(
+            "Фильтр по типу ребра (например [\"CALLS\"]). None и [] эквивалентны -- "
+            "оба означают «без фильтра, любой тип ребра» (см. "
+            "query.api.GraphQuery.expand_neighbors)."
+        ),
+    )
     direction: Literal["out", "in", "both"] = "both"
     depth: int = 1  # клампится в GraphQuery к [1,3]
     limit: int = 50
