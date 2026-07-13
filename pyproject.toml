@@ -34,7 +34,7 @@ packages = ["src/codegraph"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not scip'"
 markers = [
     "falkordb: requires a running FalkorDB instance (docker compose up -d)",
     "scip: needs node/npx and network (runs real scip-python)",

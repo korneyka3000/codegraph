@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 from codegraph.core import ids
 from codegraph.core.schema import EdgeRec
-from codegraph.extractors.python_core import _nesting
+from codegraph.extractors.python_core import nesting_chain
 from codegraph.parsing.facts import FileFacts
 from codegraph.resolvers.base import RefRow
 from codegraph.resolvers.scip.symbols import parse_symbol, symbol_to_node_id
@@ -40,11 +40,11 @@ def _caller_id(service, relpath, facts, enclosing, lookup):
         return ids.node_id(service, ids.module_descriptor(ids.relpath_to_module(relpath)))
     d = facts.defs[enclosing]
     sym = lookup(relpath, d.name_start_byte)
-    if sym:
+    if sym is not None:
         return symbol_to_node_id(service, relpath, sym)
     return ids.node_id(
         service,
-        ids.structural_descriptor(ids.relpath_to_module(relpath), _nesting(facts.defs, d)),
+        ids.structural_descriptor(ids.relpath_to_module(relpath), nesting_chain(facts.defs, d)),
     )
 
 
@@ -93,6 +93,9 @@ def build_calls(
                 continue
 
             parsed = parse_symbol(ref.symbol)
+            # ВНИМАНИЕ (M1b): pyright деградирует нерезолвленные 3rd-party в 'local N' — такие
+            # "first-party" локалы без def-occurrence в том же документе на деле unresolved
+            # (см. m1a-task-10-report §2).
             if not parsed.is_local and parsed.package != service:
                 calls_external += 1
                 continue

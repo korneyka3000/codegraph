@@ -38,6 +38,15 @@ sys.exit(5)
 """
 
 
+FAKE_WRITE_THEN_SLEEP = """#!/usr/bin/env python3
+import sys, time, pathlib
+args = sys.argv[1:]
+out = args[args.index("--output") + 1]
+pathlib.Path(out).write_bytes(b"PARTIAL")
+time.sleep(60)
+"""
+
+
 def _mk_fake(tmp_path, body, name="fake-npx"):
     p = tmp_path / name
     p.write_text(body)
@@ -128,3 +137,12 @@ def test_failed_run_does_not_poison_cache(tmp_path):
     with pytest.raises(ScipRunError):  # повторный запуск снова ЗАПУСКАЕТ, а не отдаёт кэш
         r.run("svc", svc, None, tmp_path / "cache", "h1")
     assert (tmp_path / "invocations.log").read_text().count("run") == 2
+
+
+def test_timeout_cleans_partial_output(tmp_path):
+    fake = _mk_fake(tmp_path, FAKE_WRITE_THEN_SLEEP)
+    svc = tmp_path / "svc"
+    svc.mkdir()
+    with pytest.raises(ScipRunError, match="timeout"):
+        ScipRunner(npx=str(fake), timeout_s=1).run("svc", svc, None, tmp_path / "cache", "h1")
+    assert not (tmp_path / "cache" / "svc-h1.scip").exists()

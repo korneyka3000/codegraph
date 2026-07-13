@@ -125,7 +125,7 @@ ast-tree-multi/
 - **S9 load** — UNWIND-батчи (1000, группировка по label-набору и (edge_type, src_label, dst_label)): `UNWIND $rows AS r MERGE (n:Sym:Function:RouteHandler {id: r.id}) SET n += r.props`; рёбра через двойной MATCH+MERGE. Ошибка батча → бисекция до кривой строки. **Blue/green**: пишем в `<graph>__build`, атомарный Redis `RENAME` (граф = redis-ключ).
 - **S10 report** — counts, % heuristic, % orphan, нерезолвленные каналы/URL, degraded-сервисы → rich-stdout + report.json (это и есть `doctor`-метрики качества графа).
 
-**Стабильные ID** (`core/ids.py`): кодовый узел = `sym:<service>:<scip-descriptors-без-pkg/version>`; SCIP-`local N` → `sym:<svc>:<relpath>:<enclosing>:<name>@local`; каналы `chan:kafka_topic:<name>` / `chan:event_type:<name>` / `chan:http:<owner|?>:<METHOD> <template>`; `content_hash` — только детекция изменений, в ID не входит.
+**Стабильные ID** (`core/ids.py`): кодовый узел = `sym:<service>:<scip-descriptors-без-pkg/version>`; SCIP-`local N` → `sym:<service>:<relpath>:local<N>` (реализация `ids.local_id`; план M1a суперсидит); каналы `chan:kafka_topic:<name>` / `chan:event_type:<name>` / `chan:http:<owner|?>:<METHOD> <template>`; `content_hash` — только детекция изменений, в ID не входит.
 
 ## Интерфейсы (Protocols)
 

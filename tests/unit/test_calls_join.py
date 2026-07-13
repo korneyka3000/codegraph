@@ -57,6 +57,7 @@ def test_join_aggregates_and_classifies(tmp_path):
     assert e.src == "sym:svc:`m`/f()." and e.dst == "sym:svc:`m`/g()."
     assert e.props["callsite_count"] == 2
     assert e.resolution == "static" and e.confidence == 1.0
+    assert e.evidence_file == "m.py" and e.evidence_line == 6
 
 
 def test_module_level_call_attributed_to_module(tmp_path):

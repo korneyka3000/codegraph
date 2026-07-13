@@ -6,6 +6,7 @@ from codegraph.config.models import (
     ChannelSpec,
     ConsumerIdiom,
     ProducerIdiom,
+    ServiceConfig,
     ValueSpec,
     WorkspaceConfig,
 )
@@ -96,3 +97,11 @@ def test_extra_fields_forbidden():
 def test_channel_spec_kafka_topic_name_from_arg():
     ch = ChannelSpec.model_validate({"kind": "kafka_topic", "name_from": {"arg": 0}})
     assert ch.name_from.arg == 0
+
+
+def test_service_name_rejects_unsafe_characters():
+    for bad in ("my svc", "a:b", "a/b"):
+        with pytest.raises(ValidationError):
+            ServiceConfig.model_validate({"name": bad, "path": "."})
+    svc = ServiceConfig.model_validate({"name": "kyc-worker_2", "path": "."})
+    assert svc.name == "kyc-worker_2"

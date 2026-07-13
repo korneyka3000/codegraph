@@ -18,13 +18,16 @@ _RESOLUTION = "static"
 _CONFIDENCE = 1.0
 
 
-def _nesting(defs: list[DefFact], d: DefFact) -> list[tuple[str, str]]:
+def nesting_chain(defs: list[DefFact], d: DefFact) -> list[tuple[str, str]]:
     chain = []
     cur = d
     while cur is not None:
         chain.append(("class" if cur.kind == "class" else "function", cur.name))
         cur = defs[cur.parent] if cur.parent is not None else None
     return list(reversed(chain))
+
+
+_nesting = nesting_chain  # alias for internal call sites below; public name is nesting_chain
 
 
 def _resolve_relative(package: str, target: str) -> str:

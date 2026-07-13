@@ -20,12 +20,14 @@ def test_doctor_bad_config_prints_one_liner(tmp_path):
     result = runner.invoke(app, ["doctor", "--config", str(cfg), "--skip-store"])
     assert result.exit_code == 1
     assert "config error" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_stages_moved_to_pipeline():
     from codegraph.pipeline.stages import STAGES
 
     assert STAGES[0][0] == "S1" and STAGES[-1][0] == "S10"
+    assert len(STAGES) == 10 and all(len(t) == 3 for t in STAGES)
 
 
 def test_scip_version_single_source():

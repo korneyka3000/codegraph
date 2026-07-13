@@ -135,7 +135,7 @@ class ProcessDecl(_Strict):
 
 
 class ServiceConfig(_Strict):
-    name: str
+    name: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
     path: Path
     python: str | None = None
     exclude: list[str] = Field(default_factory=list)

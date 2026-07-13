@@ -4,7 +4,7 @@
 
 - Defs: КАЖДЫЙ `DefFact` (включая вложенные классы/функции) получает синтетический символ
   `f"scip-python python {service} 0.0 {структурный дескриптор}"`, где дескриптор строится
-  через `ids.structural_descriptor` по полной цепочке родителей (`_nesting` из
+  через `ids.structural_descriptor` по полной цепочке родителей (`nesting_chain` из
   `python_core` — тот же алгоритм, что и у static-резолвера, поэтому формат совпадает с
   parse_symbol/symbol_to_node_id и с id, которые построил бы python_core extractor).
   Байтовый span — name-token (`name_start_byte:name_end_byte`), не весь def/class.
@@ -28,7 +28,7 @@ resolution="heuristic", confidence=0.6.
 from __future__ import annotations
 
 from codegraph.core import ids
-from codegraph.extractors.python_core import _nesting
+from codegraph.extractors.python_core import nesting_chain
 from codegraph.parsing.facts import DefFact, FileFacts
 from codegraph.resolvers.base import DefRow, RefRow
 
@@ -58,7 +58,7 @@ def resolve_service(
         top_level: dict[str, DefFact] = {}
         sym_by_index: dict[int, str] = {}
         for d in facts.defs:
-            sym = _symbol(service, module_dotted, _nesting(facts.defs, d))
+            sym = _symbol(service, module_dotted, nesting_chain(facts.defs, d))
             sym_by_index[d.index] = sym
             defs.append(DefRow(relpath, sym, d.name_start_byte, d.name_end_byte, d.start_line))
             if d.parent is None:
