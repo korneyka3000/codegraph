@@ -11,6 +11,7 @@ from rich.table import Table
 from codegraph.config.loader import ConfigError, load_workspace
 from codegraph.config.models import WorkspaceConfig
 from codegraph.doctor import run_env_checks, run_store_probes
+from codegraph.mcp.server import build_server
 from codegraph.pipeline.analyze import analyze_service
 from codegraph.pipeline.load import load_graph
 from codegraph.pipeline.report import build_report, print_report, write_report
@@ -19,13 +20,13 @@ from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
 from codegraph.stores.falkordb.store import FalkorStore
 from codegraph.stores.staging import Staging
 
-# analyze_service/load_graph/FalkorStore/Staging импортированы по имени (не через
-# module-алиас) НАМЕРЕННО: юнит-тесты (tests/unit/test_cli_m1b.py) monkeypatch'ат
-# ровно эти module-level имена (`codegraph.cli.analyze_service` и т.д.), подставляя
-# фейки вместо реального SCIP/FalkorDB -- сработает только если имя резолвится из
-# ГЛОБАЛЬНОГО namespace codegraph.cli на момент вызова, а не из локального импорта
-# внутри тела команды (см. существующий паттерн лениво импортируемого `connect` в
-# doctor() -- та же техника здесь была бы непатчибельной).
+# analyze_service/load_graph/FalkorStore/Staging/build_server импортированы по имени
+# (не через module-алиас) НАМЕРЕННО: юнит-тесты (tests/unit/test_cli_m1b.py)
+# monkeypatch'ат ровно эти module-level имена (`codegraph.cli.analyze_service` и т.д.),
+# подставляя фейки вместо реального SCIP/FalkorDB/MCP -- сработает только если имя
+# резолвится из ГЛОБАЛЬНОГО namespace codegraph.cli на момент вызова, а не из
+# локального импорта внутри тела команды (см. существующий паттерн лениво
+# импортируемого `connect` в doctor() -- та же техника здесь была бы непатчибельной).
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 console = Console()
 
@@ -267,9 +268,29 @@ def trace() -> None:
 
 
 @app.command()
-def serve() -> None:
-    """MCP-сервер (M1: v0)."""
-    _stub("M1")
+def serve(
+    target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
+    graph: str | None = typer.Option(None, "--graph"),
+) -> None:
+    """MCP-сервер (stdio, M1 v0): graph_stats/get_source/expand_neighbors/who_calls."""
+    target_path = target if target is not None else Path.cwd()
+    cfg = _load(target_path)
+    graph_name = _resolve_graph_name(cfg, graph)
+
+    # graph_exists() идёт через _store_guard как и в stats() -- недостижимость самого
+    # FalkorDB остаётся красной границей exit 1 (единый контракт со всеми
+    # store-командами). Но САМ факт "граф ещё не существует" -- НЕ ошибка здесь (в
+    # отличие от stats): index может отработать позже, пока MCP-сервер уже поднят и
+    # ждёт запросов (store_factory в build_server пересоздаёт FalkorStore на каждый
+    # tool-call -- см. query.api.GraphQuery докстринг), поэтому это жёлтое
+    # предупреждение, а не отказ стартовать.
+    store = FalkorStore(cfg.storage.falkordb, graph_name)
+    if not _store_guard(store.graph_exists):
+        console.print(
+            f"[yellow]graph {graph_name!r} not found yet -- run 'codegraph index' "
+            "whenever ready; server is starting anyway[/]"
+        )
+    build_server(cfg, graph_name).run()
 
 
 @app.command()

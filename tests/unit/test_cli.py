@@ -51,9 +51,9 @@ def test_init_defaults_to_cwd(tmp_path, monkeypatch):
 
 
 def test_stub_commands_exit_2():
-    # stats/load left this list in M1b Task 6 -- both are real commands now (see
-    # tests/unit/test_cli_m1b.py); trace/eval stay M2, serve stays a stub until Task 7.
-    for cmd, milestone in [("trace", "M2"), ("serve", "M1"), ("eval", "M2")]:
+    # stats/load left this list in M1b Task 6, serve left it in M1b Task 7 -- all three
+    # are real commands now (see tests/unit/test_cli_m1b.py); trace/eval stay M2 stubs.
+    for cmd, milestone in [("trace", "M2"), ("eval", "M2")]:
         result = runner.invoke(app, [cmd])
         assert result.exit_code == 2, cmd
         assert milestone in result.output

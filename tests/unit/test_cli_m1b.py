@@ -1,7 +1,8 @@
-"""CLI `index`/`load`/`stats` wired to the real pipeline (M1b Task 6): argument
-proводка (staging path, graph name, store_factory) через monkeypatched
-analyze_service/load_graph/FalkorStore -- без реального SCIP/FalkorDB (это делает
-tests/integration/test_e2e_index.py, markers scip+falkordb).
+"""CLI `index`/`load`/`stats`/`serve` wired to the real pipeline/MCP server (M1b Tasks
+6-7): argument proводка (staging path, graph name, store_factory, build_server args)
+через monkeypatched analyze_service/load_graph/FalkorStore/build_server -- без
+реального SCIP/FalkorDB/MCP-клиента (это делает tests/integration/test_e2e_index.py и
+tests/integration/test_mcp_contract.py, markers scip+falkordb).
 """
 
 from __future__ import annotations
@@ -397,3 +398,103 @@ def test_stats_store_unreachable_is_red_error_exit_1(tmp_path, monkeypatch):
     assert result.exit_code == 1
     assert "falkordb unreachable" in result.output
     assert "Traceback" not in result.output
+
+
+# -- serve: _load -> build_server(cfg, graph_name).run() (stdio) --
+
+
+class _FakeServeStore:
+    """graph_exists()-only fake -- serve() never touches .stats()/.get_nodes()/etc
+    directly (that's all inside GraphQuery, exercised by test_query_api.py and the
+    falkordb-marked MCP contract test, not this module's monkeypatched CLI wiring)."""
+
+    def __init__(self, cfg, name):
+        self.cfg = cfg
+        self.name = name
+
+    def graph_exists(self):
+        return True
+
+
+class _FakeMissingServeStore(_FakeServeStore):
+    def graph_exists(self):
+        return False
+
+
+class _FakeUnreachableServeStore(_FakeServeStore):
+    def graph_exists(self):
+        raise StoreError("Connection refused")
+
+
+class _FakeServer:
+    def __init__(self):
+        self.run_called = False
+
+    def run(self):
+        self.run_called = True
+
+
+def _fake_build_server(recorded: list[dict]):
+    def fn(cfg, graph_name):
+        server = _FakeServer()
+        recorded.append({"cfg": cfg, "graph_name": graph_name, "server": server})
+        return server
+
+    return fn
+
+
+def test_serve_loads_config_and_starts_server_with_config_graph_name(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
+    build_calls: list[dict] = []
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeServeStore)
+    monkeypatch.setattr("codegraph.cli.build_server", _fake_build_server(build_calls))
+
+    result = runner.invoke(app, ["serve", str(root)])
+    assert result.exit_code == 0, result.output
+    assert len(build_calls) == 1
+    assert build_calls[0]["graph_name"] == "wsgraph"
+    assert build_calls[0]["cfg"].graph_name == "wsgraph"
+    assert build_calls[0]["server"].run_called is True
+    assert "not found" not in result.output  # graph_exists() True -> no warning
+
+
+def test_serve_graph_option_overrides_config_graph_name(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
+    build_calls: list[dict] = []
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeServeStore)
+    monkeypatch.setattr("codegraph.cli.build_server", _fake_build_server(build_calls))
+
+    result = runner.invoke(app, ["serve", str(root), "--graph", "override555"])
+    assert result.exit_code == 0, result.output
+    assert build_calls[0]["graph_name"] == "override555"
+
+
+def test_serve_warns_but_still_starts_when_graph_not_found(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
+    build_calls: list[dict] = []
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeMissingServeStore)
+    monkeypatch.setattr("codegraph.cli.build_server", _fake_build_server(build_calls))
+
+    result = runner.invoke(app, ["serve", str(root)])
+    # amendment 4: graph not existing yet is a YELLOW warning, not a failure -- index
+    # may run later against an already-running MCP server (store_factory in
+    # build_server re-resolves the graph on every tool call, see query.api.GraphQuery).
+    assert result.exit_code == 0, result.output
+    assert "not found" in result.output
+    assert len(build_calls) == 1  # server still starts
+    assert build_calls[0]["server"].run_called is True
+
+
+def test_serve_store_unreachable_is_red_error_exit_1_and_never_starts_server(
+    tmp_path, monkeypatch
+):
+    root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
+    build_calls: list[dict] = []
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeUnreachableServeStore)
+    monkeypatch.setattr("codegraph.cli.build_server", _fake_build_server(build_calls))
+
+    result = runner.invoke(app, ["serve", str(root)])
+    assert result.exit_code == 1
+    assert "falkordb unreachable" in result.output
+    assert "Traceback" not in result.output
+    assert build_calls == []  # never got to build_server/run -- hard boundary, no partial start
