@@ -95,3 +95,17 @@ def test_local_ref_without_local_def_is_unresolved(tmp_path):
     stats = build_calls("svc", st, {"m.py": facts}, lambda rp, sb: None,
                         local_defs_for_file=lambda rp: st.local_def_symbols("svc", rp))
     assert stats.calls_unresolved == 1 and stats.calls_joined == 0
+
+
+def test_local_ref_with_local_def_is_joined(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    src = b"def f():\n    ghost()\n"
+    facts = build_file_facts("m.py", src)
+    call = facts.calls[0]
+    st.add_defs("svc", [DefRow("m.py", "local 5", 0, 1, 1)])  # def-а local 5 в файле ЕСТЬ
+    st.add_refs("svc", [RefRow("m.py", "local 5", call.callee_start_byte,
+                               call.callee_end_byte, 2, 0)])
+    stats = build_calls("svc", st, {"m.py": facts}, lambda rp, sb: None,
+                        local_defs_for_file=lambda rp: st.local_def_symbols("svc", rp))
+    assert stats.calls_joined == 1 and stats.calls_unresolved == 0
