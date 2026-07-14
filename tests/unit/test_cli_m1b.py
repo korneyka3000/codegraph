@@ -13,7 +13,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from codegraph.cli import app
-from codegraph.config.models import FalkorDBConfig
+from codegraph.config.models import DEFAULT_BUILTIN_IDIOMS, FalkorDBConfig
 from codegraph.stores.falkordb.connection import StoreError
 from codegraph.stores.staging import Staging
 
@@ -45,8 +45,11 @@ def _write_workspace(tmp_path: Path, n_services: int = 1, graph_name: str = "wsg
 
 
 def _fake_analyze_service(recorded: list[dict]):
-    def fn(svc, staging, cache_dir, runner=None):
-        recorded.append({"svc": svc, "staging": staging, "cache_dir": cache_dir})
+    def fn(svc, staging, cache_dir, runner=None, active_idioms=frozenset()):
+        recorded.append({
+            "svc": svc, "staging": staging, "cache_dir": cache_dir,
+            "active_idioms": active_idioms,
+        })
         return {
             "service": svc.name, "files": 1, "defs": 0, "refs": 0, "malformed_ranges": 0,
             "nodes": 1, "edges": 0, "imports_external": 0,
@@ -100,6 +103,9 @@ def test_index_calls_analyze_service_per_service_and_load_graph_with_config_grap
     for c in analyze_calls:
         assert c["cache_dir"] == root / ".codegraph" / "scip"
         assert isinstance(c["staging"], Staging)
+        # M2 T4 wiring fix: index() активирует доменные экстракторы по
+        # cfg.builtin_idioms (workspace без явного builtin_idioms -> полный дефолт).
+        assert c["active_idioms"] == frozenset(DEFAULT_BUILTIN_IDIOMS)
 
     assert len(load_calls) == 1
     assert load_calls[0]["graph_name"] == "wsgraph"
@@ -139,7 +145,7 @@ def test_index_writes_report_json_from_build_report(tmp_path, monkeypatch):
 def test_index_degraded_service_still_exits_zero_with_warning(tmp_path, monkeypatch):
     root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
 
-    def fake_analyze(svc, staging, cache_dir, runner=None):
+    def fake_analyze(svc, staging, cache_dir, runner=None, active_idioms=frozenset()):
         return {
             "service": svc.name, "files": 1, "defs": 0, "refs": 0, "malformed_ranges": 0,
             "nodes": 1, "edges": 0, "imports_external": 0,

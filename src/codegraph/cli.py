@@ -170,9 +170,14 @@ def index(
     # эвристический fallback) НЕ валит exit — print_report печатает жёлтый блок,
     # но код возврата остаётся 0 (см. self-review брифа m1b-task-6).
     codegraph_dir = _workspace_dir(cfg, target_path) / ".codegraph"
+    # active_idioms (M2 T4): включает доменные экстракторы S5 (сейчас — fastapi) по
+    # workspace-списку builtin-идиом; cfg.builtin_idioms уже провалидирован
+    # load_workspace (resolve_builtins), незнакомое имя сюда не доедет.
+    active_idioms = frozenset(cfg.builtin_idioms)
     with Staging(codegraph_dir / "staging.db") as staging:
         per_service = [
-            analyze_service(svc, staging, codegraph_dir / "scip") for svc in cfg.services
+            analyze_service(svc, staging, codegraph_dir / "scip", active_idioms=active_idioms)
+            for svc in cfg.services
         ]
         load_stats = _store_guard(lambda: load_graph(
             staging, lambda name: FalkorStore(cfg.storage.falkordb, name), graph_name
