@@ -8,8 +8,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from codegraph.config.models import (
+    BaseUrlSpec,
     ChannelSpec,
     ConsumerIdiom,
+    HttpClientIdiom,
     ProducerIdiom,
     ServiceConfig,
     ServiceIdioms,
@@ -415,3 +417,65 @@ def test_analyze_kafka_and_temporal_can_both_be_active_together(tmp_path):
     # path (confirmed structurally in this task's report) -- handler ref resolution
     # itself needs a value-arg SCIP ref, which the fallback never lays down either.
     assert st.claims_for("temporal_start_mark", service="kyc-worker") == []
+
+
+# -- M2 T6: http_client_ext wiring (idioms param), degraded path --
+#
+# Unlike fastapi/kafka/temporal, http_client_ext needs NO ref_symbol_lookup at all (see
+# its own module docstring: pure structural facts + consts.resolve_arg, zero SCIP
+# dependency) -- so, unlike every other T4-T6 domain extractor's wiring test, there is
+# no "cannot resolve under the degraded fallback" gap to document here: claims come out
+# fully resolved below using ONLY the degraded _AlwaysFailRunner path.
+
+DEFAULT_SDK_IDIOM = HttpClientIdiom(
+    name="default-sdk", file_glob="**/clients/*_client.py", class_glob="*Client",
+    base_url=BaseUrlSpec(attr="self._base_url", env="DOCUMENT_MANAGEMENT_URL"),
+)
+
+
+def test_analyze_http_client_inactive_by_default_no_claims(tmp_path):
+    """idioms defaults to None -- opt-in, so every pre-existing caller is unaffected,
+    same convention as kafka's own "inactive by default" test."""
+    svc = ServiceConfig(name="kyc-worker", path=KYC_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+
+    assert st.claims_for("http_call") == []
+
+
+def test_analyze_http_client_active_with_no_http_clients_is_a_noop(tmp_path):
+    svc = ServiceConfig(name="kyc-worker", path=KYC_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        idioms=ServiceIdioms(),
+    )
+    assert st.claims_for("http_call") == []
+
+
+def test_analyze_http_client_active_wires_http_call_claims(tmp_path):
+    """Activation is idioms-driven (idioms.http_clients non-empty), NOT
+    active_idioms-driven -- active_idioms stays empty here on purpose, mirroring kafka's
+    own wiring test. Claims land in staging via add_claims, readable back through
+    claims_for exactly like temporal_start_mark (kind passed separately, "_service"/
+    "_relpath" injected by claims_for itself)."""
+    svc = ServiceConfig(name="kyc-worker", path=KYC_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        idioms=ServiceIdioms(http_clients=[DEFAULT_SDK_IDIOM]),
+    )
+
+    claims = st.claims_for("http_call", service="kyc-worker")
+    assert len(claims) == 2
+    verbs_paths = {(c["verb"], c["path_template"]) for c in claims}
+    assert verbs_paths == {("GET", "/documents/{doc_id}"), ("POST", "/documents")}
+    assert all(c["base_url_env"] == "DOCUMENT_MANAGEMENT_URL" for c in claims)
+    assert all(c["resolution_hint"] == "static" for c in claims)
+    assert all(c["_relpath"] == "app/clients/document_management_client.py" for c in claims)
+
+    # http_client_ext emits no roles/edges/channels/node_props at all (master plan:
+    # "роли для клиентов не вводим; CALLS_HTTP делает S7") -- mirrors kafka's own
+    # "structurally empty besides claims" shape check.
+    assert not any(n.roles for n in st.iter_nodes())
+    assert not any(e.type == "CALLS_HTTP" for e in st.iter_edges())

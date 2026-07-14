@@ -24,7 +24,18 @@ ServiceIdioms — builtin aiokafka/faststream/confluent, если они в cfg.
 `active_idioms=frozenset()`, ни на один существующий вызов не влияет) эквивалентен
 пустой ServiceIdioms. temporal — структурный экстрактор как fastapi: активен, если
 "temporal" ∈ active_idioms (builtin_idioms.py держит его ServiceIdioms пустым намеренно
-— паттерны декораторов зашиты в temporal_ext.py, не в идиом-DSL). node_ids -- та же
+— паттерны декораторов зашиты в temporal_ext.py, не в идиом-DSL).
+
+M2 T6: http_client_ext — ТОЖЕ данные-идиома, тем же принципом что kafka: активен, если
+`idioms.http_clients` непуст (active_idioms не читает вовсе). В отличие от kafka/fastapi/
+temporal, ничего не пишет в domain_roles/domain_node_props/domain_edges/domain_channels
+-- extract_http_client(ctx, node_ids, idioms) возвращает ТОЛЬКО claims (никаких рёбер --
+CALLS_HTTP делает S7/T7) + stats; claims идут в staging.add_claims(svc.name, rp,
+"http_call", hr.claims) сразу же по каждому файлу, тем же паттерном что temporal_start_mark
+(kind — отдельный позиционный параметр add_claims, не внутри payload). Не нуждается в
+ref_symbol_lookup вовсе (внутри ConstTable.build + resolve_arg, чисто структурно), так что
+резолвится идентично что в degraded fallback, что при реальном SCIP -- см. модульный
+докстринг extractors/http_client_ext.py. node_ids -- та же
 def-index -> node-id карта, что уже строилась для fastapi, дополненная ОДНИМ новым
 ключом `None -> Module-node-id`: CallFact.enclosing_def уже использует None как маркер
 "вызов на уровне модуля", так что `node_ids.get(call.enclosing_def)` прозрачно
@@ -46,6 +57,7 @@ from codegraph.core.schema import EdgeRec, NodeRec, make_service_node
 from codegraph.extractors.base import FileContext
 from codegraph.extractors.calls import build_calls
 from codegraph.extractors.fastapi_ext import extract_fastapi
+from codegraph.extractors.http_client_ext import extract_http_client
 from codegraph.extractors.kafka_ext import extract_kafka
 from codegraph.extractors.python_core import extract as extract_python_core
 from codegraph.extractors.temporal_ext import extract_temporal
@@ -142,7 +154,11 @@ def analyze_service(
     kafka_idioms = idioms if idioms is not None else ServiceIdioms()
     kafka_active = bool(kafka_idioms.producers or kafka_idioms.consumers)
     temporal_active = "temporal" in active_idioms
-    domain_active = fastapi_active or kafka_active or temporal_active
+    # T6: http_client, like kafka, is DATA-driven off the same effective idioms object
+    # (kafka_idioms despite the name -- see module docstring) -- active_idioms plays no
+    # role here either.
+    http_client_active = bool(kafka_idioms.http_clients)
+    domain_active = fastapi_active or kafka_active or temporal_active or http_client_active
 
     nodes = [make_service_node(svc.name)]
     edges = []
@@ -202,6 +218,12 @@ def analyze_service(
                 # temporal_start_mark: per-file claim, consumed later by S7 (T7) via
                 # staging.claims_for + update_edge_props on the matching CALLS edge.
                 staging.add_claims(svc.name, rp, "temporal_start_mark", tr.claims)
+
+            if http_client_active:
+                hr = extract_http_client(ctx, node_ids, kafka_idioms)
+                # http_call: per-file claim, consumed later by S7 (T7) via
+                # staging.claims_for + the cross-service http_route table (CALLS_HTTP).
+                staging.add_claims(svc.name, rp, "http_call", hr.claims)
 
     if domain_roles or domain_node_props:
         nodes = [_apply_role_props_patch(n, domain_roles, domain_node_props) for n in nodes]
