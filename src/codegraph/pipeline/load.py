@@ -83,7 +83,19 @@ def _omit_none(d: dict) -> dict:
 
 def _node_props(n: NodeRec) -> dict:
     core = {field: getattr(n, field) for field in _NODE_CORE_FIELDS}
-    return _omit_none({**core, **n.props})
+    props = _omit_none({**core, **n.props})
+    # M2 T8: roles live as graph LABELS via _labels_for_kind (multi-label, e.g.
+    # :Sym:Function:RouteHandler) -- but store.get_nodes()/neighbors() only ever
+    # return n.properties (see stores/falkordb/store.py: `RETURN n`/`RETURN e, m`
+    # decode to .properties, never labels(n)), so query/traverse.py (which walks
+    # role-gated transitions -- MessageConsumer/RouteHandler/TemporalWorkflow) has
+    # no way to see a node's roles from a plain node dict without this explicit
+    # mirror. Omitted entirely (not even []) when a node carries no roles, same
+    # spirit as _omit_none: don't store a not-applicable field on kinds that never
+    # have roles (Channel/BusinessProcess/Service) or role-less code nodes.
+    if n.roles:
+        props["roles"] = list(n.roles)
+    return props
 
 
 def _edge_props(e: EdgeRec) -> dict:

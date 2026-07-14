@@ -108,3 +108,95 @@ class WhoCallsInput(BaseModel):
 class WhoCallsOutput(BaseModel):
     callers: list[dict]
     truncated: bool
+
+
+# -- M2 T8: trace_process / find_paths / list_processes / find_entrypoint --
+
+
+class TraceProcessInput(BaseModel):
+    entrypoint_id: str
+    direction: Literal["downstream", "upstream"] = "downstream"  # upstream -> error dict, M2
+    max_segments: int = 12  # клампится в GraphQuery к [1,20]
+    min_confidence: float = 0.3
+    include_source: bool = False
+
+
+class TraceStep(BaseModel):
+    """Один intra-сегмент переход (CALLS/DEPENDS_ON/INVOKES_ACTIVITY; CALLS с
+    props["mechanism"]=="temporal_start" -- тот же edge_type, просто с этим
+    доп. props-ключом, см. query/traverse.py). direction всегда "out" в M2
+    (downstream-only walk)."""
+
+    edge_type: str
+    props: dict
+    node: dict
+    direction: Literal["out"]
+
+
+class TraceExit(BaseModel):
+    """Выход сегмента через канал (PRODUCES/CALLS_HTTP): next_entry_ids -- entry-id
+    следующих сегментов, восстановленные через NEXT_SEGMENT+via_channel_id
+    (см. query/traverse.py модульный докстринг); пустой список -- канал без
+    резолвленного потребителя (dead end), не ошибка."""
+
+    channel: dict
+    next_entry_ids: list[str]
+
+
+class TraceSegment(BaseModel):
+    service: str
+    entry: dict
+    steps: list[TraceStep]
+    exits: list[TraceExit]
+    truncated: bool  # depth>15 или branch>8 внутри ЭТОГО сегмента
+
+
+class TraceProcessOutput(BaseModel):
+    segments: list[TraceSegment]
+    confidence: float  # min по всем пройденным рёбрам (шаги + переходы); 1.0 если рёбер нет
+    truncated: bool  # true если truncated у любого сегмента ИЛИ max_segments срезал список
+
+
+class FindPathsInput(BaseModel):
+    from_id: str
+    to_id: str
+    max_hops: int = 8  # клампится в GraphQuery к [1,12]
+    edge_types: list[str] | None = None
+
+
+class PathStep(BaseModel):
+    """Один узел пути; edge_type/direction -- ребро, которым СЮДА пришли (None у
+    самого первого узла -- у него нет входящего в путь ребра)."""
+
+    node: dict
+    edge_type: str | None = None
+    direction: Literal["out", "in"] | None = None
+
+
+class FindPathsOutput(BaseModel):
+    path: list[PathStep] | None  # None -- путь не найден (не ошибка)
+
+
+class ListProcessesInput(BaseModel):
+    """Без параметров -- как GraphStatsInput."""
+
+
+class ProcessOut(BaseModel):
+    id: str
+    name: str
+    entrypoint_id: str
+    source: str
+
+
+class ListProcessesOutput(BaseModel):
+    processes: list[ProcessOut]
+
+
+class FindEntrypointInput(BaseModel):
+    query: str
+    kinds: list[str] | None = None
+    k: int = 5  # клампится в GraphQuery к [1,20]
+
+
+class FindEntrypointOutput(BaseModel):
+    results: list[dict]  # каждый -- node properties + "score" (см. store.search_fulltext)

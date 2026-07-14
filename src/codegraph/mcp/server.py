@@ -1,7 +1,14 @@
-"""FastMCP v0 сервер: 4 read-only инструмента (graph_stats/get_source/expand_neighbors/
-who_calls), тонкая делегация в query.api.GraphQuery -- ни одного Cypher-запроса и ни
-одного обращения к GraphStore.raw() в этом модуле (см. stores/graph.py:
+"""FastMCP сервер: 8 read-only инструментов (M1 v0: graph_stats/get_source/
+expand_neighbors/who_calls; M2 T8: trace_process/find_paths/list_processes/
+find_entrypoint), тонкая делегация в query.api.GraphQuery -- ни одного Cypher-
+запроса и ни одного обращения к GraphStore.raw() в этом модуле (см. stores/graph.py:
 GraphStore.raw() docstring -- "internal-only", не для MCP).
+
+Локальная переменная -- `gq` (не `query`): find_entrypoint's собственный
+параметр -- ИМЕННО `query: str` (см. mcp/schemas.py FindEntrypointInput /
+query.api.GraphQuery.find_entrypoint) -- назови эту переменную `query`, и
+find_entrypoint's тело закрыло бы её собственным строковым параметром
+(shadowing), сделав GraphQuery-инстанс недостижимым внутри своего же tool-а.
 
 Инструменты принимают ПЛОСКИЕ kwargs (не единственный pydantic-параметр): fastmcp
 разворачивает функцию с одним BaseModel-параметром во ВЛОЖЕННЫЙ inputSchema
@@ -47,7 +54,7 @@ def build_server(cfg: WorkspaceConfig, graph_name: str) -> FastMCP:
     устаревший schema-кэш клиента.
     """
     service_paths: dict[str, Path] = {svc.name: svc.path for svc in cfg.services}
-    query = GraphQuery(
+    gq = GraphQuery(
         store_factory=lambda: FalkorStore(cfg.storage.falkordb, graph_name),
         service_paths=service_paths,
     )
@@ -57,13 +64,13 @@ def build_server(cfg: WorkspaceConfig, graph_name: str) -> FastMCP:
     @mcp.tool
     def graph_stats() -> dict:
         """Счётчики узлов по kind и рёбер по type в текущем графе."""
-        return query.graph_stats()
+        return gq.graph_stats()
 
     @mcp.tool
     def get_source(node_id: str, context_lines: int = 0) -> dict:
         """Исходный текст узла (+/- context_lines строк контекста) с флагом staleness
         (файл на диске изменился после индексации -- содержимое может не совпадать)."""
-        return query.get_source(node_id, context_lines=context_lines)
+        return gq.get_source(node_id, context_lines=context_lines)
 
     @mcp.tool
     def expand_neighbors(
@@ -79,7 +86,7 @@ def build_server(cfg: WorkspaceConfig, graph_name: str) -> FastMCP:
         Каждый hop несёт своё направление (direction: "out"|"in") -- в режиме
         direction="both" это различает исходные и обратные рёбра после слияния.
         Невалидный direction -> {"error": "invalid direction: ..."} (не исключение)."""
-        return query.expand_neighbors(
+        return gq.expand_neighbors(
             node_id, edge_types=edge_types, direction=direction, depth=depth, limit=limit
         )
 
@@ -87,6 +94,53 @@ def build_server(cfg: WorkspaceConfig, graph_name: str) -> FastMCP:
     def who_calls(node_id: str, transitive: bool = False, max_depth: int = 3) -> dict:
         """Вызывающие узел через CALLS-рёбра: прямые (transitive=false) или BFS вверх
         по цепочке вызовов до max_depth (клампится к 1..5, transitive=true)."""
-        return query.who_calls(node_id, transitive=transitive, max_depth=max_depth)
+        return gq.who_calls(node_id, transitive=transitive, max_depth=max_depth)
+
+    @mcp.tool
+    def trace_process(
+        entrypoint_id: str,
+        direction: Literal["downstream", "upstream"] = "downstream",
+        max_segments: int = 12,
+        min_confidence: float = 0.3,
+        include_source: bool = False,
+    ) -> dict:
+        """Трассировка бизнес-процесса от entrypoint_id вниз по цепочке вызовов и
+        каналов (downstream-only в M2 -- direction="upstream" -> error dict, не
+        исключение). max_segments клампится к 1..20, каждый сегмент -- до 15 хопов
+        вглубь / 8 в ширину (truncated -- на сегменте и агрегированно). confidence --
+        минимум по всем пройденным рёбрам (шагам и меж-сегментным переходам),
+        отфильтрованным по min_confidence. include_source=true подмешивает исходный
+        текст (get_source) в каждый узел трассы, best-effort (узлы без источника --
+        напр. Channel -- остаются без "source", не ошибка)."""
+        return gq.trace_process(
+            entrypoint_id, direction=direction, max_segments=max_segments,
+            min_confidence=min_confidence, include_source=include_source,
+        )
+
+    @mcp.tool
+    def find_paths(
+        from_id: str,
+        to_id: str,
+        max_hops: int = 8,
+        edge_types: list[str] | None = None,
+    ) -> dict:
+        """BFS-путь между from_id и to_id по рёбрам в обе стороны (max_hops
+        клампится к 1..12); путь -- список узлов с рёбрами, которыми до них дошли
+        (edge_type/direction у самого from_id -- null). Путь не найден ->
+        {"path": null} (не ошибка)."""
+        return gq.find_paths(from_id, to_id, max_hops=max_hops, edge_types=edge_types)
+
+    @mcp.tool
+    def list_processes() -> dict:
+        """Все BusinessProcess-узлы графа (id/name/entrypoint_id/source), отсортированы
+        по id."""
+        return gq.list_processes()
+
+    @mcp.tool
+    def find_entrypoint(query: str, kinds: list[str] | None = None, k: int = 5) -> dict:
+        """Fulltext-поиск по Sym(name, qualified_name, docstring) (k клампится к
+        1..20); kinds -- опциональный фильтр по n.kind. Пустой результат (в т.ч.
+        запрос из одних RediSearch-спецсимволов) -- не ошибка, {"results": []}."""
+        return gq.find_entrypoint(query, kinds=kinds, k=k)
 
     return mcp

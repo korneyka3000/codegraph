@@ -8,6 +8,7 @@ blue/green через Redis RENAME.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import Any, Literal
 
@@ -25,6 +26,31 @@ _DIRECTION_PATTERNS = {
     "out": "(n {id: $id})-[e]->(m)",
     "in": "(n {id: $id})<-[e]-(m)",
 }
+
+# RediSearch query-syntax special characters (M2 T8 fulltext search): a raw query
+# string containing these -- e.g. a qualified name like "app.routes.orders" (the
+# dot survives; only THESE chars are special) or free text with punctuation --
+# must not reach db.idx.fulltext.queryNodes verbatim, or RediSearch parses them as
+# query OPERATORS (`-` = NOT, `|` = OR, `@field:` = field-scoping, `*` = wildcard,
+# `(`/`)` = grouping, `~` = fuzzy, `"` = phrase, `{}` = tag/range, `$` = param
+# marker, `%` = fuzzy-distance, `<`/`>` = numeric range) instead of literal text,
+# either raising a syntax error or silently changing what's matched. `-` is
+# escaped (not just placed at class edges) so it reads unambiguously here.
+_FULLTEXT_SPECIAL_CHARS = re.compile(r'[@{}|()~*"$:%\-<>]')
+
+
+def _sanitize_fulltext_query(query: str) -> str:
+    """Replaces (not strips) each RediSearch special char with a space -- stripping
+    outright would glue adjacent tokens together (`"orders-api"` -> `"ordersapi"`,
+    a DIFFERENT word from either "orders" or "api"), which is worse than losing the
+    character entirely. Runs of whitespace produced by the substitution (or already
+    present) collapse to single spaces, and leading/trailing whitespace is trimmed.
+
+    A query that is empty, all-whitespace, or entirely special characters (e.g.
+    `"@{}~*"`) sanitizes to `""` -- callers MUST treat that as "no usable query
+    text" and skip the RediSearch call entirely (an empty or pure-operator query
+    string is a syntax error there, not a legitimate empty-result search)."""
+    return " ".join(_FULLTEXT_SPECIAL_CHARS.sub(" ", query).split())
 
 
 class FalkorStore:
@@ -69,6 +95,22 @@ class FalkorStore:
         res = self._g.query(
             "UNWIND $ids AS i MATCH (n {id: i}) RETURN n", {"ids": list(ids)}
         )
+        return [row[0].properties for row in res.result_set]
+
+    def get_nodes_by_kind(self, kind: str) -> list[dict]:
+        """`MATCH (n {kind: $kind}) RETURN n` -- property match on `n.kind` (every
+        loaded node carries it, see pipeline/load._NODE_CORE_FIELDS), NOT a label
+        match: Cypher labels cannot be parameterized (`MATCH (n:$kind)` is not
+        valid syntax), and interpolating `kind` as a label would need its own
+        allowlist-before-f-string guard (see batch.py's `_validate_labels`). A
+        property match sidesteps that whole class of concern for free -- `kind` is
+        just another bind parameter here, same as `id` in get_nodes above. M2 T8's
+        only caller is query.api.GraphQuery.list_processes (kind="BusinessProcess")
+        -- BusinessProcess nodes aren't reachable via get_nodes (their ids aren't
+        known ahead of time by any caller) or via neighbors (no fixed node to walk
+        from), so this is the one place a plain "give me every node of this kind"
+        query is needed."""
+        res = self._g.query("MATCH (n {kind: $kind}) RETURN n", {"kind": kind})
         return [row[0].properties for row in res.result_set]
 
     def neighbors(
@@ -125,6 +167,34 @@ class FalkorStore:
         nodes = self._g.query("MATCH (n) RETURN n.kind, count(n)")
         edges = self._g.query("MATCH ()-[e]->() RETURN type(e), count(e)")
         return {"nodes": dict(nodes.result_set), "edges": dict(edges.result_set)}
+
+    def search_fulltext(
+        self, query: str, k: int, kinds: Sequence[str] | None = None
+    ) -> list[dict]:
+        """`CALL db.idx.fulltext.queryNodes('Sym', $q) YIELD node, score` over the
+        Sym(name, qualified_name, docstring) fulltext index (ddl.ensure_schema) --
+        `query` is sanitized first (RediSearch operator chars -> space, see
+        _sanitize_fulltext_query); a query that sanitizes to "" returns [] WITHOUT
+        ever calling FalkorDB (an empty/pure-operator RediSearch query string is a
+        syntax error there, not a legitimate empty-result search -- see
+        query.api.GraphQuery.find_entrypoint, the only caller).
+
+        `kinds`, if given, narrows results to `node.kind IN $kinds` (a property
+        filter alongside the fulltext YIELD, same parameterization pattern as
+        neighbors()'s `type(e) IN $types` -- no injection surface). Results are
+        ordered by RediSearch relevance score, descending, capped at `k`; each
+        result is the node's properties with an added "score" key (float)."""
+        sanitized = _sanitize_fulltext_query(query)
+        if not sanitized:
+            return []
+        cypher = "CALL db.idx.fulltext.queryNodes('Sym', $q) YIELD node, score"
+        params: dict[str, Any] = {"q": sanitized, "k": k}
+        if kinds:
+            cypher += " WHERE node.kind IN $kinds"
+            params["kinds"] = list(kinds)
+        cypher += " RETURN node, score ORDER BY score DESC LIMIT $k"
+        res = self._g.query(cypher, params)
+        return [{**node.properties, "score": score} for node, score in res.result_set]
 
     def graph_exists(self) -> bool:
         """True, если граф-ключ self.graph_name существует (membership в GRAPH.LIST).

@@ -1,0 +1,443 @@
+"""Юниты query.traverse (M2 T8) на fake store: trace_process (сегмент-обход) +
+find_paths (BFS). Живой FalkorDB не нужен -- контракт MCP-схем/сети живёт в
+tests/integration/test_mcp_contract.py (marker falkordb).
+
+Мини-граф из плана (§Task 8 test bullet): route(create_order, RouteHandler)
+-CALLS-> save_order -PRODUCES-> chan:event_type:OrderCreated <-CONSUMES-
+handle_order_created(MessageConsumer) -CALLS(mechanism=temporal_start)->
+KycWorkflow.run -INVOKES_ACTIVITY-> verify_documents -CALLS_HTTP->
+chan:http:doc-mgmt:GET /documents/{id} -HANDLES-> get_document(RouteHandler).
+Three segments (orders-api / kyc-worker / doc-mgmt), two channel crossings (one
+event, one http); segments.py's own NEXT_SEGMENT derivation is NOT re-run here --
+the fake store's NEXT_SEGMENT edges are seeded directly, exactly as T7's
+segments.derive() would have produced them (via_channel_id keyed on the producer
+side's own edge target -- see linking/segments.py docstring), since traverse.py's
+job is to CONSUME that pre-derived fast path, not re-derive it (see traverse.py
+module docstring)."""
+
+from __future__ import annotations
+
+from codegraph.query import traverse
+
+
+class FakeStore:
+    """Duck-typed GraphStore subset traverse.py actually calls: get_nodes/neighbors
+    only (same shape as tests/unit/test_query_api.py's FakeStore -- traverse.py
+    never touches upsert/schema/stats/search_fulltext, it's a read-only walker)."""
+
+    def __init__(self) -> None:
+        self.nodes: dict[str, dict] = {}
+        self.edges: list[tuple[str, str, dict, str]] = []  # (src, edge_type, props, dst)
+
+    def add_node(self, node_id: str, **props) -> None:
+        self.nodes[node_id] = {"id": node_id, **props}
+
+    def add_edge(self, src: str, edge_type: str, dst: str, **edge_props) -> None:
+        edge_props.setdefault("confidence", 1.0)
+        edge_props.setdefault("resolution", "static")
+        self.edges.append((src, edge_type, edge_props, dst))
+
+    def get_nodes(self, ids):
+        return [self.nodes[i] for i in ids if i in self.nodes]
+
+    def neighbors(self, node_id, edge_types, direction, limit):
+        # trace_process only ever calls with direction="out" (downstream-only, M2);
+        # find_paths calls with direction="both". Mirrors FalkorStore.neighbors'
+        # documented both=out+in-merge semantics over a plain in-memory edge list.
+        out = [
+            (et, dict(ep), self.nodes[d], "out")
+            for (s, et, ep, d) in self.edges
+            if s == node_id and (not edge_types or et in edge_types)
+        ]
+        inn = [
+            (et, dict(ep), self.nodes[s], "in")
+            for (s, et, ep, d) in self.edges
+            if d == node_id and (not edge_types or et in edge_types)
+        ]
+        merged = out if direction == "out" else inn if direction == "in" else out + inn
+        return merged[:limit]
+
+
+def _three_segment_store() -> FakeStore:
+    store = FakeStore()
+    # -- segment 0: orders-api --
+    store.add_node(
+        "create_order",
+        service="orders-api",
+        kind="Function",
+        name="create_order",
+        roles=["RouteHandler"],
+    )
+    store.add_node("save_order", service="orders-api", kind="Function", name="save_order")
+    store.add_node(
+        "chan:event_type:OrderCreated",
+        kind="Channel",
+        name="OrderCreated",
+        channel_kind="event_type",
+    )
+    store.add_edge("create_order", "CALLS", "save_order")
+    store.add_edge("save_order", "PRODUCES", "chan:event_type:OrderCreated")
+
+    # -- segment 1: kyc-worker --
+    store.add_node(
+        "handle_order_created",
+        service="kyc-worker",
+        kind="Function",
+        name="handle_order_created",
+        roles=["MessageConsumer"],
+    )
+    store.add_node("KycWorkflow.run", service="kyc-worker", kind="Function", name="run")
+    store.add_node(
+        "verify_documents",
+        service="kyc-worker",
+        kind="Function",
+        name="verify_documents",
+        roles=["TemporalActivity"],
+    )
+    store.add_node(
+        "chan:http:doc-mgmt:GET /documents/{id}",
+        kind="Channel",
+        name="GET /documents/{id}",
+        channel_kind="http_route",
+    )
+    store.add_edge("handle_order_created", "CONSUMES", "chan:event_type:OrderCreated")
+    store.add_edge(
+        "handle_order_created",
+        "CALLS",
+        "KycWorkflow.run",
+        mechanism="temporal_start",
+        resolution="dynamic",
+    )
+    store.add_edge("KycWorkflow.run", "INVOKES_ACTIVITY", "verify_documents")
+    store.add_edge("verify_documents", "CALLS_HTTP", "chan:http:doc-mgmt:GET /documents/{id}")
+
+    # -- segment 2: doc-mgmt --
+    store.add_node(
+        "get_document",
+        service="doc-mgmt",
+        kind="Function",
+        name="get_document",
+        roles=["RouteHandler"],
+    )
+    store.add_edge("chan:http:doc-mgmt:GET /documents/{id}", "HANDLES", "get_document")
+
+    # -- fast-path NEXT_SEGMENT edges, exactly as linking/segments.derive() would
+    # produce them: src = the node with the actual PRODUCES/CALLS_HTTP edge. --
+    store.add_edge(
+        "save_order",
+        "NEXT_SEGMENT",
+        "handle_order_created",
+        via_channel_id="chan:event_type:OrderCreated",
+        derived=True,
+        confidence=1.0,
+        resolution="static",
+    )
+    store.add_edge(
+        "verify_documents",
+        "NEXT_SEGMENT",
+        "get_document",
+        via_channel_id="chan:http:doc-mgmt:GET /documents/{id}",
+        derived=True,
+        confidence=1.0,
+        resolution="static",
+    )
+    return store
+
+
+# -- happy path: 3 segments, 2 channel crossings, temporal_start step --
+
+
+def test_three_segments_via_event_and_http_channel():
+    store = _three_segment_store()
+    result = traverse.trace_process(store, "create_order", max_segments=12, min_confidence=0.3)
+
+    assert "error" not in result
+    assert len(result["segments"]) == 3
+    seg0, seg1, seg2 = result["segments"]
+
+    assert seg0["service"] == "orders-api"
+    assert seg0["entry"]["id"] == "create_order"
+    assert [s["node"]["id"] for s in seg0["steps"]] == ["save_order"]
+    assert seg0["steps"][0]["edge_type"] == "CALLS"
+    assert seg0["steps"][0]["direction"] == "out"
+    assert len(seg0["exits"]) == 1
+    assert seg0["exits"][0]["channel"]["id"] == "chan:event_type:OrderCreated"
+    assert seg0["exits"][0]["next_entry_ids"] == ["handle_order_created"]
+    assert seg0["truncated"] is False
+
+    assert seg1["service"] == "kyc-worker"
+    assert seg1["entry"]["id"] == "handle_order_created"
+    step_ids = {s["node"]["id"] for s in seg1["steps"]}
+    assert step_ids == {"KycWorkflow.run", "verify_documents"}
+    assert seg1["exits"][0]["channel"]["id"] == "chan:http:doc-mgmt:GET /documents/{id}"
+    assert seg1["exits"][0]["next_entry_ids"] == ["get_document"]
+
+    assert seg2["service"] == "doc-mgmt"
+    assert seg2["entry"]["id"] == "get_document"
+    assert seg2["steps"] == []
+    assert seg2["exits"] == []
+
+    assert result["truncated"] is False
+    assert 0.0 < result["confidence"] <= 1.0
+
+
+def test_temporal_start_call_appears_as_intra_segment_step_with_mechanism_prop():
+    store = _three_segment_store()
+    result = traverse.trace_process(store, "create_order", max_segments=12, min_confidence=0.3)
+    seg1 = result["segments"][1]
+    step = next(s for s in seg1["steps"] if s["node"]["id"] == "KycWorkflow.run")
+    assert step["edge_type"] == "CALLS"
+    assert step["props"]["mechanism"] == "temporal_start"
+
+
+def test_invokes_activity_step_present_in_same_segment_as_temporal_start():
+    store = _three_segment_store()
+    result = traverse.trace_process(store, "create_order", max_segments=12, min_confidence=0.3)
+    seg1 = result["segments"][1]
+    step = next(s for s in seg1["steps"] if s["node"]["id"] == "verify_documents")
+    assert step["edge_type"] == "INVOKES_ACTIVITY"
+
+
+# -- entrypoint not found --
+
+
+def test_entrypoint_not_found_returns_error_dict():
+    store = FakeStore()
+    result = traverse.trace_process(store, "does-not-exist", max_segments=12, min_confidence=0.3)
+    assert "error" in result
+    assert "does-not-exist" in result["error"]
+
+
+# -- min_confidence filters steps and cross-segment transitions --
+
+
+def test_min_confidence_filters_low_confidence_step():
+    store = FakeStore()
+    store.add_node("entry", service="a", kind="Function")
+    store.add_node("strong", service="a", kind="Function")
+    store.add_node("weak", service="a", kind="Function")
+    store.add_edge("entry", "CALLS", "strong", confidence=0.9)
+    store.add_edge("entry", "CALLS", "weak", confidence=0.1)
+
+    high = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+    assert {s["node"]["id"] for s in high["segments"][0]["steps"]} == {"strong"}
+
+    low = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.0)
+    assert {s["node"]["id"] for s in low["segments"][0]["steps"]} == {"strong", "weak"}
+
+
+def test_min_confidence_filters_next_segment_transition():
+    store = FakeStore()
+    store.add_node("producer", service="a", kind="Function")
+    store.add_node("chan:event_type:E", kind="Channel", channel_kind="event_type")
+    store.add_node("consumer", service="b", kind="Function")
+    store.add_edge("producer", "PRODUCES", "chan:event_type:E")
+    store.add_edge(
+        "producer",
+        "NEXT_SEGMENT",
+        "consumer",
+        via_channel_id="chan:event_type:E",
+        derived=True,
+        confidence=0.1,
+        resolution="heuristic",
+    )
+
+    result = traverse.trace_process(store, "producer", max_segments=12, min_confidence=0.3)
+    assert len(result["segments"]) == 1  # low-confidence NEXT_SEGMENT not followed
+    assert result["segments"][0]["exits"][0]["next_entry_ids"] == []
+
+
+# -- max_segments truncation --
+
+
+def test_max_segments_truncates_and_sets_flag():
+    store = _three_segment_store()
+    result = traverse.trace_process(store, "create_order", max_segments=2, min_confidence=0.3)
+    assert len(result["segments"]) == 2
+    assert result["truncated"] is True
+
+
+def test_max_segments_not_hit_is_not_truncated_by_segment_count():
+    store = _three_segment_store()
+    result = traverse.trace_process(store, "create_order", max_segments=12, min_confidence=0.3)
+    assert result["truncated"] is False
+
+
+# -- cycles terminate --
+
+
+def test_intra_segment_call_cycle_does_not_hang():
+    store = FakeStore()
+    store.add_node("a", service="s", kind="Function")
+    store.add_node("b", service="s", kind="Function")
+    store.add_edge("a", "CALLS", "b")
+    store.add_edge("b", "CALLS", "a")  # cycle
+
+    result = traverse.trace_process(store, "a", max_segments=12, min_confidence=0.3)
+    assert len(result["segments"]) == 1
+    step_ids = [s["node"]["id"] for s in result["segments"][0]["steps"]]
+    assert step_ids.count("b") == 1  # recorded once, not re-expanded infinitely
+    assert step_ids.count("a") == 1  # b->a hop recorded too (a already visited, not re-queued)
+
+
+def test_segment_level_cycle_does_not_hang_and_visits_each_entry_once():
+    store = FakeStore()
+    store.add_node("entryA", service="a", kind="Function")
+    store.add_node("entryB", service="b", kind="Function")
+    store.add_node("chan:event_type:E1", kind="Channel", channel_kind="event_type")
+    store.add_node("chan:event_type:E2", kind="Channel", channel_kind="event_type")
+    store.add_edge("entryA", "PRODUCES", "chan:event_type:E1")
+    store.add_edge(
+        "entryA", "NEXT_SEGMENT", "entryB", via_channel_id="chan:event_type:E1", derived=True
+    )
+    store.add_edge("entryB", "PRODUCES", "chan:event_type:E2")
+    store.add_edge(
+        "entryB", "NEXT_SEGMENT", "entryA", via_channel_id="chan:event_type:E2", derived=True
+    )  # cycle back to entryA
+
+    result = traverse.trace_process(store, "entryA", max_segments=12, min_confidence=0.3)
+    assert {s["entry"]["id"] for s in result["segments"]} == {"entryA", "entryB"}
+    assert len(result["segments"]) == 2
+
+
+# -- topic-level consumer reached via containment (T7-derived NEXT_SEGMENT) --
+
+
+def test_exit_includes_topic_level_consumer_reached_via_containment():
+    # segments.derive()'s containment pairing keys via_channel_id on the EVENT the
+    # producer targets directly, never the topic (see linking/segments.py
+    # docstring) -- traverse.py doesn't re-derive containment itself, it just
+    # follows whatever NEXT_SEGMENT the linker already produced, so this proves
+    # the fast path surfaces a topic-level consumer transparently.
+    store = FakeStore()
+    store.add_node("entry", service="a", kind="Function")
+    store.add_node("chan:event_type:E", kind="Channel", channel_kind="event_type")
+    store.add_node("topic-consumer", service="b", kind="Function", roles=["MessageConsumer"])
+    store.add_edge("entry", "PRODUCES", "chan:event_type:E")
+    store.add_edge(
+        "entry", "NEXT_SEGMENT", "topic-consumer", via_channel_id="chan:event_type:E", derived=True
+    )
+
+    result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+    assert {s["entry"]["id"] for s in result["segments"]} == {"entry", "topic-consumer"}
+    exits = result["segments"][0]["exits"]
+    assert len(exits) == 1
+    assert exits[0]["channel"]["id"] == "chan:event_type:E"
+    assert exits[0]["next_entry_ids"] == ["topic-consumer"]
+
+
+# -- branching cap (<=8) --
+
+
+def test_branch_cap_limits_steps_per_node_and_sets_truncated():
+    store = FakeStore()
+    store.add_node("hub", service="a", kind="Function")
+    for i in range(10):
+        store.add_node(f"leaf{i}", service="a", kind="Function")
+        store.add_edge("hub", "CALLS", f"leaf{i}")
+
+    result = traverse.trace_process(store, "hub", max_segments=12, min_confidence=0.3)
+    seg = result["segments"][0]
+    assert len(seg["steps"]) == 8
+    assert seg["truncated"] is True
+    assert result["truncated"] is True
+
+
+# -- determinism: repeated calls over the same store produce identical output --
+
+
+def test_trace_process_is_deterministic_across_repeated_calls():
+    store = _three_segment_store()
+    first = traverse.trace_process(store, "create_order", max_segments=12, min_confidence=0.3)
+    second = traverse.trace_process(store, "create_order", max_segments=12, min_confidence=0.3)
+    assert first == second
+
+
+# ============================== find_paths ==============================
+
+
+def test_find_paths_finds_path_through_next_segment_edge():
+    store = _three_segment_store()
+    result = traverse.find_paths(
+        store, "create_order", "handle_order_created", max_hops=8, edge_types=None
+    )
+    path = result["path"]
+    assert path is not None
+    node_ids = [step["node"]["id"] for step in path]
+    assert node_ids[0] == "create_order"
+    assert node_ids[-1] == "handle_order_created"
+    assert path[0]["edge_type"] is None
+    assert path[0]["direction"] is None
+    assert path[-1]["edge_type"] == "NEXT_SEGMENT"
+
+
+def test_find_paths_returns_shortest_path_by_hop_count():
+    store = FakeStore()
+    store.add_node("a", kind="Function")
+    store.add_node("b", kind="Function")
+    store.add_node("c", kind="Function")
+    store.add_node("d", kind="Function")
+    store.add_edge("a", "CALLS", "d")  # direct, 1 hop
+    store.add_edge("a", "CALLS", "b")
+    store.add_edge("b", "CALLS", "c")
+    store.add_edge("c", "CALLS", "d")  # longer, 3 hops
+
+    result = traverse.find_paths(store, "a", "d", max_hops=8, edge_types=None)
+    node_ids = [step["node"]["id"] for step in result["path"]]
+    assert node_ids == ["a", "d"]
+
+
+def test_find_paths_not_found_returns_null_path():
+    store = FakeStore()
+    store.add_node("a", kind="Function")
+    store.add_node("b", kind="Function")  # no edge between them
+    result = traverse.find_paths(store, "a", "b", max_hops=8, edge_types=None)
+    assert result == {"path": None}
+
+
+def test_find_paths_missing_from_id_returns_null_path():
+    store = FakeStore()
+    result = traverse.find_paths(store, "ghost", "also-ghost", max_hops=8, edge_types=None)
+    assert result == {"path": None}
+
+
+def test_find_paths_same_node_returns_trivial_single_node_path():
+    store = FakeStore()
+    store.add_node("a", kind="Function")
+    result = traverse.find_paths(store, "a", "a", max_hops=8, edge_types=None)
+    assert result["path"] == [{"node": store.nodes["a"], "edge_type": None, "direction": None}]
+
+
+def test_find_paths_respects_edge_types_filter():
+    store = FakeStore()
+    store.add_node("a", kind="Function")
+    store.add_node("b", kind="Function")
+    store.add_edge("a", "CONTAINS", "b")
+    result = traverse.find_paths(store, "a", "b", max_hops=8, edge_types=["CALLS"])
+    assert result == {"path": None}
+    result_unfiltered = traverse.find_paths(store, "a", "b", max_hops=8, edge_types=None)
+    assert result_unfiltered["path"] is not None
+
+
+def test_find_paths_direction_field_reflects_true_hop_direction():
+    # a -CALLS-> b: walking FROM b (both-direction expansion) reaches a via an
+    # "in" hop -- direction must reflect that, not a hardcoded "out".
+    store = FakeStore()
+    store.add_node("a", kind="Function")
+    store.add_node("b", kind="Function")
+    store.add_edge("a", "CALLS", "b")
+    result = traverse.find_paths(store, "b", "a", max_hops=8, edge_types=None)
+    assert result["path"][-1]["direction"] == "in"
+    assert result["path"][-1]["edge_type"] == "CALLS"
+
+
+def test_find_paths_max_hops_limits_search_depth():
+    store = FakeStore()
+    names = [f"n{i}" for i in range(6)]
+    for n in names:
+        store.add_node(n, kind="Function")
+    for i in range(len(names) - 1):
+        store.add_edge(names[i], "CALLS", names[i + 1])  # n0->n1->...->n5, 5 hops
+
+    assert traverse.find_paths(store, "n0", "n5", max_hops=5, edge_types=None)["path"] is not None
+    assert traverse.find_paths(store, "n0", "n5", max_hops=4, edge_types=None) == {"path": None}

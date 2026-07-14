@@ -1,4 +1,6 @@
-"""DDL для FalkorDB: range-индексы Sym.* и UNIQUE-констрейнт Sym.id (идемпотентно).
+"""DDL для FalkorDB: range-индексы Sym.* и UNIQUE-констрейнт Sym.id (идемпотентно) +
+fulltext-индекс Sym(name, qualified_name, docstring) (M2 T8, для
+store.search_fulltext/GraphQuery.find_entrypoint).
 
 Chunk.id индексы здесь НЕ создаются — появятся в M3 вместе с векторным поиском.
 """
@@ -16,6 +18,11 @@ logger = logging.getLogger(__name__)
 #       redis.exceptions.ResponseError: "Attribute 'id' is already indexed"
 #   - GRAPH.CONSTRAINT CREATE дважды:
 #       redis.exceptions.ResponseError: 'Constraint already exists'
+#   - db.idx.fulltext.createNodeIndex дважды на том же (label, property) (M2 T8,
+#     захвачено эмпирически тем же способом): та же формулировка, что у range-
+#     индекса --
+#       redis.exceptions.ResponseError: "Attribute 'name' is already indexed"
+#     -- уже покрыта маркером "already indexed" ниже, отдельный маркер не нужен.
 # Подстрочный (регистронезависимый) матч по этим маркерам даёт идемпотентность;
 # всё остальное — например 'missing supporting exact-match index' при нарушении
 # порядка индекс-до-констрейнта — настоящая ошибка и пробрасывается.
@@ -38,6 +45,14 @@ def ensure_schema(db, graph_name: str) -> None:
     ))
     _swallow_ddl_errors(lambda: g.query("CREATE INDEX FOR (n:Sym) ON (n.qualified_name)"))
     _swallow_ddl_errors(lambda: g.query("CREATE INDEX FOR (n:Sym) ON (n.service)"))
+    # M2 T8: fulltext index over Sym(name, qualified_name, docstring) --
+    # store.search_fulltext's only index (GraphQuery.find_entrypoint). Order
+    # relative to the range indexes/constraint above doesn't matter (no
+    # supporting-index dependency like the id-constraint has); placed last simply
+    # because it's the newest addition.
+    _swallow_ddl_errors(lambda: g.query(
+        "CALL db.idx.fulltext.createNodeIndex('Sym', 'name', 'qualified_name', 'docstring')"
+    ))
 
 
 def _swallow_ddl_errors(fn: Callable[[], object]) -> None:

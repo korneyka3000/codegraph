@@ -221,3 +221,45 @@ def test_no_processes_configured_and_no_temporal_roles_is_noop(tmp_path):
     assert stats["processes"] == 0
     assert list(st.iter_nodes()) == []
     assert list(st.iter_edges()) == []
+
+
+# -- resolve_selector: public wrapper reused by CLI `trace` (M2 T8) -- same
+# parser/resolution logic materialize() uses internally, exposed standalone so
+# cli.py doesn't reimplement the "<service>:<METHOD> <path>" / "<service>:qualified"
+# selector grammar a second time (see linking/processes.py module docstring and
+# cli.py's `trace` command). --
+
+
+def test_resolve_selector_http_route_form(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    chan = make_channel_node("http_route", owner_service="orders-api", method="POST",
+                              template="/orders", http_method="POST", path_template="/orders")
+    handler = _fn("sym:orders-api:create_order", "orders-api", "create_order",
+                   "app.routes.orders.create_order")
+    st.upsert_nodes([chan, handler])
+    st.upsert_edges([_edge(chan.id, handler.id, "HANDLES")])
+
+    assert processes.resolve_selector(st, "orders-api:POST /orders") == handler.id
+
+
+def test_resolve_selector_qualified_form(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    workflow = NodeRec(id="sym:kyc-worker:KycWorkflow", kind="Class", service="kyc-worker",
+                        name="KycWorkflow", qualified_name="app.workflows.kyc.KycWorkflow")
+    st.upsert_nodes([workflow])
+
+    assert (
+        processes.resolve_selector(st, "kyc-worker:app.workflows.kyc.KycWorkflow")
+        == workflow.id
+    )
+
+
+def test_resolve_selector_unresolved_returns_none(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    assert processes.resolve_selector(st, "orders-api:POST /missing") is None
+    assert processes.resolve_selector(st, "kyc-worker:app.nope.Nothing") is None
+
+
+def test_resolve_selector_malformed_selector_without_colon_returns_none(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    assert processes.resolve_selector(st, "not-a-selector") is None

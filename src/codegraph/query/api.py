@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Literal
 
 from codegraph.core.spans import LineIndex
+from codegraph.query import traverse
 from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
 from codegraph.stores.graph import GraphStore
 
@@ -52,6 +53,13 @@ _DEFAULT_CALLER_LIMIT = 50  # who_calls: внутренний cap суммарн
 # expand_neighbors -- но "Ограничения ответов: ... truncated ... обязателен" распространяется
 # на оба инструмента, поэтому cap внутренний, module-level (тесты monkeypatch'ат его для
 # детерминированной проверки truncated без построения графа на 50+ узлов).
+
+# -- M2 T8 --
+_VALID_TRACE_DIRECTIONS = frozenset({"downstream", "upstream"})
+_MAX_SEGMENTS_MIN, _MAX_SEGMENTS_MAX = 1, 20  # trace_process max_segments clamp
+_MAX_HOPS_MIN, _MAX_HOPS_MAX = 1, 12  # find_paths max_hops clamp
+_FIND_ENTRYPOINT_K_MIN, _FIND_ENTRYPOINT_K_MAX = 1, 20  # find_entrypoint k clamp
+_BUSINESS_PROCESS_KIND = "BusinessProcess"
 
 
 class GraphQuery:
@@ -241,3 +249,99 @@ class GraphQuery:
             return {"callers": list(callers_by_id.values()), "truncated": truncated}
         except (StoreError, StoreUnavailable) as e:
             return {"error": f"falkordb unreachable: {e}"}
+
+    def trace_process(
+        self,
+        entrypoint_id: str,
+        direction: Literal["downstream", "upstream"] = "downstream",
+        max_segments: int = 12,
+        min_confidence: float = 0.3,
+        include_source: bool = False,
+    ) -> dict:
+        """M2: downstream only -- direction="upstream" is a deliberate deferral
+        (query.traverse.trace_process only implements the out-edge/downstream walk;
+        an upstream trace would need its own transition table, not just direction
+        flip -- see the M2 plan's trace_process interface note), not a bug: it
+        returns a structured error like any other invalid/unsupported input here,
+        never an exception. Both invalid-direction and upstream-not-supported are
+        checked BEFORE store_factory() (same amendment-1-adjacent principle as
+        expand_neighbors' direction check -- no store needed to reject either)."""
+        if direction not in _VALID_TRACE_DIRECTIONS:
+            return {"error": f"invalid direction: {direction!r}"}
+        if direction == "upstream":
+            return {"error": "upstream tracing not supported in M2"}
+        max_segments = max(_MAX_SEGMENTS_MIN, min(_MAX_SEGMENTS_MAX, max_segments))
+        try:
+            store = self.store_factory()
+            result = traverse.trace_process(store, entrypoint_id, max_segments, min_confidence)
+        except (StoreError, StoreUnavailable) as e:
+            return {"error": f"falkordb unreachable: {e}"}
+        if "error" in result or not include_source:
+            return result
+        self._attach_sources(result)
+        return result
+
+    def _attach_sources(self, result: dict) -> None:
+        """include_source=True: best-effort get_source() on every node the trace
+        surfaced (entry/step/exit-channel), mutating each node dict in place
+        (fresh dicts from this same trace call -- safe to mutate before returning
+        to the caller). A node get_source() can't resolve (e.g. a Channel has no
+        source location) is left as-is, not an error -- this is an enrichment, not
+        a requirement."""
+        for segment in result.get("segments", []):
+            self._attach_source_to_node(segment["entry"])
+            for step in segment["steps"]:
+                self._attach_source_to_node(step["node"])
+            for exit_ in segment["exits"]:
+                self._attach_source_to_node(exit_["channel"])
+
+    def _attach_source_to_node(self, node: dict) -> None:
+        node_id = node.get("id")
+        if node_id is None:
+            return
+        src = self.get_source(node_id)
+        if "error" not in src:
+            node["source"] = src["source"]
+
+    def find_paths(
+        self,
+        from_id: str,
+        to_id: str,
+        max_hops: int = 8,
+        edge_types: Sequence[str] | None = None,
+    ) -> dict:
+        max_hops = max(_MAX_HOPS_MIN, min(_MAX_HOPS_MAX, max_hops))
+        try:
+            store = self.store_factory()
+            return traverse.find_paths(store, from_id, to_id, max_hops, edge_types)
+        except (StoreError, StoreUnavailable) as e:
+            return {"error": f"falkordb unreachable: {e}"}
+
+    def list_processes(self) -> dict:
+        """BusinessProcess-узлы графа, отсортированные по id (детерминизм --
+        store.get_nodes_by_kind не гарантирует порядок строк). Полные property-
+        dict'ы как есть (id/name/entrypoint_id/source + любые прочие props) -- та
+        же конвенция "не подрезать", что у expand_neighbors'а "nodes"."""
+        try:
+            store = self.store_factory()
+            nodes = store.get_nodes_by_kind(_BUSINESS_PROCESS_KIND)
+        except (StoreError, StoreUnavailable) as e:
+            return {"error": f"falkordb unreachable: {e}"}
+        return {"processes": sorted(nodes, key=lambda n: n.get("id") or "")}
+
+    def find_entrypoint(
+        self,
+        query: str,
+        kinds: Sequence[str] | None = None,
+        k: int = 5,
+    ) -> dict:
+        """store.search_fulltext делает и sanitize, и сам fulltext-запрос (см. её
+        докстринг) -- пустой результат (в т.ч. запрос, целиком состоящий из
+        RediSearch-спецсимволов) НЕ ошибка, обычный {"results": []}."""
+        k = max(_FIND_ENTRYPOINT_K_MIN, min(_FIND_ENTRYPOINT_K_MAX, k))
+        try:
+            store = self.store_factory()
+            results = store.search_fulltext(query, k, kinds=kinds)
+        except (StoreError, StoreUnavailable) as e:
+            return {"error": f"falkordb unreachable: {e}"}
+        return {"results": results}

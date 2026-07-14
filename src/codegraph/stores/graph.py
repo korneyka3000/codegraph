@@ -33,6 +33,16 @@ class GraphStore(Protocol):
 
     def get_nodes(self, ids: Sequence[str]) -> list[dict]: ...
 
+    def get_nodes_by_kind(self, kind: str) -> list[dict]: ...  # every node with n.kind == kind
+
+    def search_fulltext(
+        self, query: str, k: int, kinds: Sequence[str] | None = None
+    ) -> list[dict]:
+        """Fulltext over Sym(name, qualified_name, docstring); query pre-sanitized
+        by the implementation, empty-after-sanitize -> [] without a store round
+        trip. Each result: node properties + "score" (float)."""
+        ...
+
     def neighbors(
         self,
         node_id: str,

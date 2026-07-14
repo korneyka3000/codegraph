@@ -97,6 +97,22 @@ def _resolve_entrypoint(
     return qualified_index.get((service, rest))
 
 
+def resolve_selector(staging: Staging, selector: str) -> str | None:
+    """Public single-selector resolver reused by CLI `trace` (see cli.py's `trace`
+    command) -- same "<service>:<METHOD> <path>" / "<service>:qualified.name"
+    grammar and resolution as materialize()'s own cfg.processes loop, exposed
+    standalone so cli.py doesn't reimplement the selector parser a second time
+    (see module docstring). Builds the three lookup indices fresh from staging on
+    every call -- materialize() amortizes that cost across many decls in one pass,
+    but a CLI invocation resolves exactly one selector, so the fresh-scan cost here
+    is a non-issue and keeps this function trivially independent of any caller
+    state."""
+    qualified_index = _qualified_index(staging)
+    route_index = _route_index(staging)
+    handles_index = _handles_index(staging)
+    return _resolve_entrypoint(selector, qualified_index, route_index, handles_index)
+
+
 def _temporal_workflow_nodes(staging: Staging) -> list[NodeRec]:
     return sorted(
         (n for n in staging.iter_nodes() if "TemporalWorkflow" in n.roles),

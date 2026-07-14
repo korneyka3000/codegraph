@@ -28,6 +28,8 @@ class FakeStore:
         self.stats_result: dict = {"nodes": {}, "edges": {}}
         self.raise_error: Exception | None = None
         self.neighbor_calls: list[tuple] = []
+        self.fulltext_calls: list[tuple] = []
+        self.fulltext_result: list[dict] = []
 
     def add_node(self, node_id: str, **props) -> None:
         self.nodes[node_id] = {"id": node_id, **props}
@@ -59,6 +61,17 @@ class FakeStore:
         if self.raise_error:
             raise self.raise_error
         return self.stats_result
+
+    def get_nodes_by_kind(self, kind):
+        if self.raise_error:
+            raise self.raise_error
+        return [n for n in self.nodes.values() if n.get("kind") == kind]
+
+    def search_fulltext(self, query, k, kinds=None):
+        if self.raise_error:
+            raise self.raise_error
+        self.fulltext_calls.append((query, k, kinds))
+        return self.fulltext_result
 
 
 def _factory(store: FakeStore, calls: list[FakeStore] | None = None):
@@ -451,4 +464,262 @@ def test_each_public_method_call_gets_a_freshly_constructed_store():
     q.graph_stats()
     q.graph_stats()
     q.who_calls("x")
-    assert len(calls) == 3  # store_factory вызван по разу на публичный вызов, не кэшируется
+    q.trace_process("x")
+    q.find_paths("x", "y")
+    q.list_processes()
+    q.find_entrypoint("x")
+    assert len(calls) == 7  # store_factory вызван по разу на публичный вызов, не кэшируется
+
+
+# -- M2 T8: trace_process --
+
+
+def test_trace_process_delegates_to_traverse_with_clamped_max_segments(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+
+    def fake_trace_process(store, entrypoint_id, max_segments, min_confidence):
+        calls.append((entrypoint_id, max_segments, min_confidence))
+        return {"segments": [], "confidence": 1.0, "truncated": False}
+
+    monkeypatch.setattr(api_mod.traverse, "trace_process", fake_trace_process)
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    result = q.trace_process("e1", max_segments=999, min_confidence=0.42)
+    assert calls == [("e1", 20, 0.42)]  # clamped to 20
+    assert result == {"segments": [], "confidence": 1.0, "truncated": False}
+
+
+def test_trace_process_clamps_max_segments_minimum_to_1(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+    monkeypatch.setattr(
+        api_mod.traverse, "trace_process",
+        lambda store, entrypoint_id, max_segments, min_confidence: calls.append(max_segments)
+        or {"segments": [], "confidence": 1.0, "truncated": False},
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    q.trace_process("e1", max_segments=0)
+    assert calls == [1]
+
+
+def test_trace_process_invalid_direction_returns_error_before_store_factory_call():
+    store = FakeStore()
+    calls: list[FakeStore] = []
+    q = GraphQuery(_factory(store, calls), {})
+    result = q.trace_process("e1", direction="sideways")
+    assert result == {"error": "invalid direction: 'sideways'"}
+    assert calls == []
+
+
+def test_trace_process_upstream_not_supported_in_m2():
+    store = FakeStore()
+    calls: list[FakeStore] = []
+    q = GraphQuery(_factory(store, calls), {})
+    result = q.trace_process("e1", direction="upstream")
+    assert "error" in result
+    assert "upstream" in result["error"].lower()
+    assert "m2" in result["error"].lower()
+    assert calls == []  # not-supported short-circuits before touching the store
+
+
+def test_trace_process_store_unreachable_returns_error_dict():
+    store = FakeStore()
+    store.raise_error = StoreError("boom")
+    q = GraphQuery(_factory(store), {})
+    result = q.trace_process("e1")
+    assert "falkordb unreachable" in result["error"]
+
+
+def test_trace_process_propagates_traverse_error_dict_unchanged(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    monkeypatch.setattr(
+        api_mod.traverse, "trace_process",
+        lambda store, entrypoint_id, max_segments, min_confidence: {
+            "error": "entrypoint not found: e1"
+        },
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    result = q.trace_process("e1")
+    assert result == {"error": "entrypoint not found: e1"}
+
+
+def test_trace_process_include_source_attaches_source_to_reachable_nodes_only(
+    tmp_path, monkeypatch
+):
+    import codegraph.query.api as api_mod
+
+    def fake_trace_process(store, entrypoint_id, max_segments, min_confidence):
+        return {
+            "segments": [{
+                "service": "svc", "entry": {"id": "e1"},
+                "steps": [
+                    {"edge_type": "CALLS", "props": {}, "node": {"id": "s1"}, "direction": "out"}
+                ],
+                "exits": [{"channel": {"id": "c1"}, "next_entry_ids": []}],
+                "truncated": False,
+            }],
+            "confidence": 1.0, "truncated": False,
+        }
+
+    monkeypatch.setattr(api_mod.traverse, "trace_process", fake_trace_process)
+
+    root = tmp_path / "svcroot"
+    content = b"def foo():\n    pass\n"
+    _write(root, "mod.py", content)
+    node_hash = hashlib.sha256(content).hexdigest()
+
+    store = FakeStore()
+    store.add_node(
+        "e1", service="svc", relpath="mod.py", start_byte=0, end_byte=len(content),
+        start_line=1, end_line=2, content_hash=node_hash,
+    )
+    # s1/c1 deliberately absent from the store -- get_source fails for them, and
+    # include_source must skip silently (best-effort), not blow up the whole trace.
+    q = GraphQuery(_factory(store), {"svc": root})
+
+    result = q.trace_process("e1", include_source=True)
+    seg = result["segments"][0]
+    assert seg["entry"]["source"] == "def foo():\n    pass"  # get_source's own line-span slicing
+    assert "source" not in seg["steps"][0]["node"]
+    assert "source" not in seg["exits"][0]["channel"]
+
+
+def test_trace_process_include_source_false_by_default_does_not_call_get_source(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    monkeypatch.setattr(
+        api_mod.traverse, "trace_process",
+        lambda store, entrypoint_id, max_segments, min_confidence: {
+            "segments": [{
+                "service": "svc", "entry": {"id": "e1"},
+                "steps": [], "exits": [], "truncated": False,
+            }],
+            "confidence": 1.0, "truncated": False,
+        },
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    result = q.trace_process("e1")
+    assert "source" not in result["segments"][0]["entry"]
+
+
+# -- M2 T8: find_paths --
+
+
+def test_find_paths_delegates_to_traverse_with_clamped_max_hops(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+
+    def fake_find_paths(store, from_id, to_id, max_hops, edge_types):
+        calls.append((from_id, to_id, max_hops, edge_types))
+        return {"path": None}
+
+    monkeypatch.setattr(api_mod.traverse, "find_paths", fake_find_paths)
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    result = q.find_paths("a", "b", max_hops=999, edge_types=["CALLS"])
+    assert calls == [("a", "b", 12, ["CALLS"])]  # clamped to 12
+    assert result == {"path": None}
+
+
+def test_find_paths_clamps_max_hops_minimum_to_1(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+    monkeypatch.setattr(
+        api_mod.traverse, "find_paths",
+        lambda store, from_id, to_id, max_hops, edge_types: calls.append(max_hops)
+        or {"path": None},
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    q.find_paths("a", "b", max_hops=0)
+    assert calls == [1]
+
+
+def test_find_paths_store_unreachable_returns_error_dict():
+    store = FakeStore()
+    store.raise_error = StoreError("boom")
+    q = GraphQuery(_factory(store), {})
+    result = q.find_paths("a", "b")
+    assert "falkordb unreachable" in result["error"]
+
+
+# -- M2 T8: list_processes --
+
+
+def test_list_processes_delegates_to_get_nodes_by_kind_business_process_sorted_by_id():
+    store = FakeStore()
+    store.add_node("proc:b", kind="BusinessProcess", name="B", entrypoint_id="sym:x",
+                    source="config")
+    store.add_node("proc:a", kind="BusinessProcess", name="A", entrypoint_id="sym:y",
+                    source="temporal")
+    store.add_node("sym:x", kind="Function")  # not a BusinessProcess -- excluded
+    q = GraphQuery(_factory(store), {})
+    result = q.list_processes()
+    assert [p["id"] for p in result["processes"]] == ["proc:a", "proc:b"]
+    assert result["processes"][0]["entrypoint_id"] == "sym:y"
+    assert result["processes"][0]["source"] == "temporal"
+
+
+def test_list_processes_empty_graph_returns_empty_list():
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    assert q.list_processes() == {"processes": []}
+
+
+def test_list_processes_store_unreachable_returns_error_dict():
+    store = FakeStore()
+    store.raise_error = StoreError("boom")
+    q = GraphQuery(_factory(store), {})
+    result = q.list_processes()
+    assert "falkordb unreachable" in result["error"]
+
+
+# -- M2 T8: find_entrypoint --
+
+
+def test_find_entrypoint_delegates_to_search_fulltext_with_clamped_k():
+    store = FakeStore()
+    store.fulltext_result = [{"id": "sym:a:x", "score": 1.5}]
+    q = GraphQuery(_factory(store), {})
+    result = q.find_entrypoint("create order", k=999)
+    assert result == {"results": [{"id": "sym:a:x", "score": 1.5}]}
+    assert store.fulltext_calls == [("create order", 20, None)]  # clamped to 20
+
+
+def test_find_entrypoint_k_clamped_to_minimum_1():
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    q.find_entrypoint("x", k=0)
+    assert store.fulltext_calls[0][1] == 1
+
+
+def test_find_entrypoint_passes_kinds_through():
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    q.find_entrypoint("x", kinds=["Function"])
+    assert store.fulltext_calls[0][2] == ["Function"]
+
+
+def test_find_entrypoint_empty_result_is_not_an_error():
+    store = FakeStore()
+    store.fulltext_result = []
+    q = GraphQuery(_factory(store), {})
+    result = q.find_entrypoint("gibberish query with no matches")
+    assert result == {"results": []}
+
+
+def test_find_entrypoint_store_unreachable_returns_error_dict():
+    store = FakeStore()
+    store.raise_error = StoreError("boom")
+    q = GraphQuery(_factory(store), {})
+    result = q.find_entrypoint("x")
+    assert "falkordb unreachable" in result["error"]

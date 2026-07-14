@@ -8,16 +8,19 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from rich.tree import Tree
 
 from codegraph.config.loader import ConfigError, effective_idioms, load_workspace
 from codegraph.config.models import WorkspaceConfig
 from codegraph.doctor import run_env_checks, run_store_probes
+from codegraph.linking.processes import resolve_selector
 from codegraph.linking.workspace import link_workspace
 from codegraph.mcp.server import build_server
 from codegraph.pipeline.analyze import analyze_service
 from codegraph.pipeline.load import load_graph
 from codegraph.pipeline.report import build_report, print_report, write_report
 from codegraph.pipeline.stages import STAGES
+from codegraph.query.api import GraphQuery
 from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
 from codegraph.stores.falkordb.store import FalkorStore
 from codegraph.stores.staging import Staging
@@ -85,6 +88,19 @@ def _workspace_dir(cfg: WorkspaceConfig, target: Path) -> Path:
 
 def _resolve_graph_name(cfg: WorkspaceConfig, graph: str | None) -> str:
     return graph if graph is not None else cfg.graph_name
+
+
+def _require_staging(cfg: WorkspaceConfig, target_path: Path) -> Path:
+    """staging.db path for `load`/`trace` -- both need a PRIOR `codegraph index` run
+    (staging persists on disk after index completes; trace re-derives an
+    entrypoint id from it the same way `load` re-derives the graph from it -- see
+    linking.processes.resolve_selector). Missing file -> red one-liner + exit 1,
+    same shape/wording both commands used before this was factored out."""
+    path = _workspace_dir(cfg, target_path) / ".codegraph" / "staging.db"
+    if not path.exists():
+        console.print(f"[red]no staging DB at {path}; run 'codegraph index' first[/]")
+        raise typer.Exit(1)
+    return path
 
 
 def _store_guard(fn):
@@ -258,12 +274,7 @@ def load(
     (blue/green), без повторного анализа."""
     target_path = target if target is not None else Path.cwd()
     cfg = _load(target_path)
-    staging_path = _workspace_dir(cfg, target_path) / ".codegraph" / "staging.db"
-    if not staging_path.exists():
-        console.print(
-            f"[red]no staging DB at {staging_path}; run 'codegraph index' first[/]"
-        )
-        raise typer.Exit(1)
+    staging_path = _require_staging(cfg, target_path)
 
     graph_name = _resolve_graph_name(cfg, graph)
     with Staging(staging_path) as staging:
@@ -283,10 +294,138 @@ def load(
     console.print(table)
 
 
+_TRACE_FORMATS = ("text", "mermaid")
+
+
+def _node_label(node: dict) -> str:
+    """qualified_name preferred over name (more specific -- e.g. "app.routes.
+    create_order" vs "create_order") UNLESS it's just a repeat of id: Channel
+    nodes set qualified_name == id verbatim (core.schema.make_channel_node --
+    channels have no nested structure, id already uniquely identifies them), so
+    for a Channel showing qualified_name would mean showing the raw
+    "chan:event_type:OrderCreated" id instead of the friendly "OrderCreated"
+    name -- live-verified against a real trace (see tests/unit/test_cli_trace.py)."""
+    qualified = node.get("qualified_name")
+    if qualified and qualified != node.get("id"):
+        return qualified
+    return node.get("name") or node.get("id") or "?"
+
+
+def _trace_tree(result: dict) -> Tree:
+    """rich-дерево: корень -- итоговая confidence/truncated; один узел на сегмент
+    (роли entry-узла, если есть -- см. pipeline/load._node_props/roles-в-props
+    фикс, M2 T8), под ним плоский список steps (edge_type -> node) и exits
+    (channel -> next_entry_ids), без вложенной по call-графу структуры -- steps
+    сам по себе плоский список (см. query/traverse.py: без "from"-поля, шаг --
+    просто (edge_type, props, node, direction))."""
+    conf = result.get("confidence", 1.0)
+    title = f"trace (confidence={conf:.2f})"
+    if result.get("truncated"):
+        title += " [yellow](truncated)[/]"
+    root = Tree(title)
+    for i, seg in enumerate(result.get("segments", [])):
+        entry = seg.get("entry", {})
+        roles = entry.get("roles") or []
+        role_prefix = f"({escape('/'.join(roles))}) " if roles else ""
+        seg_line = (
+            f"S{i} {escape(str(seg.get('service', '')))}: "
+            f"{role_prefix}{escape(_node_label(entry))}"
+        )
+        if seg.get("truncated"):
+            seg_line += " [yellow](truncated)[/]"
+        seg_node = root.add(seg_line)
+        for step in seg.get("steps", []):
+            seg_node.add(
+                f"{escape(str(step.get('edge_type', '')))} -> "
+                f"{escape(_node_label(step.get('node', {})))}"
+            )
+        for ex in seg.get("exits", []):
+            chan_label = escape(_node_label(ex.get("channel", {})))
+            next_ids = ex.get("next_entry_ids") or []
+            dest = escape(", ".join(next_ids)) if next_ids else "unresolved"
+            seg_node.add(f"channel {chan_label} -> {dest}")
+    return root
+
+
+def _trace_mermaid(result: dict) -> str:
+    """flowchart TD: один узел на сегмент (`S{i}["service: entry"]`), одна стрелка
+    на next_entry_id (`S{i} -->|channel| S{j}`) -- next_entry_ids, не указывающие
+    ни на один сегмента этого трейса (dangling/за пределами max_segments),
+    молча пропускаются (тот сегмент просто не появится как узел стрелки).
+    `"`/`|` внутри меток заменяются -- эти символы ломают mermaid-синтаксис узла/
+    метки ребра; смоук-уровень экранирования (валиден для рендера, не
+    исчерпывающий)."""
+    segments = result.get("segments", [])
+    entry_to_index = {
+        seg["entry"]["id"]: i
+        for i, seg in enumerate(segments)
+        if seg.get("entry", {}).get("id") is not None
+    }
+    lines = ["flowchart TD"]
+    for i, seg in enumerate(segments):
+        label = f"{seg.get('service', '')}: {_node_label(seg.get('entry', {}))}"
+        lines.append(f'    S{i}["{label.replace(chr(34), chr(39))}"]')
+    for i, seg in enumerate(segments):
+        for ex in seg.get("exits", []):
+            chan_label = _node_label(ex.get("channel", {})).replace("|", "/").replace('"', "'")
+            for next_id in ex.get("next_entry_ids", []):
+                j = entry_to_index.get(next_id)
+                if j is not None:
+                    lines.append(f"    S{i} -->|{chan_label}| S{j}")
+    return "\n".join(lines)
+
+
 @app.command()
-def trace() -> None:
-    """Трассировка бизнес-процесса (M2)."""
-    _stub("M2")
+def trace(
+    selector: str = typer.Argument(...),  # noqa: B008 -- typer marker call, idiomatic
+    target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
+    graph: str | None = typer.Option(None, "--graph"),
+    output_format: str = typer.Option("text", "--format"),
+) -> None:
+    """Трассировка бизнес-процесса от selector (route-форма "<service>:<METHOD>
+    <path>" или qualified "<service>:<dotted.name>", как в cfg.processes -- см.
+    linking.processes.resolve_selector) через FalkorDB: rich-дерево сегментов
+    (--format text, по умолчанию) или mermaid flowchart (--format mermaid)."""
+    if output_format not in _TRACE_FORMATS:
+        console.print(
+            f"[red]invalid --format: {escape(output_format)!r} (expected "
+            f"{'|'.join(_TRACE_FORMATS)})[/]"
+        )
+        raise typer.Exit(1)
+
+    target_path = target if target is not None else Path.cwd()
+    cfg = _load(target_path)
+    graph_name = _resolve_graph_name(cfg, graph)
+    staging_path = _require_staging(cfg, target_path)
+
+    with Staging(staging_path) as staging:
+        entrypoint_id = resolve_selector(staging, selector)
+    if entrypoint_id is None:
+        console.print(f"[red]entrypoint not found for selector: {escape(selector)}[/]")
+        raise typer.Exit(1)
+
+    service_paths = {svc.name: svc.path for svc in cfg.services}
+    gq = GraphQuery(
+        store_factory=lambda: FalkorStore(cfg.storage.falkordb, graph_name),
+        service_paths=service_paths,
+    )
+    # GraphQuery отвечает своим собственным error-dict-контрактом (store
+    # недоступен/entrypoint не найден в графе) -- без _store_guard, как и в MCP
+    # server.py: тут нечего перехватывать, только проверить ключ "error".
+    result = gq.trace_process(entrypoint_id)
+    if "error" in result:
+        console.print(f"[red]{escape(result['error'])}[/]")
+        raise typer.Exit(1)
+
+    if output_format == "mermaid":
+        # markup=False: mermaid-синтаксис -- сплошные "[...]"/"|...|", которые
+        # rich иначе распарсил бы как markup-теги (тот же класс бага, что escape()
+        # предотвращает у остальных команд -- здесь весь вывод не наш текст с
+        # вкраплениями данных, а plain-text формат целиком, проще выключить
+        # разметку для этого print целиком, чем экранировать каждую скобку).
+        console.print(_trace_mermaid(result), markup=False)
+    else:
+        console.print(_trace_tree(result))
 
 
 @app.command()
