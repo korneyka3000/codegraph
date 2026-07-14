@@ -84,3 +84,49 @@ services:
     idioms = effective_idioms(cfg, cfg.services[0])
     names = {pr.name for pr in idioms.producers}
     assert "outbox" in names and "aiokafka-send" in names
+
+
+def test_effective_idioms_service_idioms_come_before_builtins(tmp_path):
+    """ORDER is load-bearing, not just membership (T6 review fix): extractors
+    (kafka_ext producers, http_client_ext) dedup call-sites first-idiom-in-list-wins,
+    so a service's OWN (more specific) idiom must shadow a broader builtin convention
+    when both match the same call-site -- e.g. kyc-worker's custom default-sdk
+    http_client (base_url_env set) vs the env-less builtin aiohttp-client-convention
+    matching the same class. Hence: service idioms FIRST in every merged list."""
+    p = _mk_ws(
+        tmp_path,
+        """
+version: 1
+graph_name: demo
+builtin_idioms: [aiokafka, aiohttp_client]
+services:
+  - name: svc-a
+    path: ./svc-a
+    idioms:
+      producers:
+        - name: outbox
+          call: "app.outbox.add_event"
+          channel: { kind: event_type, event_type_from: { arg: 0 } }
+      consumers:
+        - name: dispatch-map
+          kind: dispatch_dict
+          registrar_call: "app.consumers.register_handlers"
+          event_type_from: dict_key
+      http_clients:
+        - name: custom-sdk
+          base_url: { env: SOME_URL }
+""",
+    )
+    cfg = load_workspace(p)
+    idioms = effective_idioms(cfg, cfg.services[0])
+
+    producer_names = [pr.name for pr in idioms.producers]
+    assert producer_names[0] == "outbox"  # custom first, builtins after
+    assert "aiokafka-send" in producer_names[1:]
+
+    consumer_names = [c.name for c in idioms.consumers]
+    assert consumer_names[0] == "dispatch-map"
+    assert "aiokafka-consumer-init" in consumer_names[1:]
+
+    http_names = [h.name for h in idioms.http_clients]
+    assert http_names == ["custom-sdk", "aiohttp-client-convention"]

@@ -61,8 +61,17 @@ def load_workspace(target: Path) -> WorkspaceConfig:
 
 
 def effective_idioms(cfg: WorkspaceConfig, svc: ServiceConfig) -> ServiceIdioms:
-    merged = resolve_builtins(cfg.builtin_idioms)
-    merged.producers.extend(svc.idioms.producers)
-    merged.consumers.extend(svc.idioms.consumers)
-    merged.http_clients.extend(svc.idioms.http_clients)
-    return merged
+    """Effective per-service idioms: сервисные идиомы идут ПЕРВЫМИ в каждом merged-
+    списке, builtin -- после. Порядок значим, не только состав (T6-ревью фикс):
+    экстракторы (kafka_ext producers/consumers, http_client_ext) дедупят call-сайты по
+    принципу «первая идиома в списке побеждает», поэтому собственная (более специфичная)
+    идиома сервиса должна затенять builtin-конвенцию, когда обе матчат один call-сайт --
+    напр. кастомный default-sdk http-client kyc-worker'а (base_url_env=
+    DOCUMENT_MANAGEMENT_URL) против безадресного builtin aiohttp-client-convention,
+    оба глоба которых матчат один и тот же клиент-класс."""
+    builtins = resolve_builtins(cfg.builtin_idioms)
+    return ServiceIdioms(
+        producers=[*svc.idioms.producers, *builtins.producers],
+        consumers=[*svc.idioms.consumers, *builtins.consumers],
+        http_clients=[*svc.idioms.http_clients, *builtins.http_clients],
+    )

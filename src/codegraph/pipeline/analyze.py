@@ -29,13 +29,15 @@ ServiceIdioms — builtin aiokafka/faststream/confluent, если они в cfg.
 M2 T6: http_client_ext — ТОЖЕ данные-идиома, тем же принципом что kafka: активен, если
 `idioms.http_clients` непуст (active_idioms не читает вовсе). В отличие от kafka/fastapi/
 temporal, ничего не пишет в domain_roles/domain_node_props/domain_edges/domain_channels
--- extract_http_client(ctx, node_ids, idioms) возвращает ТОЛЬКО claims (никаких рёбер --
-CALLS_HTTP делает S7/T7) + stats; claims идут в staging.add_claims(svc.name, rp,
+-- extract_http_client(ctx, node_ids, idioms, consts) возвращает ТОЛЬКО claims (никаких
+рёбер -- CALLS_HTTP делает S7/T7) + stats; claims идут в staging.add_claims(svc.name, rp,
 "http_call", hr.claims) сразу же по каждому файлу, тем же паттерном что temporal_start_mark
 (kind — отдельный позиционный параметр add_claims, не внутри payload). Не нуждается в
-ref_symbol_lookup вовсе (внутри ConstTable.build + resolve_arg, чисто структурно), так что
+ref_symbol_lookup вовсе (consts + resolve_arg, чисто структурно), так что
 резолвится идентично что в degraded fallback, что при реальном SCIP -- см. модульный
-докстринг extractors/http_client_ext.py. node_ids -- та же
+докстринг extractors/http_client_ext.py. T6-ревью фикс: ConstTable строится ОДИН раз на
+файл (при kafka_active|http_client_active) и передаётся в оба consts-потребляющих
+экстрактора. node_ids -- та же
 def-index -> node-id карта, что уже строилась для fastapi, дополненная ОДНИМ новым
 ключом `None -> Module-node-id`: CallFact.enclosing_def уже использует None как маркер
 "вызов на уровне модуля", так что `node_ids.get(call.enclosing_def)` прозрачно
@@ -151,13 +153,12 @@ def analyze_service(
     # T5: kafka is DATA-driven (effective ServiceIdioms), not active_idioms-gated --
     # see module docstring. idioms=None (default, matches active_idioms=frozenset()'s
     # own "no existing caller affected" convention) behaves like an empty ServiceIdioms.
-    kafka_idioms = idioms if idioms is not None else ServiceIdioms()
-    kafka_active = bool(kafka_idioms.producers or kafka_idioms.consumers)
+    svc_idioms = idioms if idioms is not None else ServiceIdioms()
+    kafka_active = bool(svc_idioms.producers or svc_idioms.consumers)
     temporal_active = "temporal" in active_idioms
     # T6: http_client, like kafka, is DATA-driven off the same effective idioms object
-    # (kafka_idioms despite the name -- see module docstring) -- active_idioms plays no
-    # role here either.
-    http_client_active = bool(kafka_idioms.http_clients)
+    # -- active_idioms plays no role here either.
+    http_client_active = bool(svc_idioms.http_clients)
     domain_active = fastapi_active or kafka_active or temporal_active or http_client_active
 
     nodes = [make_service_node(svc.name)]
@@ -190,6 +191,13 @@ def analyze_service(
                 for d, n in zip(facts_by_file[rp].defs, res.nodes[1:], strict=True)
             }
             node_ids[None] = res.nodes[0].id
+            # T6 review fix: ONE ConstTable per file, shared by both consts-consuming
+            # extractors (kafka + http_client) -- was built inside kafka's own branch
+            # (and internally by extract_http_client), i.e. twice when both active.
+            consts = (
+                ConstTable.build(facts_by_file[rp], files[rp])
+                if kafka_active or http_client_active else None
+            )
 
             if fastapi_active:
                 fr = extract_fastapi(ctx, node_ids)
@@ -201,8 +209,7 @@ def analyze_service(
                 domain_edges.extend(fr.edges)
 
             if kafka_active:
-                consts = ConstTable.build(facts_by_file[rp], files[rp])
-                kr = extract_kafka(ctx, node_ids, kafka_idioms, consts)
+                kr = extract_kafka(ctx, node_ids, svc_idioms, consts)
                 for nid, rs in kr.roles.items():
                     domain_roles.setdefault(nid, set()).update(rs)
                 domain_channels.extend(kr.channels)
@@ -220,7 +227,7 @@ def analyze_service(
                 staging.add_claims(svc.name, rp, "temporal_start_mark", tr.claims)
 
             if http_client_active:
-                hr = extract_http_client(ctx, node_ids, kafka_idioms)
+                hr = extract_http_client(ctx, node_ids, svc_idioms, consts)
                 # http_call: per-file claim, consumed later by S7 (T7) via
                 # staging.claims_for + the cross-service http_route table (CALLS_HTTP).
                 staging.add_claims(svc.name, rp, "http_call", hr.claims)

@@ -20,11 +20,12 @@ aiohttp client code binds the session under all sorts of names (`session`, `s`,
 text at all, only on it being present (an attribute-call, as opposed to a bare
 module-level `get(...)`).
 
-arg0 resolution goes through `consts.resolve_arg` (a `ConstTable` is built fresh per
-file, internally -- see `extract_http_client`, matches this module's own 3-parameter
-`(ctx, node_ids, idioms)` signature from the task's binding contract, no separate
-`consts` parameter unlike kafka_ext's `extract_kafka`). Three accepted shapes, see
-`_resolve_path`:
+arg0 resolution goes through `consts.resolve_arg`. The `ConstTable` arrives as a
+parameter (same position as kafka_ext's `extract_kafka`), built ONCE per file by
+analyze.py's S5 wiring and shared between both consts-consuming extractors -- T6 review
+fix: the original 3-parameter signature built its own ConstTable internally, re-parsing
+the file's top-level assignments a second time whenever kafka was active on the same
+file. Three accepted shapes, see `_resolve_path`:
   - fstring template with a LEADING interpolation (`resolve_arg`'s own `<base>` marker,
     e.g. `f"{self._base_url}/documents/{doc_id}"` -> `"<base>/documents/{doc_id}"`) ->
     path = the tail after the marker, resolution_hint "static" (the base_url anchor
@@ -63,17 +64,18 @@ path and a real SCIP run (proven by test_pipeline_analyze.py's wiring test using
 Cross-idiom dedup mirrors kafka_ext's own documented producer dedup (progress.md carry-
 forward, T5's own self-review item): `idioms.http_clients` is walked in list order and
 each call's `callee_start_byte` is claimed by at most the FIRST idiom whose file_glob +
-class_glob scope matches it; a later idiom (e.g. the builtin `aiohttp_client` convention
-idiom, which `config.loader.effective_idioms` always places BEFORE a service's own
-custom idioms in list order) silently skips an already-claimed call. This means a real
-`effective_idioms` run over kyc-worker (builtin `aiohttp-client-convention`, no
-base_url, listed first, THEN the custom `default-sdk` idiom with base_url_env=
-DOCUMENT_MANAGEMENT_URL, since both idioms' globs happen to match the same real fixture
-class) resolves every call through the BUILTIN idiom, `base_url_env=None` -- the two
-idioms are exercised SEPARATELY in this task's tests (each with its own single-idiom
+class_glob scope matches it; a later idiom silently skips an already-claimed call. List
+order is therefore load-bearing, and `config.loader.effective_idioms` deliberately
+places a service's OWN idioms BEFORE the builtins (T6 review fix -- service idioms
+shadow builtin conventions): a real merged run over kyc-worker (custom `default-sdk`
+idiom with base_url_env=DOCUMENT_MANAGEMENT_URL first, THEN the env-less builtin
+`aiohttp-client-convention`, both globs matching the same real fixture class) resolves
+every call through the CUSTOM idiom, keeping its base_url_env -- pinned by
+test_real_effective_idioms_custom_sdk_shadows_builtin_base_url_env, with two synthetic
+tests additionally pinning the raw first-idiom-wins dedup in both explicit list orders,
+and the two idiom variants also exercised separately (each its own single-idiom
 `ServiceIdioms`, matching the brief's literal "два claim'а ... base_url_env=...; и
-builtin-вариант без env" as two independent scenarios), with one additional synthetic
-test pinning the dedup/list-order behavior itself for the combined case.
+builtin-вариант без env").
 
 No roles, no edges, no node_props, no channels: per the master plan's own explicit
 "Роль MessageProducer НЕ ставится; роли для клиентов не вводим" -- `HttpClientResult`
@@ -197,7 +199,7 @@ def _emit_claim(
 
 
 def extract_http_client(
-    ctx: FileContext, node_ids: dict[int, str], idioms: ServiceIdioms,
+    ctx: FileContext, node_ids: dict[int, str], idioms: ServiceIdioms, consts: ConstTable,
 ) -> HttpClientResult:
     claims: list[dict] = []
     stats = _stats()
@@ -205,7 +207,6 @@ def extract_http_client(
         return HttpClientResult(claims=claims, stats=stats)
 
     defs_by_index = {d.index: d for d in ctx.facts.defs}
-    consts = ConstTable.build(ctx.facts, ctx.source)
     claimed_starts: set[int] = set()
 
     for idiom in idioms.http_clients:
