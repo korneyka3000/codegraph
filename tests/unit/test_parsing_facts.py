@@ -1,4 +1,4 @@
-from codegraph.parsing.facts import build_file_facts
+from codegraph.parsing.facts import ArgFact, AssignFact, ParamFact, build_file_facts
 
 SRC = b'''"""Module doc."""
 import os
@@ -86,3 +86,314 @@ def test_smoke_all_fixture_files_parse():
     for f in fixtures.rglob("*.py"):
         facts = build_file_facts(str(f), f.read_bytes())
         assert facts is not None
+
+
+# --- M2 Task 2: ArgFact / CallFact.args+receiver_text / AssignFact / ParamFact ------------
+
+
+def _fixture_facts(relpath: str):
+    from pathlib import Path
+
+    path = Path(__file__).parents[2] / "fixtures" / "services" / relpath
+    source = path.read_bytes()
+    return build_file_facts(str(path), source), source
+
+
+# -- contract shape (verbatim field order per brief) --
+
+
+def test_arg_fact_field_order_matches_contract():
+    arg = ArgFact(0, None, "string", '"hi"', "hi", None, None, None)
+    assert arg.index == 0
+    assert arg.keyword is None
+    assert arg.value_kind == "string"
+    assert arg.text == '"hi"'
+    assert arg.string_value == "hi"
+    assert arg.name_start_byte is None
+    assert arg.name_end_byte is None
+    assert arg.dict_items is None
+
+
+def test_assign_fact_field_order_matches_contract():
+    a = AssignFact("x", "Callee", [], 3)
+    assert a.target == "x"
+    assert a.callee_name == "Callee"
+    assert a.call_args == []
+    assert a.start_line == 3
+
+
+def test_param_fact_field_order_matches_contract():
+    p = ParamFact("db", "Session", "Depends(get_db)", 10, 26)
+    assert p.name == "db"
+    assert p.annotation_text == "Session"
+    assert p.default_text == "Depends(get_db)"
+    assert p.default_start_byte == 10
+    assert p.default_end_byte == 26
+
+
+# -- CallFact.args: positional + keyword, string_value --
+
+
+def test_call_args_positional_and_keyword_with_string_value():
+    facts, _ = _fixture_facts("kyc_worker/app/consumer_main.py")
+    call = next(c for c in facts.calls if c.callee_name == "AIOKafkaConsumer")
+    assert len(call.args) == 2
+    topic_arg, bootstrap_arg = call.args
+    assert topic_arg.index == 0 and topic_arg.keyword is None
+    assert topic_arg.value_kind == "string"
+    assert topic_arg.string_value == "orders.events"
+    assert bootstrap_arg.index is None and bootstrap_arg.keyword == "bootstrap_servers"
+    assert bootstrap_arg.value_kind == "string"
+    assert bootstrap_arg.string_value == "kafka:9092"
+    assert bootstrap_arg.text == '"kafka:9092"'
+
+
+def test_call_with_no_args_has_empty_args_list():
+    facts, _ = _fixture_facts("document_management/app/events/producer.py")
+    call = next(c for c in facts.calls if c.callee_name == "start")
+    assert call.args == []
+
+
+def test_call_arg_name_span_and_other_kind_from_workflow_fixture():
+    facts, source = _fixture_facts("kyc_worker/app/workflows/kyc.py")
+    call = next(c for c in facts.calls if c.callee_name == "execute_activity")
+    assert len(call.args) == 3
+    name_arg, subscript_arg, kw_arg = call.args
+    assert name_arg.index == 0 and name_arg.value_kind == "name"
+    assert source[name_arg.name_start_byte:name_arg.name_end_byte] == b"verify_documents"
+    assert subscript_arg.index == 1 and subscript_arg.value_kind == "other"
+    assert kw_arg.keyword == "start_to_close_timeout" and kw_arg.value_kind == "other"
+
+
+# -- CallFact.receiver_text --
+
+
+def test_receiver_text_multi_segment_attribute():
+    facts, _ = _fixture_facts("orders_api/app/db/outbox.py")
+    call = next(c for c in facts.calls if c.callee_name == "execute")
+    assert call.receiver_text == "self._db"
+
+
+def test_receiver_text_none_for_plain_identifier_call():
+    facts, _ = _fixture_facts("document_management/app/events/producer.py")
+    call = next(c for c in facts.calls if c.callee_name == "AIOKafkaProducer")
+    assert call.receiver_text is None
+
+
+def test_receiver_text_single_identifier():
+    facts, _ = _fixture_facts("document_management/app/events/producer.py")
+    call = next(c for c in facts.calls if c.callee_name == "send")
+    assert call.receiver_text == "producer"
+
+
+# -- dict-literal ArgFact (key/value spans) --
+
+
+def test_dict_arg_single_pair_string_key_name_value_register_handlers():
+    facts, source = _fixture_facts("kyc_worker/app/consumers/orders.py")
+    call = next(c for c in facts.calls if c.callee_name == "register_handlers")
+    assert len(call.args) == 1
+    dict_arg = call.args[0]
+    assert dict_arg.value_kind == "dict"
+    assert dict_arg.index == 0
+    assert dict_arg.dict_items is not None and len(dict_arg.dict_items) == 1
+    key, value = dict_arg.dict_items[0]
+    assert key.value_kind == "string" and key.string_value == "OrderCreated"
+    assert key.index is None and key.keyword is None
+    assert value.value_kind == "name"
+    assert source[value.name_start_byte:value.name_end_byte] == b"handle_order_created"
+
+
+def test_dict_arg_two_pairs_attribute_values_add_event():
+    facts, source = _fixture_facts("orders_api/app/services/order.py")
+    place = next(d for d in facts.defs if d.name == "place")
+    call = next(
+        c for c in facts.calls if c.callee_name == "add_event" and c.enclosing_def == place.index
+    )
+    assert len(call.args) == 2
+    assert call.args[0].value_kind == "string" and call.args[0].string_value == "OrderCreated"
+    dict_arg = call.args[1]
+    assert dict_arg.value_kind == "dict"
+    assert dict_arg.dict_items is not None and len(dict_arg.dict_items) == 2
+    keys = [k.string_value for k, _ in dict_arg.dict_items]
+    assert keys == ["order_id", "customer_id"]
+    values = [v for _, v in dict_arg.dict_items]
+    assert values[0].value_kind == "attr"
+    assert source[values[0].name_start_byte:values[0].name_end_byte] == b"id"
+    assert values[1].value_kind == "attr"
+    assert source[values[1].name_start_byte:values[1].name_end_byte] == b"customer_id"
+
+
+# -- fstring ArgFact classification (template resolution itself lives in consts.py) --
+
+
+def test_fstring_arg_value_kind_and_text():
+    facts, _ = _fixture_facts("kyc_worker/app/clients/document_management_client.py")
+    call = next(c for c in facts.calls if c.callee_name == "get")
+    assert len(call.args) == 1
+    arg = call.args[0]
+    assert arg.value_kind == "fstring"
+    assert arg.text == 'f"{self._base_url}/documents/{doc_id}"'
+    assert arg.string_value is None
+
+
+# -- AssignFact: simple name = Callee(...) / name = await Callee(...) --
+
+
+def test_assign_fact_identifier_and_await_identifier_from_producer_fixture():
+    facts, _ = _fixture_facts("document_management/app/events/producer.py")
+    by_target = {a.target: a for a in facts.assigns}
+    producer_ctor = by_target["_producer"]
+    assert producer_ctor.callee_name == "AIOKafkaProducer"
+    assert len(producer_ctor.call_args) == 1
+    assert producer_ctor.call_args[0].keyword == "bootstrap_servers"
+    assert producer_ctor.call_args[0].string_value == "kafka:9092"
+
+    awaited = by_target["producer"]
+    assert awaited.callee_name == "get_producer"
+    assert awaited.call_args == []
+    assert awaited.start_line > 0
+
+
+def test_assign_fact_await_attribute_call_from_workflow_fixture():
+    facts, _ = _fixture_facts("kyc_worker/app/workflows/kyc.py")
+    status_assign = next(a for a in facts.assigns if a.target == "status")
+    assert status_assign.callee_name == "execute_activity"
+    assert len(status_assign.call_args) == 3
+
+
+def test_assign_fact_all_kwargs_and_positional_attr_from_order_service_fixture():
+    facts, _ = _fixture_facts("orders_api/app/services/order.py")
+    by_target = {a.target: a for a in facts.assigns}
+
+    order_assign = by_target["order"]
+    assert order_assign.callee_name == "Order"
+    kw = {a.keyword: a for a in order_assign.call_args}
+    assert kw["id"].value_kind == "other"
+    assert kw["customer_id"].value_kind == "attr"
+    assert kw["amount"].value_kind == "attr"
+    assert kw["status"].value_kind == "string" and kw["status"].string_value == "pending_kyc"
+
+    outbox_assign = by_target["outbox"]
+    assert outbox_assign.callee_name == "OutboxRepository"
+    assert len(outbox_assign.call_args) == 1
+    assert outbox_assign.call_args[0].value_kind == "attr"
+    assert outbox_assign.call_args[0].text == "self._db"
+
+
+def test_assign_fact_not_created_for_attribute_target():
+    facts, _ = _fixture_facts("orders_api/app/services/order.py")
+    assert all(a.target != "self._db" for a in facts.assigns)
+    assert "_db" not in {a.target for a in facts.assigns}
+
+
+def test_assigns_collected_at_module_and_function_level():
+    src = b'''client = make_client()
+
+
+def handler():
+    result = process(client)
+    return result
+'''
+    facts = build_file_facts("x.py", src)
+    targets = {a.target: a.callee_name for a in facts.assigns}
+    assert targets == {"client": "make_client", "result": "process"}
+
+
+# -- ParamFact: typed_parameter / typed_default_parameter (Depends) with spans --
+
+
+def test_param_fact_depends_from_orders_route_fixture():
+    facts, source = _fixture_facts("orders_api/app/routes/orders.py")
+    create_order = next(d for d in facts.defs if d.name == "create_order")
+    by_name = {p.name: p for p in create_order.params}
+
+    req_param = by_name["req"]
+    assert req_param.annotation_text == "OrderCreate"
+    assert req_param.default_text is None
+    assert req_param.default_start_byte is None
+    assert req_param.default_end_byte is None
+
+    db_param = by_name["db"]
+    assert db_param.annotation_text == "Session"
+    assert db_param.default_text == "Depends(get_db)"
+    assert source[db_param.default_start_byte:db_param.default_end_byte] == b"Depends(get_db)"
+
+
+def test_param_fact_bare_identifier_no_annotation_no_default():
+    f = _facts()
+    place = next(d for d in f.defs if d.name == "place")
+    assert [p.name for p in place.params] == ["self", "req"]
+    self_param, req_param = place.params
+    assert self_param.annotation_text is None and self_param.default_text is None
+    assert req_param.annotation_text is None and req_param.default_text is None
+
+
+def test_class_def_has_empty_params():
+    f = _facts()
+    cls = next(d for d in f.defs if d.kind == "class")
+    assert cls.params == []
+
+
+def test_param_fact_bare_default_without_annotation():
+    src = b'''def f(x=5):
+    pass
+'''
+    facts = build_file_facts("x.py", src)
+    f = next(d for d in facts.defs if d.name == "f")
+    x_param = f.params[0]
+    assert x_param.name == "x"
+    assert x_param.annotation_text is None
+    assert x_param.default_text == "5"
+
+
+def test_param_fact_star_args_and_kwargs_and_bare_separators():
+    src = b'''def f(a, /, b, *args, c, **kwargs):
+    pass
+'''
+    facts = build_file_facts("x.py", src)
+    f = next(d for d in facts.defs if d.name == "f")
+    names = [p.name for p in f.params]
+    assert names == ["a", "b", "args", "c", "kwargs"]
+
+
+# -- smoke: all 29 fixture files, args/params/assigns actually populated (not just present) --
+
+
+def test_smoke_all_fixture_files_have_populated_args_params_assigns():
+    from pathlib import Path
+
+    fixtures = Path(__file__).parents[2] / "fixtures" / "services"
+    calls_with_args = 0
+    params_with_annotation = 0
+    assigns_total = 0
+    dict_args_seen = 0
+    fstring_args_seen = 0
+    for f in fixtures.rglob("*.py"):
+        facts = build_file_facts(str(f), f.read_bytes())
+        for c in facts.calls:
+            assert isinstance(c.args, list)
+            if c.args:
+                calls_with_args += 1
+            for a in c.args:
+                if a.value_kind == "dict":
+                    dict_args_seen += 1
+                if a.value_kind == "fstring":
+                    fstring_args_seen += 1
+        for d in facts.defs:
+            assert isinstance(d.params, list)
+            for p in d.params:
+                if p.annotation_text is not None:
+                    params_with_annotation += 1
+        for a in facts.assigns:
+            assert isinstance(a.call_args, list)
+        assigns_total += len(facts.assigns)
+
+    # known, real call-sites across the fixture set (see the dedicated per-fixture
+    # tests above for exact shapes) — a nonzero floor here would catch a regression
+    # where args/params/assigns silently stayed empty across the whole walker.
+    assert calls_with_args >= 10
+    assert params_with_annotation >= 10
+    assert assigns_total >= 5
+    assert dict_args_seen >= 2  # register_handlers (1 pair) + add_event (2 pairs)
+    assert fstring_args_seen >= 2  # get_document + create_document base_url interpolation
