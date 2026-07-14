@@ -24,16 +24,20 @@ def _pct(numerator: int, denominator: int) -> float:
     return 100.0 * numerator / denominator if denominator else 0.0
 
 
-def build_report(per_service: list[dict], load_stats: dict) -> dict:
+def build_report(per_service: list[dict], load_stats: dict, link_stats: dict | None = None) -> dict:
     """per_service: список dict'ов analyze_service()-report (ключ "service" включён).
     load_stats: возврат load.load_graph() (nodes_written/edges_written/
-    edges_dropped_missing_endpoint + by-type/by-label разбивки).
+    edges_dropped_missing_endpoint + by-type/by-label разбивки). link_stats (M2 T7,
+    аддитивный параметр -- дефолт None сохраняет ПОЛНОСТЬЮ идентичный dict для каждого
+    существующего 2-позиционного вызова): возврат linking.workspace.link_workspace()
+    (calls_http/calls_http_unresolved/next_segments/processes/marks).
 
-    Возврат -- JSON-сериализуемый dict: {"services", "totals", "load", "health"}.
-    "health": pct_unresolved_calls = unresolved/(joined+unresolved+external) * 100
-    (0.0 при нулевом знаменателе -- сервисы без единого call-сайта, не делить на 0),
-    dropped_edges(+by_type) из load_stats, degraded_services -- список {service, reason}
-    для сервисов с degraded=True (эвристический fallback вместо SCIP, см. analyze.py).
+    Возврат -- JSON-сериализуемый dict: {"services", "totals", "load", "health"} + ключ
+    "linking" (ТОЛЬКО если link_stats передан -- см. выше). "health": pct_unresolved_calls
+    = unresolved/(joined+unresolved+external) * 100 (0.0 при нулевом знаменателе --
+    сервисы без единого call-сайта, не делить на 0), dropped_edges(+by_type) из
+    load_stats, degraded_services -- список {service, reason} для сервисов с
+    degraded=True (эвристический fallback вместо SCIP, см. analyze.py).
     """
     totals = {field: sum(s.get(field, 0) for s in per_service) for field in _TOTAL_FIELDS}
     denom = totals["calls_joined"] + totals["calls_unresolved"] + totals["calls_external"]
@@ -42,7 +46,7 @@ def build_report(per_service: list[dict], load_stats: dict) -> dict:
         for s in per_service
         if s.get("degraded")
     ]
-    return {
+    report = {
         "services": list(per_service),
         "totals": totals,
         "load": dict(load_stats),
@@ -53,6 +57,9 @@ def build_report(per_service: list[dict], load_stats: dict) -> dict:
             "degraded_services": degraded_services,
         },
     }
+    if link_stats is not None:
+        report["linking"] = dict(link_stats)
+    return report
 
 
 def write_report(report: dict, path: Path) -> None:
@@ -131,3 +138,15 @@ def print_report(report: dict, console: Console) -> None:
         # ниже, иначе "[...]"-подстрока либо валит Console.print MarkupError, либо
         # молча съедается как (невалидный) style-тег (live-verified).
         console.print(f"[yellow]degraded services: {escape(detail)}[/]")
+
+    # M2 T7 (additive): "linking" key only present when build_report was given
+    # link_stats -- absent for every pre-T7 report shape, so .get() + a truthy guard
+    # keeps this a strict no-op (no new output, no KeyError) for those callers.
+    linking = report.get("linking")
+    if linking:
+        console.print(
+            f"linking: channels calls_http = {linking.get('calls_http', 0)} "
+            f"(unresolved={linking.get('calls_http_unresolved', 0)}), "
+            f"next_segments = {linking.get('next_segments', 0)}, "
+            f"processes = {linking.get('processes', 0)}"
+        )

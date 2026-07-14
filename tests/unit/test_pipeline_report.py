@@ -33,6 +33,10 @@ LOAD_STATS = {
     "edges_dropped_missing_endpoint": 1,
     "edges_dropped_by_type": {"CALLS": 1, "CONTAINS": 0},
 }
+LINK_STATS = {
+    "calls_http": 5, "calls_http_unresolved": 1,
+    "next_segments": 3, "processes": 2, "marks": 1,
+}
 
 
 # -- build_report: aggregation --
@@ -90,6 +94,31 @@ def test_build_report_empty_per_service_list():
     assert report["services"] == []
     assert report["health"]["degraded_services"] == []
     assert report["health"]["pct_unresolved_calls"] == 0.0
+
+
+# -- M2 T7: build_report link_stats (additive third parameter) --
+
+
+def test_build_report_without_link_stats_has_no_linking_key():
+    """Backward compatibility: every pre-M2-T7 2-positional-arg call site (this file's
+    own tests above included) must see an IDENTICAL report shape -- no "linking" key at
+    all when link_stats is omitted, not even an empty dict."""
+    report = build_report([SERVICE_OK], LOAD_STATS)
+    assert "linking" not in report
+
+
+def test_build_report_with_link_stats_adds_linking_key():
+    report = build_report([SERVICE_OK], LOAD_STATS, LINK_STATS)
+    assert report["linking"] == LINK_STATS
+    # additive: every pre-existing key/shape is untouched.
+    assert report["totals"] == {
+        "files": 5, "nodes": 8, "edges": 9,
+        "calls_joined": 6, "calls_unresolved": 2, "calls_external": 1,
+    }
+
+
+def test_build_report_link_stats_none_is_same_as_omitted():
+    assert build_report([SERVICE_OK], LOAD_STATS, None) == build_report([SERVICE_OK], LOAD_STATS)
 
 
 # -- write_report: JSON round-trip --
@@ -170,3 +199,27 @@ def test_print_report_smoke_no_degraded_block_when_absent():
     # says "no"); the distinct summary block ("degraded services: ...") must be absent
     # since nothing is degraded here.
     assert "degraded services" not in text.lower()
+
+
+# -- M2 T7: print_report linking summary (additive) --
+
+
+def test_print_report_shows_linking_summary_when_present():
+    report = build_report([SERVICE_OK], LOAD_STATS, LINK_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+
+    assert "linking" in text.lower()
+    for value in ("5", "1", "3", "2"):  # calls_http/unresolved/next_segments/processes
+        assert value in text
+
+
+def test_print_report_no_linking_line_when_absent():
+    """Backward compatibility: a report built without link_stats (or hand-built without
+    a "linking" key at all, as every pre-T7 report was) must not print anything new."""
+    report = build_report([SERVICE_OK], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise (no KeyError on missing "linking")
+    text = console.export_text()
+    assert "linking" not in text.lower()

@@ -107,15 +107,38 @@ class Staging:
         self._db.commit()
 
     def clear_workspace_layer(self) -> None:
-        """Стирает S7-слой (Channel/BusinessProcess-узлы + linking-рёбра) ПЕРЕД
-        link_workspace -- вызывается один раз, ПОСЛЕ всех analyze_service (см.
-        Global Constraint 2 плана M2: S7 всегда идёт после полного прогона;
-        инкрементальность -- M4). Селективно: НЕ трогает код-узлы/рёбра S5/S6
-        (те чистятся per-service в begin_service) и НЕ трогает Channel/
-        BusinessProcess-рёбра, эмитированные НЕ линковкой (extractor != "linking",
-        напр. будущие S5-рёбра к каналам -- PRODUCES/CONSUMES/HANDLES остаются)."""
+        """Стирает S7-derived-слой ПЕРЕД link_workspace -- вызывается один раз, ПОСЛЕ
+        всех analyze_service (см. Global Constraint 2 плана M2: S7 всегда идёт после
+        полного прогона; инкрементальность -- M4).
+
+        M2 T7 CONTRACT FIX (сужение T1-контракта, санкционировано контроллером T7):
+        Channel-узлы БОЛЬШЕ НЕ удаляются здесь. T1 писал этот метод до того, как T4/T5/
+        T6 закрепили, что Channel-узлы создаются ЭКСТРАКТОРАМИ в S5, per-service (fastapi_
+        ext/kafka_ext), и живут в staged nodes ТОЧНО так же, как любой код-узел --
+        начиная с T7 Channel-узлы ТАКЖЕ создаются самой линковкой (http_routes.link'а
+        unresolved-fallback канал). Удаление kind='Channel' здесь стирало бы Channel-узлы
+        КАЖДОГО сервиса разом (workspace-wide), хотя begin_service чистит только ОДИН
+        сервис за раз -- вызов clear_workspace_layer() перед повторным link_workspace без
+        полного re-analyze всех сервисов уничтожил бы каналы сервисов, которые не
+        переанализировались. Не страшно для избыточности/дублей: id канала детерминирован
+        (ids.chan_kafka/chan_event/chan_http), upsert_nodes -- INSERT OR REPLACE, так что
+        повторная эмиссия ТОГО ЖЕ канала -- no-op замена той же строки, а не дубликат;
+        явная очистка Channel-узлов здесь была бы избыточной защитой без реальной пользы
+        (см. workspace.py модульный докстринг про «unification = no-op при совпадающих
+        id» -- то же рассуждение, что закрыло отдельный linking/channels.py).
+
+        Остаётся селективным по двум другим осям: BusinessProcess-узлы -- ВСЕГДА чисто
+        S7-derived (материализуются только здесь, processes.materialize), поэтому чистка
+        перед пересчётом безопасна и необходима (иначе устаревшие proc:-узлы/слаги
+        накапливались бы). Рёбра -- только extractor=="linking" (S7-derived: CALLS_HTTP,
+        NEXT_SEGMENT, PART_OF_PROCESS, temporal_start-CALLS созданные S7 "с нуля"); НЕ
+        трогает код-рёбра S5/S6 (HANDLES/PRODUCES/CONSUMES/INVOKES_ACTIVITY и т.п. --
+        extractor="fastapi"/"kafka"/"temporal"/"calls", чистятся per-service в
+        begin_service) и НЕ трогает CALLS-рёбра, которые S7 лишь ПОМЕТИЛ через
+        update_edge_props (тот CALLS остаётся с исходным extractor="calls" -- только
+        props получают mechanism="temporal_start", extractor не переписывается)."""
         cur = self._db
-        cur.execute("DELETE FROM nodes WHERE kind IN ('Channel','BusinessProcess')")
+        cur.execute("DELETE FROM nodes WHERE kind='BusinessProcess'")
         cur.execute("DELETE FROM edges WHERE extractor='linking'")
         self._db.commit()
 

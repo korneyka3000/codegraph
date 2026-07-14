@@ -295,10 +295,20 @@ def test_begin_service_does_not_clear_other_services_claims(tmp_path):
     assert st.claims_for("kafka_producer", service="a") == []
 
 
-# -- M2: clear_workspace_layer --
+# -- M2 T7: clear_workspace_layer (narrowed contract) --
+#
+# T1 originally deleted kind IN ('Channel','BusinessProcess'). T7 narrows this to
+# BusinessProcess ONLY (sanctioned T1-contract fix, see staging.py's clear_workspace_layer
+# docstring): Channel nodes are now created by S5 extractors (fastapi_ext/kafka_ext),
+# per-service, staged the same way code nodes are -- deleting kind='Channel' here would
+# wipe EVERY service's channels workspace-wide even though begin_service only re-analyzes
+# ONE service at a time, losing channels for services that weren't re-analyzed in this run.
+# Channel ids are deterministic (ids.chan_kafka/chan_event/chan_http) and upsert_nodes is
+# INSERT OR REPLACE, so re-emission is a no-op replace, not a duplicate -- explicit
+# deletion here would be redundant defense with a real downside (data loss) and no upside.
 
 
-def test_clear_workspace_layer_removes_channel_and_process_nodes_and_linking_edges_only(
+def test_clear_workspace_layer_removes_only_business_process_nodes_and_linking_edges(
     tmp_path,
 ):
     st = Staging(tmp_path / "s.db")
@@ -317,10 +327,25 @@ def test_clear_workspace_layer_removes_channel_and_process_nodes_and_linking_edg
 
     st.clear_workspace_layer()
 
+    # Channel survives (T7 fix); BusinessProcess is removed; the code node is untouched.
     remaining_ids = {n.id for n in st.iter_nodes()}
-    assert remaining_ids == {fn.id}
+    assert remaining_ids == {fn.id, chan.id}
     remaining_edges = {(e.src, e.dst, e.type) for e in st.iter_edges()}
     assert remaining_edges == {(code_edge.src, code_edge.dst, code_edge.type)}
+
+
+def test_clear_workspace_layer_survives_repeated_calls_without_deleting_channel(tmp_path):
+    """Regression guard for the exact scenario the T7 fix addresses: calling
+    clear_workspace_layer() a second time (as link_workspace does on every `codegraph
+    index` run) must not progressively erode Channel nodes staged by an EARLIER
+    analyze_service call that isn't part of THIS run's service loop."""
+    st = Staging(tmp_path / "s.db")
+    chan = NodeRec(id="chan:http:svc:GET /x", kind="Channel", service="",
+                    name="GET /x", qualified_name="chan:http:svc:GET /x")
+    st.upsert_nodes([chan])
+    st.clear_workspace_layer()
+    st.clear_workspace_layer()
+    assert {n.id for n in st.iter_nodes()} == {chan.id}
 
 
 # -- M2: update_edge_props --

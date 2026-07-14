@@ -12,6 +12,7 @@ from rich.table import Table
 from codegraph.config.loader import ConfigError, effective_idioms, load_workspace
 from codegraph.config.models import WorkspaceConfig
 from codegraph.doctor import run_env_checks, run_store_probes
+from codegraph.linking.workspace import link_workspace
 from codegraph.mcp.server import build_server
 from codegraph.pipeline.analyze import analyze_service
 from codegraph.pipeline.load import load_graph
@@ -21,13 +22,14 @@ from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
 from codegraph.stores.falkordb.store import FalkorStore
 from codegraph.stores.staging import Staging
 
-# analyze_service/load_graph/FalkorStore/Staging/build_server импортированы по имени
-# (не через module-алиас) НАМЕРЕННО: юнит-тесты (tests/unit/test_cli_m1b.py)
-# monkeypatch'ат ровно эти module-level имена (`codegraph.cli.analyze_service` и т.д.),
-# подставляя фейки вместо реального SCIP/FalkorDB/MCP -- сработает только если имя
-# резолвится из ГЛОБАЛЬНОГО namespace codegraph.cli на момент вызова, а не из
-# локального импорта внутри тела команды (см. существующий паттерн лениво
-# импортируемого `connect` в doctor() -- та же техника здесь была бы непатчибельной).
+# analyze_service/link_workspace/load_graph/FalkorStore/Staging/build_server
+# импортированы по имени (не через module-алиас) НАМЕРЕННО: юнит-тесты
+# (tests/unit/test_cli_m1b.py) monkeypatch'ат ровно эти module-level имена
+# (`codegraph.cli.analyze_service` и т.д.), подставляя фейки вместо реального
+# SCIP/FalkorDB/MCP -- сработает только если имя резолвится из ГЛОБАЛЬНОГО namespace
+# codegraph.cli на момент вызова, а не из локального импорта внутри тела команды (см.
+# существующий паттерн лениво импортируемого `connect` в doctor() -- та же техника
+# здесь была бы непатчибельной).
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 console = Console()
 
@@ -163,10 +165,11 @@ def index(
         console.print(svc_table)
         return
 
-    # полный прогон: S1–S6 (analyze_service, per service) → S9 (load_graph,
-    # blue/green) → S10 (report). Деградация отдельных сервисов (SCIP недоступен →
-    # эвристический fallback) НЕ валит exit — print_report печатает жёлтый блок,
-    # но код возврата остаётся 0 (см. self-review брифа m1b-task-6).
+    # полный прогон: S1–S6 (analyze_service, per service) → S7 (link_workspace,
+    # cross-service derivation) → S9 (load_graph, blue/green) → S10 (report).
+    # Деградация отдельных сервисов (SCIP недоступен → эвристический fallback) НЕ валит
+    # exit — print_report печатает жёлтый блок, но код возврата остаётся 0 (см.
+    # self-review брифа m1b-task-6).
     codegraph_dir = _workspace_dir(cfg, target_path) / ".codegraph"
     # active_idioms (M2 T4): включает доменные экстракторы S5 (сейчас — fastapi/temporal)
     # по workspace-списку builtin-идиом; cfg.builtin_idioms уже провалидирован
@@ -180,11 +183,16 @@ def index(
             )
             for svc in cfg.services
         ]
+        # M2 T7: link_workspace ПОСЛЕ цикла analyze (нужны staged каналы/claims ВСЕХ
+        # сервисов) и ДО load_graph (S9 должен снапшотить staging уже вместе с
+        # derived-слоем — NEXT_SEGMENT/CALLS_HTTP/PART_OF_PROCESS). staging-only --
+        # FalkorDB не трогает, поэтому без _store_guard (в отличие от load_graph ниже).
+        link_report = link_workspace(cfg, staging)
         load_stats = _store_guard(lambda: load_graph(
             staging, lambda name: FalkorStore(cfg.storage.falkordb, name), graph_name
         ))
 
-    report = build_report(per_service, load_stats)
+    report = build_report(per_service, load_stats, link_report)
     write_report(report, codegraph_dir / "report.json")
     print_report(report, console)
 

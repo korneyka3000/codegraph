@@ -121,6 +121,86 @@ def test_index_calls_analyze_service_per_service_and_load_graph_with_config_grap
     assert load_calls[0]["store_cfg"] == FalkorDBConfig()
 
 
+def _fake_link_workspace(recorded: list[dict], call_order: list[str] | None = None):
+    def fn(cfg, staging):
+        if call_order is not None:
+            call_order.append("link_workspace")
+        recorded.append({"cfg": cfg, "staging": staging})
+        return {
+            "calls_http": 0, "calls_http_unresolved": 0,
+            "next_segments": 0, "processes": 0, "marks": 0,
+        }
+    return fn
+
+
+def test_index_calls_link_workspace_between_analyze_and_load(tmp_path, monkeypatch):
+    """M2 T7 wiring: link_workspace(cfg, staging) runs AFTER every analyze_service call
+    and BEFORE load_graph -- staging must already hold every service's S1-S6 output
+    (linking derives cross-service edges from it) before load_graph snapshots staging
+    into FalkorDB."""
+    root = _write_workspace(tmp_path, n_services=2, graph_name="wsgraph")
+    call_order: list[str] = []
+    link_calls: list[dict] = []
+
+    def analyze_spy(svc, staging, cache_dir, runner=None, active_idioms=frozenset(), idioms=None):
+        call_order.append(f"analyze:{svc.name}")
+        return {
+            "service": svc.name, "files": 1, "defs": 0, "refs": 0, "malformed_ranges": 0,
+            "nodes": 1, "edges": 0, "imports_external": 0,
+            "calls_joined": 0, "calls_unresolved": 0, "calls_external": 0,
+            "degraded": False, "reason": None, "from_cache": False,
+        }
+
+    def load_spy(staging, store_factory, graph_name):
+        call_order.append("load_graph")
+        store_factory(f"{graph_name}__build")
+        return {
+            "nodes_written": 0, "nodes_written_by_label": {},
+            "edges_written": 0, "edges_written_by_type": {},
+            "edges_dropped_missing_endpoint": 0, "edges_dropped_by_type": {},
+        }
+
+    monkeypatch.setattr("codegraph.cli.analyze_service", analyze_spy)
+    monkeypatch.setattr(
+        "codegraph.cli.link_workspace", _fake_link_workspace(link_calls, call_order)
+    )
+    monkeypatch.setattr("codegraph.cli.load_graph", load_spy)
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeFalkorStore)
+
+    result = runner.invoke(app, ["index", str(root)])
+    assert result.exit_code == 0, result.output
+
+    assert call_order == ["analyze:svc0", "analyze:svc1", "link_workspace", "load_graph"]
+    assert len(link_calls) == 1
+    assert isinstance(link_calls[0]["staging"], Staging)
+    assert link_calls[0]["cfg"].graph_name == "wsgraph"
+
+
+def test_index_report_includes_linking_stats_from_link_workspace(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
+
+    def fake_link_workspace(cfg, staging):
+        return {
+            "calls_http": 4, "calls_http_unresolved": 1,
+            "next_segments": 2, "processes": 1, "marks": 3,
+        }
+
+    monkeypatch.setattr("codegraph.cli.analyze_service", _fake_analyze_service([]))
+    monkeypatch.setattr("codegraph.cli.link_workspace", fake_link_workspace)
+    monkeypatch.setattr("codegraph.cli.load_graph", _fake_load_graph([]))
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeFalkorStore)
+
+    result = runner.invoke(app, ["index", str(root)])
+    assert result.exit_code == 0, result.output
+
+    report = json.loads((root / ".codegraph" / "report.json").read_text())
+    assert report["linking"] == {
+        "calls_http": 4, "calls_http_unresolved": 1,
+        "next_segments": 2, "processes": 1, "marks": 3,
+    }
+    assert "linking" in result.output.lower()
+
+
 def test_index_graph_option_overrides_config_graph_name(tmp_path, monkeypatch):
     root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
     load_calls: list[dict] = []
