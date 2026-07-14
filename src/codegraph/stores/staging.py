@@ -9,7 +9,7 @@ from pathlib import Path
 
 from codegraph.core import ids
 from codegraph.core.errors import InvariantError
-from codegraph.core.schema import SCHEMA_VERSION, EdgeRec, NodeRec
+from codegraph.core.schema import ROLE_KINDS, SCHEMA_VERSION, EdgeRec, NodeRec
 from codegraph.resolvers.base import DefRow, RefRow
 
 _DDL = """
@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS edges(
   src_service TEXT,
   PRIMARY KEY(src, dst, type));
 CREATE INDEX IF NOT EXISTS idx_edges_service ON edges(src_service);
+CREATE TABLE IF NOT EXISTS claims(
+  service TEXT, relpath TEXT, kind TEXT, payload_json TEXT,
+  PRIMARY KEY(service, relpath, kind, payload_json));
+CREATE INDEX IF NOT EXISTS idx_claims_kind ON claims(kind, service);
 """
 
 
@@ -85,12 +89,34 @@ class Staging:
     # -- запись --
 
     def begin_service(self, service: str) -> None:
+        """Сбрасывает S1-S6 слой ОДНОГО сервиса (files/defs/refs/nodes/edges с
+        src_service=service) + его claims. НЕ трогает workspace-слой (Channel/
+        BusinessProcess-узлы, extractor="linking"-рёбра, чужие claims) -- те
+        живут в отдельном скоупе, чистятся ТОЛЬКО clear_workspace_layer() (см. её
+        докстринг и Global Constraint 2 плана M2). Раньше здесь был ещё глобальный
+        `DELETE FROM edges WHERE src_service IS NULL` "страховкой от накопления" --
+        убран: он стирал ЛЮБОЙ null-src edge (в т.ч. рёбра с chan:/proc: концом) как
+        побочный эффект обработки ОДНОГО сервиса, что ломало персистентность
+        workspace-слоя между прогонами S7."""
         cur = self._db
         for t in ("files", "scip_defs", "scip_refs"):
             cur.execute(f"DELETE FROM {t} WHERE service=?", (service,))  # noqa: S608
         cur.execute("DELETE FROM nodes WHERE service=?", (service,))
         cur.execute("DELETE FROM edges WHERE src_service=?", (service,))
-        cur.execute("DELETE FROM edges WHERE src_service IS NULL")  # страховка от накопления
+        cur.execute("DELETE FROM claims WHERE service=?", (service,))
+        self._db.commit()
+
+    def clear_workspace_layer(self) -> None:
+        """Стирает S7-слой (Channel/BusinessProcess-узлы + linking-рёбра) ПЕРЕД
+        link_workspace -- вызывается один раз, ПОСЛЕ всех analyze_service (см.
+        Global Constraint 2 плана M2: S7 всегда идёт после полного прогона;
+        инкрементальность -- M4). Селективно: НЕ трогает код-узлы/рёбра S5/S6
+        (те чистятся per-service в begin_service) и НЕ трогает Channel/
+        BusinessProcess-рёбра, эмитированные НЕ линковкой (extractor != "linking",
+        напр. будущие S5-рёбра к каналам -- PRODUCES/CONSUMES/HANDLES остаются)."""
+        cur = self._db
+        cur.execute("DELETE FROM nodes WHERE kind IN ('Channel','BusinessProcess')")
+        cur.execute("DELETE FROM edges WHERE extractor='linking'")
         self._db.commit()
 
     def add_files(self, service: str, rows: list[tuple[str, str, int]]) -> None:
@@ -117,9 +143,20 @@ class Staging:
         self._db.commit()
 
     def upsert_nodes(self, rows: list[NodeRec]) -> None:
+        """labels-колонка = json [kind, *roles] (роли -- доп. label'ы поверх kind,
+        см. ROLE_KINDS/schema.py докстринг). roles валидируются ⊆ ROLE_KINDS ДО
+        любой записи -- один невалидный узел в батче проваливает весь upsert
+        (fail-closed, по аналогии с cross-service инвариантом ниже)."""
+        for n in rows:
+            invalid_roles = [r for r in n.roles if r not in ROLE_KINDS]
+            if invalid_roles:
+                raise InvariantError(
+                    f"invalid role(s) for node {n.id!r}: {invalid_roles!r} "
+                    f"(allowed: {sorted(ROLE_KINDS)!r})"
+                )
         self._db.executemany(
             "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [(n.id, n.kind, json.dumps([n.kind]), n.service, n.relpath,
+            [(n.id, n.kind, json.dumps([n.kind, *n.roles]), n.service, n.relpath,
               n.start_byte, n.end_byte, n.start_line, n.end_line,
               n.name, n.qualified_name, n.content_hash, json.dumps(n.props))
              for n in rows],
@@ -127,13 +164,31 @@ class Staging:
         self._db.commit()
 
     def upsert_edges(self, rows: list[EdgeRec]) -> None:
+        """Cross-service инвариант (Global Constraint 1 плана M2):
+          - endpoints, начинающиеся на "chan:"/"proc:" -- без cross-service проверки
+            вовсе (каналы/процессы кросс-сервисны по природе, у них нет "своего"
+            сервиса).
+          - sym→sym (оба конца "sym:") разных сервисов -- разрешено ТОЛЬКО если
+            type == "NEXT_SEGMENT" И "via_channel_id" в props (иначе InvariantError).
+          - всё прочее (в т.ч. svc:-конец в кросс-сервисной паре) -- как раньше,
+            безусловный InvariantError.
+        """
         prepared = []
         for e in rows:
             ss, ds = _id_service(e.src), _id_service(e.dst)
-            if ss and ds and ss != ds:
-                raise InvariantError(
-                    f"cross-service edge forbidden: {e.src} -{e.type}-> {e.dst}"
+            chan_or_proc_endpoint = (
+                e.src.startswith(("chan:", "proc:")) or e.dst.startswith(("chan:", "proc:"))
+            )
+            if not chan_or_proc_endpoint and ss and ds and ss != ds:
+                next_segment_ok = (
+                    e.type == "NEXT_SEGMENT"
+                    and e.src.startswith("sym:") and e.dst.startswith("sym:")
+                    and "via_channel_id" in e.props
                 )
+                if not next_segment_ok:
+                    raise InvariantError(
+                        f"cross-service edge forbidden: {e.src} -{e.type}-> {e.dst}"
+                    )
             prepared.append((e.src, e.dst, e.type, e.resolution, e.confidence,
                              e.extractor, e.evidence_file, e.evidence_line,
                              json.dumps(e.props), ss))
@@ -141,6 +196,60 @@ class Staging:
             "INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?)", prepared
         )
         self._db.commit()
+
+    def update_edge_props(self, src: str, dst: str, type: str, merge: dict) -> bool:  # noqa: A002
+        """Json-merge поверх существующих props ребра (src,dst,type) -- shallow
+        `{**old, **merge}`, merge побеждает при коллизии ключей. No-op (возвращает
+        False), если такого ребра нет; True при успешном обновлении."""
+        row = self._db.execute(
+            "SELECT props FROM edges WHERE src=? AND dst=? AND type=?",
+            (src, dst, type),
+        ).fetchone()
+        if row is None:
+            return False
+        props = json.loads(row[0])
+        props.update(merge)
+        self._db.execute(
+            "UPDATE edges SET props=? WHERE src=? AND dst=? AND type=?",
+            (json.dumps(props), src, dst, type),
+        )
+        self._db.commit()
+        return True
+
+    def add_claims(self, service: str, relpath: str, kind: str, payloads: list[dict]) -> None:
+        """Claims -- staging-only находки экстракторов (M2 S5), ещё не узлы/рёбра
+        графа (напр. "этот файл содержит kafka-producer вызов с topic=X") --
+        потребляются линковкой (S7) через claims_for(). payload_json сериализуется
+        с sort_keys=True, чтобы идентичный по содержимому payload (напр. при
+        повторном прогоне на неизменённом файле) давал тот же PRIMARY KEY-ключ и
+        не плодил дубликаты строк."""
+        self._db.executemany(
+            "INSERT OR REPLACE INTO claims VALUES (?,?,?,?)",
+            [(service, relpath, kind, json.dumps(p, sort_keys=True)) for p in payloads],
+        )
+        self._db.commit()
+
+    def claims_for(self, kind: str, service: str | None = None) -> list[dict]:
+        """payload dict + инжектированные "_service"/"_relpath" (побеждают при
+        коллизии имён с ключами самого payload -- staging-метаданные авторитетнее
+        произвольного содержимого claim'а)."""
+        if service is None:
+            cur = self._db.execute(
+                "SELECT service, relpath, payload_json FROM claims WHERE kind=? "
+                "ORDER BY service, relpath",
+                (kind,),
+            )
+        else:
+            cur = self._db.execute(
+                "SELECT service, relpath, payload_json FROM claims "
+                "WHERE kind=? AND service=? ORDER BY relpath",
+                (kind, service),
+            )
+        out = []
+        for svc, relpath, payload_json in cur.fetchall():
+            payload = json.loads(payload_json)
+            out.append({**payload, "_service": svc, "_relpath": relpath})
+        return out
 
     # -- чтение --
 
@@ -184,14 +293,17 @@ class Staging:
         return out
 
     def iter_nodes(self) -> Iterator[NodeRec]:
+        """roles реконструируются из labels-колонки (json [kind, *roles]) --
+        labels[0] всегда == kind (см. upsert_nodes), roles == остаток списка."""
         cur = self._db.execute(
-            "SELECT id, kind, service, relpath, start_byte, end_byte, start_line, "
+            "SELECT id, kind, labels, service, relpath, start_byte, end_byte, start_line, "
             "end_line, name, qualified_name, content_hash, props FROM nodes")
-        for (id_, kind, service, relpath, sb, eb, sl, el, name, qn, ch, props) in cur:
+        for (id_, kind, labels, service, relpath, sb, eb, sl, el, name, qn, ch, props) in cur:
+            roles = tuple(json.loads(labels)[1:])
             yield NodeRec(id=id_, kind=kind, service=service, relpath=relpath,
                           start_byte=sb, end_byte=eb, start_line=sl, end_line=el,
                           name=name, qualified_name=qn, content_hash=ch,
-                          props=json.loads(props))
+                          props=json.loads(props), roles=roles)
 
     def iter_edges(self) -> Iterator[EdgeRec]:
         cur = self._db.execute(

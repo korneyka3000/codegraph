@@ -41,12 +41,16 @@ class FakeStore:
         return [self.nodes[i] for i in ids if i in self.nodes]
 
     def neighbors(self, node_id, edge_types, direction, limit):
+        # Hop -- 4-кортеж (M2, добавлено direction): каждый hop несёт СВОЁ истинное
+        # направление ("out"/"in"), не эхо параметра direction -- воспроизводит
+        # задокументированную семантику FalkorStore._one_way/both-merge (см.
+        # stores/falkordb/store.py) поверх простого списка рёбер в памяти.
         if self.raise_error:
             raise self.raise_error
         self.neighbor_calls.append((node_id, edge_types, direction, limit))
-        out = [(et, dict(ep), self.nodes[d]) for (s, et, ep, d) in self.edges
+        out = [(et, dict(ep), self.nodes[d], "out") for (s, et, ep, d) in self.edges
                if s == node_id and (not edge_types or et in edge_types)]
-        inn = [(et, dict(ep), self.nodes[s]) for (s, et, ep, d) in self.edges
+        inn = [(et, dict(ep), self.nodes[s], "in") for (s, et, ep, d) in self.edges
                if d == node_id and (not edge_types or et in edge_types)]
         merged = out if direction == "out" else inn if direction == "in" else out + inn
         return merged[:limit]
@@ -323,6 +327,43 @@ def test_expand_neighbors_store_unreachable_returns_error_dict():
     q = GraphQuery(_factory(store), {})
     result = q.expand_neighbors("n0")
     assert "falkordb unreachable" in result["error"]
+
+
+# -- M2: Hop direction field + invalid-direction validation --
+
+
+def test_expand_neighbors_hop_includes_direction_out():
+    store = FakeStore()
+    store.add_node("a")
+    store.add_node("b")
+    store.add_edge("a", "CALLS", "b")
+    q = GraphQuery(_factory(store), {})
+    result = q.expand_neighbors("a", direction="out", depth=1)
+    assert len(result["hops"]) == 1
+    assert result["hops"][0]["direction"] == "out"
+
+
+def test_expand_neighbors_hop_direction_correct_in_both_mode():
+    # a -CALLS-> b (out from a), c -CALLS-> a (in to a) -- both-mode must tag each
+    # hop with ITS OWN true direction after the out+in merge, not a single value.
+    store = FakeStore()
+    for name in "abc":
+        store.add_node(name)
+    store.add_edge("a", "CALLS", "b")
+    store.add_edge("c", "CALLS", "a")
+    q = GraphQuery(_factory(store), {})
+    result = q.expand_neighbors("a", direction="both", depth=1, limit=10)
+    direction_by_neighbor = {h["neighbor"]: h["direction"] for h in result["hops"]}
+    assert direction_by_neighbor == {"b": "out", "c": "in"}
+
+
+def test_expand_neighbors_invalid_direction_returns_error_before_store_factory_call():
+    store = FakeStore()
+    calls: list[FakeStore] = []
+    q = GraphQuery(_factory(store, calls), {})
+    result = q.expand_neighbors("a", direction="sideways")
+    assert result == {"error": "invalid direction: 'sideways'"}
+    assert calls == []  # store_factory must never be called
 
 
 # -- who_calls --

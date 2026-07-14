@@ -83,7 +83,12 @@ class FalkorStore:
         ограничен тем же limit -- этого достаточно, т.к. после слияния всё равно
         обрезаем до limit; per-side limit не может дать МЕНЬШЕ полных hop'ов, чем
         обрезка суммы). Несуществующий node_id -- MATCH не матчит ничего, обе стороны
-        дают [], результат []."""
+        дают [], результат [].
+
+        Каждый Hop несёт СВОЁ direction ("out"/"in", см. Hop в stores/graph.py) --
+        _one_way проставляет его по стороне запроса, которая его породила, поэтому
+        в both-режиме после слияния out- и in-хопы остаются различимы (не единое
+        значение на весь результат)."""
         if direction == "both":
             merged = self._one_way(node_id, edge_types, "out", limit) + self._one_way(
                 node_id, edge_types, "in", limit
@@ -110,7 +115,11 @@ class FalkorStore:
             params["types"] = list(edge_types)
         cypher += " RETURN e, m LIMIT $limit"
         res = self._g.query(cypher, params)
-        return [(e.relation, e.properties, m.properties) for e, m in res.result_set]
+        # direction -- параметр ЭТОГО вызова (не выведен из Cypher-результата): каждая
+        # строка результата пришла из ОДНОГО фиксированного _DIRECTION_PATTERNS[direction]
+        # паттерна выше, поэтому все строки этого под-запроса имеют одно и то же
+        # истинное направление -- то самое direction, с которым вызван _one_way.
+        return [(e.relation, e.properties, m.properties, direction) for e, m in res.result_set]
 
     def stats(self) -> dict:
         nodes = self._g.query("MATCH (n) RETURN n.kind, count(n)")

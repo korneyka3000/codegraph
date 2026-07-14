@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import pytest
 
-from codegraph.core.schema import EdgeRec, NodeRec, make_service_node
+from codegraph.core.schema import (
+    EdgeRec,
+    NodeRec,
+    make_channel_node,
+    make_process_node,
+    make_service_node,
+)
 from codegraph.pipeline.load import load_graph
 from codegraph.stores.falkordb.connection import connect
 from codegraph.stores.falkordb.store import FalkorStore
@@ -137,15 +143,17 @@ def test_load_graph_writes_labels_edges_drops_ghost_and_swaps(falkordb_cfg, tmp_
         # -- edges: CALLS a->b written with props; ghost dropped, never reachable --
         out_hops = final_store.neighbors(NODE_A_ID, ["CALLS"], "out", limit=10)
         assert len(out_hops) == 1
-        edge_type, edge_props, node_dict = out_hops[0]
+        edge_type, edge_props, node_dict, direction = out_hops[0]
         assert edge_type == "CALLS"
         assert edge_props["callsite_count"] == 1
         assert edge_props["resolution"] == "static"
         assert node_dict["id"] == NODE_B_ID
+        assert direction == "out"
 
         contains_hops = final_store.neighbors(SERVICE_NODE.id, ["CONTAINS"], "out", limit=10)
         assert len(contains_hops) == 1
         assert contains_hops[0][2]["id"] == NODE_A_ID
+        assert contains_hops[0][3] == "out"
 
         assert final_store.get_nodes([GHOST_ID]) == []
     finally:
@@ -181,3 +189,47 @@ def test_load_graph_resets_stale_build_graph_from_crashed_run(falkordb_cfg, tmp_
         assert {r[0] for r in rows} == {NODE_A_ID, NODE_B_ID, SERVICE_NODE.id}
     finally:
         _cleanup(falkordb_cfg, STALE_BUILD, STALE_GRAPH)
+
+
+ROLES_GRAPH = "__t5roles__"
+ROLES_BUILD = f"{ROLES_GRAPH}__build"
+
+
+def test_load_graph_writes_role_multilabel_and_channel_business_process_labels(
+    falkordb_cfg, tmp_path,
+):
+    """M2: _labels_for_kind's новые ветки (roles-appended multi-label для кодовых
+    узлов; Channel/BusinessProcess как однословные labels) против РЕАЛЬНОГО FalkorDB
+    -- доказывает, что MERGE (n:Sym:Function:RouteHandler {...}) (3+ labels, не
+    только 2, как в остальных тестах этого файла) действительно создаёт узел с
+    ожидаемым набором labels(), а не молча падает/схлопывает часть меток."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("t5rsvc")
+    handler = NodeRec(
+        id="sym:t5rsvc:`app`/handle().", kind="Function", service="t5rsvc",
+        name="handle", qualified_name="app.handle", relpath="app.py",
+        start_byte=0, end_byte=10, start_line=1, end_line=2, content_hash="h",
+        roles=("RouteHandler",),
+    )
+    chan = make_channel_node("kafka_topic", "orders.created")
+    proc = make_process_node(
+        "place-order", "Place Order", entrypoint_id=handler.id, source="config",
+    )
+    st.upsert_nodes([handler, chan, proc])
+
+    try:
+        load_graph(st, lambda name: FalkorStore(falkordb_cfg, name), ROLES_GRAPH)
+
+        final_store = FalkorStore(falkordb_cfg, ROLES_GRAPH)
+        rows = final_store.raw("MATCH (n) RETURN n.id, labels(n)").result_set
+        labels_by_id = {row[0]: set(row[1]) for row in rows}
+        assert labels_by_id[handler.id] == {"Sym", "Function", "RouteHandler"}
+        assert labels_by_id[chan.id] == {"Channel"}
+        assert labels_by_id[proc.id] == {"BusinessProcess"}
+
+        chan_props = final_store.get_nodes([chan.id])[0]
+        assert chan_props["name"] == "orders.created"
+        proc_props = final_store.get_nodes([proc.id])[0]
+        assert proc_props["entrypoint_id"] == handler.id
+    finally:
+        _cleanup(falkordb_cfg, ROLES_BUILD, ROLES_GRAPH)

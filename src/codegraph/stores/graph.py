@@ -5,6 +5,13 @@ Hop — единственный примитив обхода, который �
 (depth>1) собираются в Python поверх повторных вызовов neighbors() выше по стеку
 (query/api.py), а не Cypher-паттернами произвольной длины (см. Global Constraints
 m1b-serving.md: "Многошаговость -- Python BFS").
+
+M2: Hop -- 4-кортеж (было 3 в M1, добавлено direction). direction ∈ {"out","in"} --
+ИСТИННОЕ направление ЭТОГО конкретного перехода относительно запрошенного node_id,
+а не эхо параметра direction, переданного в neighbors(): при direction="both"
+neighbors() сливает out- и in-обходы в один список, и каждый hop в результате несёт
+СВОЁ направление (какая часть слияния его породила), иначе после слияния "out" и
+"in" стали бы неразличимы (см. FalkorStore.neighbors/._one_way).
 """
 
 from __future__ import annotations
@@ -12,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Literal, Protocol
 
-Hop = tuple[str, dict, dict]  # (edge_type, edge_props, node_dict)
+Hop = tuple[str, dict, dict, str]  # (edge_type, edge_props, node_dict, direction)
 
 
 class GraphStore(Protocol):

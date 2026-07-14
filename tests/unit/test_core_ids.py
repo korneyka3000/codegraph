@@ -28,3 +28,38 @@ def test_display_qualified():
     assert ids.display_qualified("`app.mod`/Cls#meth().") == "app.mod.Cls.meth"
     assert ids.display_qualified("`app.mod`/fn().") == "app.mod.fn"
     assert ids.display_qualified("`app.mod`/") == "app.mod"
+
+
+# -- M2: channel/process id helpers --
+
+
+def test_chan_kafka():
+    assert ids.chan_kafka("orders.created") == "chan:kafka_topic:orders.created"
+
+
+def test_chan_event():
+    assert ids.chan_event("OrderPlaced") == "chan:event_type:OrderPlaced"
+
+
+def test_chan_http_with_owner():
+    assert ids.chan_http("orders-api", "POST", "/orders") == "chan:http:orders-api:POST /orders"
+
+
+def test_chan_http_without_owner_uses_question_mark():
+    assert ids.chan_http(None, "GET", "/health") == "chan:http:?:GET /health"
+
+
+def test_proc_id():
+    assert ids.proc_id("place-order") == "proc:place-order"
+
+
+def test_slugify_lowercases_and_replaces_spaces_with_hyphens():
+    assert ids.slugify("Place Order") == "place-order"
+
+
+def test_slugify_strips_non_latin_alnum_hyphen_chars():
+    assert ids.slugify("Order_Placed! (v2)") == "orderplaced-v2"
+
+
+def test_slugify_collapses_repeated_separators_and_trims_edges():
+    assert ids.slugify("--KYC   Worker--") == "kyc-worker"

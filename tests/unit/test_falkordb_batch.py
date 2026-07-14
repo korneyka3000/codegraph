@@ -88,3 +88,52 @@ def test_labels_validated():
     with pytest.raises(InvariantError):
         upsert_nodes(g, ("Sym", "Nope"), rows)
     assert g.calls == []  # validation happens before any query
+
+
+# -- M2: label allowlist grows with roles/Channel/BusinessProcess --
+
+
+def test_upsert_nodes_allows_role_label():
+    g = FakeGraph()
+    rows = [{"id": "sym:a:f", "props": {}}]
+    written = upsert_nodes(g, ("Sym", "Function", "RouteHandler"), rows)
+    assert written == 1
+    assert "MERGE (n:Sym:Function:RouteHandler {id: r.id})" in g.calls[0][0]
+
+
+def test_upsert_nodes_allows_all_five_role_labels():
+    g = FakeGraph()
+    roles = ("RouteHandler", "MessageConsumer", "MessageProducer",
+              "TemporalWorkflow", "TemporalActivity")
+    for role in roles:
+        written = upsert_nodes(g, ("Sym", "Function", role), [{"id": "x", "props": {}}])
+        assert written == 1
+
+
+def test_upsert_nodes_allows_channel_label():
+    g = FakeGraph()
+    written = upsert_nodes(g, ("Channel",), [{"id": "chan:kafka_topic:x", "props": {}}])
+    assert written == 1
+
+
+def test_upsert_nodes_allows_business_process_label():
+    g = FakeGraph()
+    written = upsert_nodes(g, ("BusinessProcess",), [{"id": "proc:x", "props": {}}])
+    assert written == 1
+
+
+def test_upsert_nodes_rejects_unknown_role_label():
+    g = FakeGraph()
+    with pytest.raises(InvariantError):
+        upsert_nodes(g, ("Sym", "Function", "NotARole"), [{"id": "x", "props": {}}])
+    assert g.calls == []
+
+
+def test_upsert_edges_allows_new_m2_edge_types():
+    g = FakeGraph()
+    for edge_type in ("HANDLES", "DEPENDS_ON", "PRODUCES", "CONSUMES",
+                       "INVOKES_ACTIVITY", "CALLS_HTTP", "NEXT_SEGMENT", "PART_OF_PROCESS"):
+        written, dropped = upsert_edges(
+            g, edge_type, [{"src": "a", "dst": "b", "props": {}}], known_ids={"a", "b"}
+        )
+        assert (written, dropped) == (1, 0)

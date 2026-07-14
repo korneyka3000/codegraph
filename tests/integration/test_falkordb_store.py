@@ -56,7 +56,9 @@ def test_falkordb_store_upsert_swap_neighbors_stats(falkordb_cfg):
         # трогает), neighbors() разбирает полноценные Node/Edge объекты и тем самым
         # заполняет кэш label/property-key/relationship-type id->имя старым состоянием.
         pre_hops = final_store.neighbors("old-junk-a", None, "out", limit=10)
-        assert pre_hops == [("OLD_REL", {"x": 0}, {"id": "old-junk-b", "kind": "OldStuff"})]
+        assert pre_hops == [
+            ("OLD_REL", {"x": 0}, {"id": "old-junk-b", "kind": "OldStuff"}, "out")
+        ]
 
         pre_stats = final_store.stats()
         assert pre_stats == {"nodes": {"OldStuff": 2}, "edges": {"OLD_REL": 1}}
@@ -92,29 +94,36 @@ def test_falkordb_store_upsert_swap_neighbors_stats(falkordb_cfg):
         assert {n["id"] for n in nodes} == {func_a["id"], func_b["id"]}
         assert all(n["kind"] == "Function" for n in nodes)
 
-        # --- neighbors: out, отфильтрованные по CALLS ---
+        # --- neighbors: out, отфильтрованные по CALLS -- Hop 4-кортеж, direction="out" ---
         out_hops = final_store.neighbors(func_a["id"], ["CALLS"], "out", limit=10)
         assert len(out_hops) == 1
-        edge_type, edge_props, node_dict = out_hops[0]
+        edge_type, edge_props, node_dict, direction = out_hops[0]
         assert edge_type == "CALLS"
         assert edge_props == {"callsite_count": 1}
         assert node_dict["id"] == func_b["id"]
+        assert direction == "out"
 
-        # --- neighbors: in, без фильтра -- CONTAINS от svc ---
+        # --- neighbors: in, без фильтра -- CONTAINS от svc, direction="in" ---
         in_hops = final_store.neighbors(func_a["id"], None, "in", limit=10)
         assert len(in_hops) == 1
         assert in_hops[0][0] == "CONTAINS"
         assert in_hops[0][2]["id"] == svc["id"]
+        assert in_hops[0][3] == "in"
 
-        # --- neighbors: both, без фильтра -- CALLS(out) + CONTAINS(in) объединены ---
+        # --- neighbors: both, без фильтра -- CALLS(out) + CONTAINS(in) объединены;
+        # КАЖДЫЙ hop несёт СВОЁ истинное направление после слияния (не одно значение
+        # на весь результат) -- это и есть живая проверка both-режима из watch-item 3. ---
         both_hops = final_store.neighbors(func_a["id"], None, "both", limit=10)
         assert len(both_hops) == 2
         assert {h[0] for h in both_hops} == {"CALLS", "CONTAINS"}
+        direction_by_edge_type = {h[0]: h[3] for h in both_hops}
+        assert direction_by_edge_type == {"CALLS": "out", "CONTAINS": "in"}
 
-        # --- neighbors: фильтр по типу сужает "both" до одного CALLS-хопа ---
+        # --- neighbors: фильтр по типу сужает "both" до одного CALLS-хопа (out) ---
         filtered_hops = final_store.neighbors(func_a["id"], ["CALLS"], "both", limit=10)
         assert len(filtered_hops) == 1
         assert filtered_hops[0][0] == "CALLS"
+        assert filtered_hops[0][3] == "out"
 
         # --- neighbors: limit применяется к сумме out+in ---
         limited_hops = final_store.neighbors(func_a["id"], None, "both", limit=1)

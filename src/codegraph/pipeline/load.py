@@ -8,11 +8,14 @@ build_name), потому что FalkorStore.swap_in(build_name) переиме�
 в self.graph_name (см. store.py: `RENAME build_name self.graph_name`) -- self
 здесь обязан УЖЕ быть final-именем, иначе получим RENAME в неверную сторону.
 
-Labels staging не хранит как таковые для serving-графа (Staging.iter_nodes() отдаёт
-NodeRec.kind, а не готовый labels-набор) -- реконструируем по kind: {Module,Class,
-Function} (кодовые) -> ("Sym", kind); Service -> ("Service",). Ребро -> группировка
-по type (единственный дискриминатор, который есть у EdgeRec и который batch.py
-принимает как edge_type).
+Labels staging не хранит как готовый набор для serving-графа -- реконструируем по
+(kind, roles) (Staging.iter_nodes() отдаёт оба, roles восстановлены из labels-json,
+см. staging.py): {Module,Class,Function} (кодовые) -> ("Sym", kind, *roles) --
+roles добавляют multi-label поверх kind (M2, см. core/schema.py ROLE_KINDS);
+Service -> ("Service",); Channel -> ("Channel",); BusinessProcess ->
+("BusinessProcess",) -- эти три игнорируют roles (см. _labels_for_kind). Ребро ->
+группировка по type (единственный дискриминатор, который есть у EdgeRec и который
+batch.py принимает как edge_type).
 
 known_ids собирается ПОКА обходим все узлы (один проход iter_nodes(), до единой
 записи ребра) -- это обязательное условие корректности endpoint-policy рёбер:
@@ -58,11 +61,19 @@ _NODE_CORE_FIELDS = (
 _EDGE_CORE_FIELDS = ("resolution", "confidence", "extractor", "evidence_file", "evidence_line")
 
 
-def _labels_for_kind(kind: str) -> tuple[str, ...]:
+def _labels_for_kind(kind: str, roles: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Кодовые kinds (Module/Class/Function) -> ("Sym", kind, *roles) -- roles
+    добавляют доп. label'ы поверх kind (multi-label, см. core/schema.py ROLE_KINDS).
+    Service/Channel/BusinessProcess -- фиксированный однословный label, roles
+    игнорируются (роли осмысленны только для кодовых узлов)."""
     if kind in _CODE_KINDS:
-        return ("Sym", kind)
+        return ("Sym", kind, *roles)
     if kind == "Service":
         return ("Service",)
+    if kind == "Channel":
+        return ("Channel",)
+    if kind == "BusinessProcess":
+        return ("BusinessProcess",)
     raise InvariantError(f"unknown node kind for graph load: {kind!r}")
 
 
@@ -99,7 +110,7 @@ def load_graph(
     nodes_by_labels: dict[tuple[str, ...], list[dict]] = defaultdict(list)
     known_ids: set[str] = set()
     for n in staging.iter_nodes():
-        labels = _labels_for_kind(n.kind)
+        labels = _labels_for_kind(n.kind, n.roles)
         nodes_by_labels[labels].append({"id": n.id, "props": _node_props(n)})
         known_ids.add(n.id)
 

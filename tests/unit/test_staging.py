@@ -103,3 +103,210 @@ def test_local_def_symbols(tmp_path):
     st.add_defs("a", [DefRow("m.py", "local 1", 0, 1, 1),
                       DefRow("m.py", "scip-python python a 0.1 `m`/f().", 5, 6, 1)])
     assert st.local_def_symbols("a", "m.py") == {"local 1"}
+
+
+# -- M2: NodeRec.roles round-trip + validation --
+
+
+def test_upsert_nodes_roles_round_trip_via_iter_nodes(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    n = NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", name="f",
+                qualified_name="m.f", roles=("RouteHandler",))
+    st.upsert_nodes([n])
+    out = list(st.iter_nodes())
+    assert len(out) == 1
+    assert out[0].roles == ("RouteHandler",)
+
+
+def test_upsert_nodes_no_roles_round_trips_empty_tuple(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_node("sym:a:`m`/f().", "a")])
+    out = list(st.iter_nodes())
+    assert out[0].roles == ()
+
+
+def test_upsert_nodes_multiple_roles_round_trip_order_preserved(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    n = NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", name="f",
+                qualified_name="m.f", roles=("MessageConsumer", "TemporalActivity"))
+    st.upsert_nodes([n])
+    out = list(st.iter_nodes())
+    assert out[0].roles == ("MessageConsumer", "TemporalActivity")
+
+
+def test_upsert_nodes_invalid_role_raises_invariant_error(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    n = NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", name="f",
+                qualified_name="m.f", roles=("NotARole",))
+    with pytest.raises(InvariantError):
+        st.upsert_nodes([n])
+
+
+# -- M2: upsert_edges invariant (chan:/proc: endpoints free; NEXT_SEGMENT exception) --
+
+
+def test_next_segment_cross_service_allowed_with_via_channel_id(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("sym:a:`m`/f().", "sym:b:`m`/g().", "NEXT_SEGMENT", "derived", 0.9,
+                "linking", props={"via_channel_id": "chan:kafka_topic:orders"})
+    st.upsert_edges([e])  # must not raise
+    edges = list(st.iter_edges())
+    assert len(edges) == 1 and edges[0].type == "NEXT_SEGMENT"
+
+
+def test_next_segment_cross_service_without_via_channel_id_forbidden(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("sym:a:`m`/f().", "sym:b:`m`/g().", "NEXT_SEGMENT", "derived", 0.9,
+                "linking")  # no via_channel_id prop
+    with pytest.raises(InvariantError):
+        st.upsert_edges([e])
+
+
+def test_cross_service_edge_wrong_type_with_via_channel_id_still_forbidden(tmp_path):
+    # via_channel_id alone doesn't grant a pass -- type must be exactly NEXT_SEGMENT.
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("sym:a:`m`/f().", "sym:b:`m`/g().", "CALLS", "static", 1.0,
+                "calls", props={"via_channel_id": "chan:kafka_topic:orders"})
+    with pytest.raises(InvariantError):
+        st.upsert_edges([e])
+
+
+def test_channel_endpoint_edge_no_cross_service_check(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("sym:a:`m`/f().", "chan:kafka_topic:orders.created", "PRODUCES",
+                "static", 1.0, "kafka")
+    st.upsert_edges([e])  # must not raise despite a service-bearing endpoint
+    assert len(list(st.iter_edges())) == 1
+
+
+def test_process_endpoint_edge_no_cross_service_check(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("proc:place-order", "sym:a:`m`/f().", "PART_OF_PROCESS",
+                "derived", 1.0, "linking")
+    st.upsert_edges([e])  # must not raise
+    assert len(list(st.iter_edges())) == 1
+
+
+# -- M2: begin_service no longer wipes unrelated NULL-src edges globally --
+
+
+def test_begin_service_does_not_wipe_other_services_null_src_edges(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    # proc: src -> NULL src_service; must survive an unrelated service's
+    # begin_service (old code deleted ALL null-src edges globally as a side
+    # effect of ANY single service's begin_service call -- this is the fixed
+    # regression: workspace-layer edges are now cleared ONLY by
+    # clear_workspace_layer(), never as a side effect of begin_service).
+    e = EdgeRec("proc:place-order", "sym:a:`m`/f().", "PART_OF_PROCESS",
+                "derived", 1.0, "linking")
+    st.upsert_edges([e])
+    st.begin_service("b")  # unrelated service; never touched "a" or the process
+    edges = list(st.iter_edges())
+    assert len(edges) == 1 and edges[0].type == "PART_OF_PROCESS"
+
+
+# -- M2: claims --
+
+
+def test_claims_round_trip_injects_service_and_relpath(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.add_claims("a", "app/producer.py", "kafka_producer",
+                  [{"topic": "orders.created", "var": "producer"}])
+    claims = st.claims_for("kafka_producer")
+    assert len(claims) == 1
+    assert claims[0]["topic"] == "orders.created"
+    assert claims[0]["var"] == "producer"
+    assert claims[0]["_service"] == "a"
+    assert claims[0]["_relpath"] == "app/producer.py"
+
+
+def test_claims_filtered_by_kind_and_service(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.add_claims("a", "x.py", "kafka_producer", [{"topic": "t1"}])
+    st.add_claims("b", "y.py", "kafka_producer", [{"topic": "t2"}])
+    st.add_claims("a", "x.py", "kafka_consumer", [{"topic": "t3"}])
+
+    claims_a_producer = st.claims_for("kafka_producer", service="a")
+    assert len(claims_a_producer) == 1 and claims_a_producer[0]["topic"] == "t1"
+
+    claims_all_producers = st.claims_for("kafka_producer")
+    assert {c["topic"] for c in claims_all_producers} == {"t1", "t2"}
+
+    claims_a_consumer = st.claims_for("kafka_consumer")
+    assert len(claims_a_consumer) == 1 and claims_a_consumer[0]["topic"] == "t3"
+
+
+def test_claims_for_unknown_kind_returns_empty_list(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    assert st.claims_for("nope") == []
+
+
+def test_add_claims_multiple_payloads_one_call(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.add_claims("a", "x.py", "kafka_producer", [{"topic": "t1"}, {"topic": "t2"}])
+    claims = st.claims_for("kafka_producer")
+    assert {c["topic"] for c in claims} == {"t1", "t2"}
+
+
+def test_begin_service_clears_own_claims(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.add_claims("a", "app/x.py", "kafka_producer", [{"topic": "orders"}])
+    st.begin_service("a")
+    assert st.claims_for("kafka_producer", service="a") == []
+
+
+def test_begin_service_does_not_clear_other_services_claims(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.add_claims("a", "x.py", "kafka_producer", [{"topic": "t1"}])
+    st.add_claims("b", "y.py", "kafka_producer", [{"topic": "t2"}])
+    st.begin_service("a")
+    assert st.claims_for("kafka_producer", service="b") != []
+    assert st.claims_for("kafka_producer", service="a") == []
+
+
+# -- M2: clear_workspace_layer --
+
+
+def test_clear_workspace_layer_removes_channel_and_process_nodes_and_linking_edges_only(
+    tmp_path,
+):
+    st = Staging(tmp_path / "s.db")
+    fn = NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", name="f",
+                 qualified_name="m.f")
+    chan = NodeRec(id="chan:kafka_topic:orders", kind="Channel", service="",
+                    name="orders", qualified_name="chan:kafka_topic:orders")
+    proc = NodeRec(id="proc:place-order", kind="BusinessProcess", service="",
+                    name="Place Order", qualified_name="proc:place-order")
+    st.upsert_nodes([fn, chan, proc])
+
+    code_edge = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/f().", "CALLS", "static", 1.0, "calls")
+    linking_edge = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/f().", "NEXT_SEGMENT", "derived",
+                           0.9, "linking", props={"via_channel_id": chan.id})
+    st.upsert_edges([code_edge, linking_edge])  # same (src,dst), distinct type -> both kept
+
+    st.clear_workspace_layer()
+
+    remaining_ids = {n.id for n in st.iter_nodes()}
+    assert remaining_ids == {fn.id}
+    remaining_edges = {(e.src, e.dst, e.type) for e in st.iter_edges()}
+    assert remaining_edges == {(code_edge.src, code_edge.dst, code_edge.type)}
+
+
+# -- M2: update_edge_props --
+
+
+def test_update_edge_props_merges_and_overwrites(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "CALLS", "static", 1.0, "calls",
+                props={"callsite_count": 1, "keep": "me"})
+    st.upsert_edges([e])
+    ok = st.update_edge_props(e.src, e.dst, e.type, {"callsite_count": 5, "new_key": "v"})
+    assert ok is True
+    updated = next(iter(st.iter_edges()))
+    assert updated.props == {"callsite_count": 5, "keep": "me", "new_key": "v"}
+
+
+def test_update_edge_props_returns_false_when_edge_missing(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    ok = st.update_edge_props("sym:a:x", "sym:a:y", "CALLS", {"k": "v"})
+    assert ok is False

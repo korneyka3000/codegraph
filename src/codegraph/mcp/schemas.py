@@ -78,14 +78,16 @@ class ExpandNeighborsInput(BaseModel):
 
 
 class Hop(BaseModel):
-    """Один шаг обхода: `node` -[edge_type]-> `neighbor` (или наоборот при
-    direction="in" -- направление живёт в самом edge_type/запросе, не переутверждается
-    здесь; см. query.api.GraphQuery.expand_neighbors докстринг)."""
+    """Один шаг обхода: `node` -[edge_type]-> `neighbor` в направлении `direction`
+    (M2: обязательное поле -- "out"|"in", ИСТИННОЕ направление ЭТОГО перехода; при
+    вызове expand_neighbors(direction="both") каждый hop несёт своё, а не общее
+    значение -- см. query.api.GraphQuery.expand_neighbors и stores/graph.py Hop)."""
 
     node: str
     edge_type: str
     edge_props: dict
     neighbor: str | None = None
+    direction: Literal["out", "in"]
 
 
 class ExpandNeighborsOutput(BaseModel):

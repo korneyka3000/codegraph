@@ -44,6 +44,7 @@ from codegraph.core.spans import LineIndex
 from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
 from codegraph.stores.graph import GraphStore
 
+_VALID_DIRECTIONS = frozenset({"out", "in", "both"})  # expand_neighbors direction validation
 _DEPTH_MIN, _DEPTH_MAX = 1, 3  # expand_neighbors depth clamp
 _MAX_DEPTH_MIN, _MAX_DEPTH_MAX = 1, 5  # who_calls max_depth clamp
 _DEFAULT_CALLER_LIMIT = 50  # who_calls: внутренний cap суммарных callers (нет параметра limit
@@ -147,7 +148,15 @@ class GraphQuery:
     ) -> dict:
         """edge_types=None и edge_types=[] эквивалентны -- оба означают "без фильтра по
         типу ребра" (store._one_way делает `if edge_types:` перед добавлением `WHERE
-        type(e) IN $types`, пустой список falsy -- та же ветка, что и None)."""
+        type(e) IN $types`, пустой список falsy -- та же ветка, что и None).
+
+        Невалидный direction -> `{"error": ...}` ДО обращения к store_factory (M2):
+        direction в сигнатуре типизирован Literal["out","in","both"], но это лишь
+        подсказка типа для статических чекеров/схемы -- вызывающая сторона (в т.ч.
+        MCP-клиент, CLI trace) может передать произвольную строку в рантайме, и эта
+        проверка -- защитный рубеж независимо от вызывающего слоя."""
+        if direction not in _VALID_DIRECTIONS:
+            return {"error": f"invalid direction: {direction!r}"}
         depth = max(_DEPTH_MIN, min(_DEPTH_MAX, depth))
         try:
             store = self.store_factory()
@@ -171,7 +180,7 @@ class GraphQuery:
                     if len(step) > remaining:
                         step = step[:remaining]
                         truncated = True
-                    for edge_type, edge_props, node_dict in step:
+                    for edge_type, edge_props, node_dict, hop_direction in step:
                         neighbor_id = node_dict.get("id")
                         hops.append(
                             {
@@ -179,6 +188,7 @@ class GraphQuery:
                                 "edge_type": edge_type,
                                 "edge_props": edge_props,
                                 "neighbor": neighbor_id,
+                                "direction": hop_direction,
                             }
                         )
                         if neighbor_id is not None:
@@ -215,7 +225,7 @@ class GraphQuery:
                     if len(step) > remaining:
                         step = step[:remaining]
                         truncated = True
-                    for _edge_type, _edge_props, node_dict in step:
+                    for _edge_type, _edge_props, node_dict, _direction in step:
                         caller_id = node_dict.get("id")
                         if caller_id is None:
                             continue

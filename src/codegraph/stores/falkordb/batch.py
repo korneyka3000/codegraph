@@ -12,11 +12,17 @@ import logging
 from collections.abc import Callable
 
 from codegraph.core.errors import InvariantError
-from codegraph.core.schema import EDGE_TYPES, NODE_KINDS
+from codegraph.core.schema import EDGE_TYPES, NODE_KINDS, ROLE_KINDS
 
 logger = logging.getLogger(__name__)
 
-_ALLOWED_NODE_LABELS = frozenset(NODE_KINDS | {"Sym", "Service"})
+# NODE_KINDS уже содержит Service/Channel/BusinessProcess; "Sym" -- структурный
+# маркер-label для кодовых узлов (не NodeRec.kind сам по себе, см. pipeline/load.
+# _labels_for_kind), ROLE_KINDS -- доп. label'ы поверх kind (multi-label, напр.
+# :Sym:Function:RouteHandler). Растёт автоматически вместе со schema.py -- schema.py
+# остаётся единственным источником истины (fail-closed расширение, Global
+# Constraint 5 плана M2).
+_ALLOWED_NODE_LABELS = frozenset(NODE_KINDS | ROLE_KINDS | {"Sym"})
 
 
 def upsert_nodes(
