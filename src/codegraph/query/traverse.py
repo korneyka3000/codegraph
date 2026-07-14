@@ -39,9 +39,12 @@ _EXIT_EDGE_TYPES = ("PRODUCES", "CALLS_HTTP")
 _SEGMENT_EDGE_TYPES = [*_INTRA_EDGE_TYPES, *_EXIT_EDGE_TYPES]
 
 _SEGMENT_MAX_DEPTH = 15  # hops from a segment's entry; a node reached AT this depth
-# is recorded as a step but not itself expanded (see _walk_segment) -- conservatively
-# marks the segment truncated even if that specific node had no further edges (no
-# cheap way to know without querying past the cap, which would defeat having one).
+# is recorded as a step but not itself expanded (see _walk_segment). Whether that
+# non-expansion counts as truncation is decided honestly (T8 review fix): one extra
+# neighbors-peek on the capped node -- truncated only if it actually HAS onward
+# edges (above min_confidence) the walk would have processed. A COMPLETE 15-hop
+# chain, whose last node merely sits at the cap with nothing beyond it, reads
+# truncated=False.
 _SEGMENT_MAX_BRANCH = 8  # per-node fan-out cap, across intra+exit edges combined
 _NEIGHBOR_FETCH_LIMIT = 50  # generous per-node store.neighbors() cap; confidence
 # filtering happens client-side (store.neighbors has no confidence predicate), so
@@ -85,7 +88,17 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
         node_id, depth = frontier[idx]
         idx += 1
         if depth >= _SEGMENT_MAX_DEPTH:
-            truncated = True  # see _SEGMENT_MAX_DEPTH docstring above
+            # Honest truncation (T8 review fix): reaching the cap only truncated
+            # something if this node actually has onward edges the walk would have
+            # processed -- ANY of _SEGMENT_EDGE_TYPES (a cut-off exit is a missing
+            # channel/next segment, as real a loss as a missing step), above the
+            # min_confidence floor (a below-floor edge would have been dropped by
+            # _sorted_hops anyway, cap or no cap). Peek skipped once truncated is
+            # already True -- the flag can't get any truer.
+            if not truncated:
+                peek = store.neighbors(node_id, _SEGMENT_EDGE_TYPES, "out", _NEIGHBOR_FETCH_LIMIT)
+                if any(h[1].get("confidence", 1.0) >= min_confidence for h in peek):
+                    truncated = True
             continue
 
         raw_hops = store.neighbors(node_id, _SEGMENT_EDGE_TYPES, "out", _NEIGHBOR_FETCH_LIMIT)
@@ -258,7 +271,16 @@ def find_paths(
     for _ in range(max_hops):
         next_frontier: list[str] = []
         for node_id in frontier:
-            hops = store.neighbors(node_id, edge_types, "both", _FIND_PATHS_NEIGHBOR_LIMIT)
+            # _sorted_hops with min_confidence=0.0 -- pure deterministic ordering,
+            # NO confidence filtering (find_paths' contract has no min_confidence
+            # parameter; 0.0 keeps every hop). Sorting mirrors trace_process: with
+            # several equal-length paths, the (edge_type, neighbor_id) tie-break
+            # decides which one wins, so the winner must not depend on the store's
+            # own row order (T8 review fix -- FalkorDB row order isn't stable).
+            hops = _sorted_hops(
+                store.neighbors(node_id, edge_types, "both", _FIND_PATHS_NEIGHBOR_LIMIT),
+                min_confidence=0.0,
+            )
             for edge_type, _edge_props, neighbor, hop_direction in hops:
                 neighbor_id = neighbor.get("id")
                 if neighbor_id is None or neighbor_id in visited:

@@ -173,6 +173,48 @@ def test_trace_invalid_format_is_red_error_exit_1(tmp_path, monkeypatch):
     assert "Traceback" not in result.output
 
 
+def test_trace_mermaid_escapes_quotes_and_pipes_in_labels(tmp_path, monkeypatch):
+    # T8 review fast-follow (reviewer's crafted-name scenario): a raw `"` inside a
+    # node label closes mermaid's quoted node text early; a raw `|` inside an edge
+    # label closes the |label| early -- pin the smoke-level escaping _trace_mermaid
+    # applies: `"` -> `'` in node labels, `|` -> `/` and `"` -> `'` in edge labels.
+    crafted = {
+        "segments": [
+            {
+                "service": "orders-api",
+                "entry": {"id": "e1", "name": 'we"ird'},
+                "steps": [],
+                "exits": [
+                    {"channel": {"id": "c1", "name": 'Order|Created"x'}, "next_entry_ids": ["e2"]},
+                ],
+                "truncated": False,
+            },
+            {
+                "service": "kyc-worker",
+                "entry": {"id": "e2", "name": "handler"},
+                "steps": [],
+                "exits": [],
+                "truncated": False,
+            },
+        ],
+        "confidence": 1.0,
+        "truncated": False,
+    }
+    root = _write_workspace(tmp_path)
+    _with_staging(root)
+    monkeypatch.setattr("codegraph.cli.resolve_selector", _fake_resolve_selector("e1"))
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(crafted))
+
+    result = runner.invoke(
+        app, ["trace", "orders-api:POST /orders", str(root), "--format", "mermaid"]
+    )
+    assert result.exit_code == 0, result.output
+    assert 'S0["orders-api: we\'ird"]' in result.output  # `"` in node label -> `'`
+    assert "S0 -->|Order/Created'x| S1" in result.output  # `|` -> `/`, `"` -> `'` in edge label
+    assert 'we"ird' not in result.output  # no raw quote survives anywhere
+    assert 'Order|Created"x' not in result.output  # no raw pipe/quote in the edge label
+
+
 # -- not-found entrypoint --
 
 

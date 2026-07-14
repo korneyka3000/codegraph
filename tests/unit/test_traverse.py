@@ -198,6 +198,22 @@ def test_invokes_activity_step_present_in_same_segment_as_temporal_start():
     assert step["edge_type"] == "INVOKES_ACTIVITY"
 
 
+def test_depends_on_edge_appears_as_intra_segment_step():
+    # T8 review fast-follow: DEPENDS_ON is the third intra-segment edge type
+    # (same walk path as CALLS/INVOKES_ACTIVITY) -- pin it explicitly so a future
+    # edit to _INTRA_EDGE_TYPES can't silently drop FastAPI DI edges from traces.
+    store = FakeStore()
+    store.add_node("handler", service="a", kind="Function", roles=["RouteHandler"])
+    store.add_node("get_db", service="a", kind="Function")
+    store.add_edge("handler", "DEPENDS_ON", "get_db", via="depends")
+
+    result = traverse.trace_process(store, "handler", max_segments=12, min_confidence=0.3)
+    seg = result["segments"][0]
+    assert [(s["edge_type"], s["node"]["id"]) for s in seg["steps"]] == [("DEPENDS_ON", "get_db")]
+    assert seg["steps"][0]["props"]["via"] == "depends"
+    assert seg["steps"][0]["direction"] == "out"
+
+
 # -- entrypoint not found --
 
 
@@ -343,6 +359,65 @@ def test_branch_cap_limits_steps_per_node_and_sets_truncated():
     assert result["truncated"] is True
 
 
+# -- depth cap (<=15): honest truncation (T8 review fast-follow) --
+# truncated must mean "edges the walk WOULD have processed were actually cut off",
+# not merely "a node happened to sit exactly at the depth cap".
+
+
+def _chain_store(hops: int) -> FakeStore:
+    """n0 -CALLS-> n1 -CALLS-> ... -CALLS-> n{hops}: an exactly-hops-long chain."""
+    store = FakeStore()
+    for i in range(hops + 1):
+        store.add_node(f"n{i}", service="s", kind="Function")
+    for i in range(hops):
+        store.add_edge(f"n{i}", "CALLS", f"n{i + 1}")
+    return store
+
+
+def test_complete_15_hop_chain_is_not_truncated():
+    # Reviewer's exact probe: the last node of a COMPLETE 15-hop chain sits exactly
+    # AT the depth cap -- it has nothing further to walk, so nothing was cut off.
+    store = _chain_store(15)
+    result = traverse.trace_process(store, "n0", max_segments=12, min_confidence=0.3)
+    seg = result["segments"][0]
+    assert len(seg["steps"]) == 15  # every edge of the chain IS in the output
+    assert seg["truncated"] is False
+    assert result["truncated"] is False
+
+
+def test_16_hop_chain_is_truncated_and_walk_stops_at_the_cap():
+    store = _chain_store(16)
+    result = traverse.trace_process(store, "n0", max_segments=12, min_confidence=0.3)
+    seg = result["segments"][0]
+    assert len(seg["steps"]) == 15  # the n15->n16 edge was NOT walked...
+    assert {s["node"]["id"] for s in seg["steps"]} == {f"n{i}" for i in range(1, 16)}
+    assert seg["truncated"] is True  # ...and the flag says so
+    assert result["truncated"] is True
+
+
+def test_capped_node_with_only_subthreshold_edge_is_not_truncated():
+    # The peek respects min_confidence: an edge below the floor would have been
+    # dropped by the walk anyway (cap or no cap) -- it can't be "cut off".
+    store = _chain_store(15)
+    store.add_node("weak", service="s", kind="Function")
+    store.add_edge("n15", "CALLS", "weak", confidence=0.1)
+    result = traverse.trace_process(store, "n0", max_segments=12, min_confidence=0.3)
+    assert result["segments"][0]["truncated"] is False
+
+
+def test_capped_node_with_exit_edge_is_truncated():
+    # An exit (PRODUCES/CALLS_HTTP) cut off at the cap is a missing channel -- and
+    # potentially a whole missing next segment -- as much a truncation as a missing
+    # step: the peek uses the walk's full edge set, not just the intra types.
+    store = _chain_store(15)
+    store.add_node("chan:event_type:E", kind="Channel", channel_kind="event_type")
+    store.add_edge("n15", "PRODUCES", "chan:event_type:E")
+    result = traverse.trace_process(store, "n0", max_segments=12, min_confidence=0.3)
+    seg = result["segments"][0]
+    assert seg["exits"] == []  # the exit itself is NOT recorded (cap stopped the walk)...
+    assert seg["truncated"] is True  # ...which is exactly why the flag must be honest
+
+
 # -- determinism: repeated calls over the same store produce identical output --
 
 
@@ -385,6 +460,29 @@ def test_find_paths_returns_shortest_path_by_hop_count():
     result = traverse.find_paths(store, "a", "d", max_hops=8, edge_types=None)
     node_ids = [step["node"]["id"] for step in result["path"]]
     assert node_ids == ["a", "d"]
+
+
+def test_find_paths_deterministic_tie_break_between_equal_length_paths():
+    # T8 review fast-follow: two equal-length paths a->b->d and a->c->d -- the hop
+    # sorting (edge_type, neighbor id) must pick the SAME winner regardless of the
+    # store's own row order (FalkorDB row order is not contractually stable; the
+    # fake store returns edges in insertion order, so the reversed-insertion store
+    # below would win with a->c->d if BFS took hops unsorted).
+    def diamond(edge_order):
+        store = FakeStore()
+        for n in "abcd":
+            store.add_node(n, kind="Function")
+        for src, dst in edge_order:
+            store.add_edge(src, "CALLS", dst)
+        return store
+
+    forward = diamond([("a", "b"), ("a", "c"), ("b", "d"), ("c", "d")])
+    reversed_ = diamond([("a", "c"), ("a", "b"), ("c", "d"), ("b", "d")])
+
+    path_fwd = traverse.find_paths(forward, "a", "d", max_hops=8, edge_types=None)["path"]
+    path_rev = traverse.find_paths(reversed_, "a", "d", max_hops=8, edge_types=None)["path"]
+    assert [s["node"]["id"] for s in path_fwd] == ["a", "b", "d"]
+    assert [s["node"]["id"] for s in path_rev] == ["a", "b", "d"]
 
 
 def test_find_paths_not_found_returns_null_path():

@@ -148,7 +148,8 @@ class TraceSegment(BaseModel):
     entry: dict
     steps: list[TraceStep]
     exits: list[TraceExit]
-    truncated: bool  # depth>15 или branch>8 внутри ЭТОГО сегмента
+    truncated: bool  # рёбра ЭТОГО сегмента реально срезаны depth-капом 15 (за капом
+    # есть непройденные рёбра -- полная 15-хоповая цепочка НЕ truncated) или branch-капом 8
 
 
 class TraceProcessOutput(BaseModel):
