@@ -13,7 +13,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from codegraph.cli import app
-from codegraph.config.models import DEFAULT_BUILTIN_IDIOMS, FalkorDBConfig
+from codegraph.config.models import DEFAULT_BUILTIN_IDIOMS, FalkorDBConfig, ServiceIdioms
 from codegraph.stores.falkordb.connection import StoreError
 from codegraph.stores.staging import Staging
 
@@ -45,10 +45,10 @@ def _write_workspace(tmp_path: Path, n_services: int = 1, graph_name: str = "wsg
 
 
 def _fake_analyze_service(recorded: list[dict]):
-    def fn(svc, staging, cache_dir, runner=None, active_idioms=frozenset()):
+    def fn(svc, staging, cache_dir, runner=None, active_idioms=frozenset(), idioms=None):
         recorded.append({
             "svc": svc, "staging": staging, "cache_dir": cache_dir,
-            "active_idioms": active_idioms,
+            "active_idioms": active_idioms, "idioms": idioms,
         })
         return {
             "service": svc.name, "files": 1, "defs": 0, "refs": 0, "malformed_ranges": 0,
@@ -106,6 +106,14 @@ def test_index_calls_analyze_service_per_service_and_load_graph_with_config_grap
         # M2 T4 wiring fix: index() активирует доменные экстракторы по
         # cfg.builtin_idioms (workspace без явного builtin_idioms -> полный дефолт).
         assert c["active_idioms"] == frozenset(DEFAULT_BUILTIN_IDIOMS)
+        # M2 T5: idioms — per-service effective ServiceIdioms (builtin merged with the
+        # service's own, empty here since _write_workspace's services declare none of
+        # their own); default builtin_idioms still contributes aiokafka/faststream/
+        # confluent producers+consumers and aiohttp_client's http_client.
+        assert isinstance(c["idioms"], ServiceIdioms)
+        assert len(c["idioms"].producers) > 0
+        assert len(c["idioms"].consumers) > 0
+        assert len(c["idioms"].http_clients) > 0
 
     assert len(load_calls) == 1
     assert load_calls[0]["graph_name"] == "wsgraph"
@@ -145,7 +153,7 @@ def test_index_writes_report_json_from_build_report(tmp_path, monkeypatch):
 def test_index_degraded_service_still_exits_zero_with_warning(tmp_path, monkeypatch):
     root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
 
-    def fake_analyze(svc, staging, cache_dir, runner=None, active_idioms=frozenset()):
+    def fake_analyze(svc, staging, cache_dir, runner=None, active_idioms=frozenset(), idioms=None):
         return {
             "service": svc.name, "files": 1, "defs": 0, "refs": 0, "malformed_ranges": 0,
             "nodes": 1, "edges": 0, "imports_external": 0,

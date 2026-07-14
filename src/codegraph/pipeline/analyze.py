@@ -14,9 +14,25 @@ M2 T4: доменные экстракторы (сейчас — fastapi) зап
 мёржатся в уже построенные python_core NodeRec'и ДО staging.upsert_nodes; channels/edges
 идут в те же upsert_nodes/upsert_edges вызовы. `active_idioms` — НЕ то же самое, что
 per-service ServiceIdioms (config/models.py): это подмножество cfg.builtin_idioms
-(workspace-level), просто проверка "какие структурные доменные экстракторы включать" —
-cli.py-проводка (`cfg.builtin_idioms` → сюда) намеренно НЕ часть этой задачи (см. T4
-report); текущие вызовы analyze_service (cli.py, все тесты) её не передают.
+(workspace-level), просто проверка "какие структурные доменные экстракторы включать".
+
+M2 T5: kafka_ext/temporal_ext добавлены в тот же S5-проход. kafka — ДАННЫЕ-идиома: её
+активация НЕ читает active_idioms вовсе, а зависит от параметра `idioms` (effective
+ServiceIdioms — builtin aiokafka/faststream/confluent, если они в cfg.builtin_idioms,
+смёрженные с собственными идиомами сервиса, см. config.loader.effective_idioms) —
+активна, если там есть хоть один producer/consumer; `idioms=None` (дефолт — как и
+`active_idioms=frozenset()`, ни на один существующий вызов не влияет) эквивалентен
+пустой ServiceIdioms. temporal — структурный экстрактор как fastapi: активен, если
+"temporal" ∈ active_idioms (builtin_idioms.py держит его ServiceIdioms пустым намеренно
+— паттерны декораторов зашиты в temporal_ext.py, не в идиом-DSL). node_ids -- та же
+def-index -> node-id карта, что уже строилась для fastapi, дополненная ОДНИМ новым
+ключом `None -> Module-node-id`: CallFact.enclosing_def уже использует None как маркер
+"вызов на уровне модуля", так что `node_ids.get(call.enclosing_def)` прозрачно
+резолвится в Module-узел для module-level producer/consumer вызовов без отдельной ветки
+в самих экстракторах (пример — document_management-подобный `producer = Foo(); producer.send(...)`
+на уровне модуля; ни один текущий фикстурный файл этого не требует, но kafka_ext
+контрактно это поддерживает). cli.py передаёт `idioms=effective_idioms(cfg, svc)` —
+ПЕР-сервисно (в отличие от `active_idioms`, который один на весь workspace).
 """
 
 from __future__ import annotations
@@ -25,12 +41,15 @@ from dataclasses import replace
 from functools import cache, partial
 from pathlib import Path
 
-from codegraph.config.models import ServiceConfig
+from codegraph.config.models import ServiceConfig, ServiceIdioms
 from codegraph.core.schema import EdgeRec, NodeRec, make_service_node
 from codegraph.extractors.base import FileContext
 from codegraph.extractors.calls import build_calls
 from codegraph.extractors.fastapi_ext import extract_fastapi
+from codegraph.extractors.kafka_ext import extract_kafka
 from codegraph.extractors.python_core import extract as extract_python_core
+from codegraph.extractors.temporal_ext import extract_temporal
+from codegraph.parsing.consts import ConstTable
 from codegraph.parsing.facts import build_file_facts
 from codegraph.resolvers import fallback
 from codegraph.resolvers.scip.reader import read_scip_into_staging
@@ -71,6 +90,7 @@ def analyze_service(
     cache_dir: Path,
     runner: ScipRunner | None = None,
     active_idioms: frozenset[str] = frozenset(),
+    idioms: ServiceIdioms | None = None,
 ) -> dict:
     runner = runner if runner is not None else ScipRunner()
 
@@ -116,6 +136,13 @@ def analyze_service(
     ref_symbol_lookup = partial(staging.ref_symbol_at, svc.name)
     module_exists = module_set.__contains__
     fastapi_active = "fastapi" in active_idioms
+    # T5: kafka is DATA-driven (effective ServiceIdioms), not active_idioms-gated --
+    # see module docstring. idioms=None (default, matches active_idioms=frozenset()'s
+    # own "no existing caller affected" convention) behaves like an empty ServiceIdioms.
+    kafka_idioms = idioms if idioms is not None else ServiceIdioms()
+    kafka_active = bool(kafka_idioms.producers or kafka_idioms.consumers)
+    temporal_active = "temporal" in active_idioms
+    domain_active = fastapi_active or kafka_active or temporal_active
 
     nodes = [make_service_node(svc.name)]
     edges = []
@@ -135,22 +162,46 @@ def analyze_service(
         edges.extend(res.edges)
         imports_external += res.stats["imports_external"]
 
-        if fastapi_active:
+        if domain_active:
             # def-index -> node id, из ЭТОГО ЖЕ python_core-прогона: nodes[0] всегда
             # Service (общий по сервису, не per-file), res.nodes[0] — Module этого
             # файла, res.nodes[1:] — ровно по одному узлу на facts.defs[rp], в том же
             # порядке (python_core.extract строит их именно так, один append на def).
-            node_ids = {
+            # None -> Module id (T5): CallFact.enclosing_def уже None для module-level
+            # вызовов, так что .get(call.enclosing_def) резолвится сюда без спецветки.
+            node_ids: dict[int | None, str] = {
                 d.index: n.id
                 for d, n in zip(facts_by_file[rp].defs, res.nodes[1:], strict=True)
             }
-            fr = extract_fastapi(ctx, node_ids)
-            for nid, rs in fr.roles.items():
-                domain_roles.setdefault(nid, set()).update(rs)
-            for nid, props in fr.node_props.items():
-                domain_node_props.setdefault(nid, {}).update(props)
-            domain_channels.extend(fr.channels)
-            domain_edges.extend(fr.edges)
+            node_ids[None] = res.nodes[0].id
+
+            if fastapi_active:
+                fr = extract_fastapi(ctx, node_ids)
+                for nid, rs in fr.roles.items():
+                    domain_roles.setdefault(nid, set()).update(rs)
+                for nid, props in fr.node_props.items():
+                    domain_node_props.setdefault(nid, {}).update(props)
+                domain_channels.extend(fr.channels)
+                domain_edges.extend(fr.edges)
+
+            if kafka_active:
+                consts = ConstTable.build(facts_by_file[rp], files[rp])
+                kr = extract_kafka(ctx, node_ids, kafka_idioms, consts)
+                for nid, rs in kr.roles.items():
+                    domain_roles.setdefault(nid, set()).update(rs)
+                domain_channels.extend(kr.channels)
+                domain_edges.extend(kr.edges)
+
+            if temporal_active:
+                tr = extract_temporal(ctx, node_ids)
+                for nid, rs in tr.roles.items():
+                    domain_roles.setdefault(nid, set()).update(rs)
+                for nid, props in tr.node_props.items():
+                    domain_node_props.setdefault(nid, {}).update(props)
+                domain_edges.extend(tr.edges)
+                # temporal_start_mark: per-file claim, consumed later by S7 (T7) via
+                # staging.claims_for + update_edge_props on the matching CALLS edge.
+                staging.add_claims(svc.name, rp, "temporal_start_mark", tr.claims)
 
     if domain_roles or domain_node_props:
         nodes = [_apply_role_props_patch(n, domain_roles, domain_node_props) for n in nodes]

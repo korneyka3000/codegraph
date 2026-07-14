@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from codegraph.config.loader import ConfigError, load_workspace
+from codegraph.config.loader import ConfigError, effective_idioms, load_workspace
 from codegraph.config.models import WorkspaceConfig
 from codegraph.doctor import run_env_checks, run_store_probes
 from codegraph.mcp.server import build_server
@@ -142,8 +142,6 @@ def index(
     graph_name = _resolve_graph_name(cfg, graph)
 
     if dry_run:
-        from codegraph.config.loader import effective_idioms
-
         stage_table = Table(title=f"pipeline plan · graph={graph_name}")
         stage_table.add_column("stage")
         stage_table.add_column("name")
@@ -170,13 +168,16 @@ def index(
     # эвристический fallback) НЕ валит exit — print_report печатает жёлтый блок,
     # но код возврата остаётся 0 (см. self-review брифа m1b-task-6).
     codegraph_dir = _workspace_dir(cfg, target_path) / ".codegraph"
-    # active_idioms (M2 T4): включает доменные экстракторы S5 (сейчас — fastapi) по
-    # workspace-списку builtin-идиом; cfg.builtin_idioms уже провалидирован
+    # active_idioms (M2 T4): включает доменные экстракторы S5 (сейчас — fastapi/temporal)
+    # по workspace-списку builtin-идиом; cfg.builtin_idioms уже провалидирован
     # load_workspace (resolve_builtins), незнакомое имя сюда не доедет.
     active_idioms = frozenset(cfg.builtin_idioms)
     with Staging(codegraph_dir / "staging.db") as staging:
         per_service = [
-            analyze_service(svc, staging, codegraph_dir / "scip", active_idioms=active_idioms)
+            analyze_service(
+                svc, staging, codegraph_dir / "scip",
+                active_idioms=active_idioms, idioms=effective_idioms(cfg, svc),
+            )
             for svc in cfg.services
         ]
         load_stats = _store_guard(lambda: load_graph(

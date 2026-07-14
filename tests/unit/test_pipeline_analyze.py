@@ -7,7 +7,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from codegraph.config.models import ServiceConfig
+from codegraph.config.models import (
+    ChannelSpec,
+    ConsumerIdiom,
+    ProducerIdiom,
+    ServiceConfig,
+    ServiceIdioms,
+    ValueSpec,
+)
 from codegraph.pipeline.analyze import analyze_service
 from codegraph.resolvers.scip import scip_pb2
 from codegraph.resolvers.scip.runner import ScipRunError, ScipRunResult
@@ -249,3 +256,162 @@ def test_analyze_non_fastapi_active_idiom_is_a_noop_for_fastapi_wiring(tmp_path)
     )
     assert not any(n.roles for n in st.iter_nodes())
     assert not any(n.kind == "Channel" for n in st.iter_nodes())
+
+
+# -- M2 T5: kafka_ext/temporal_ext wiring (idioms param, active_idioms), degraded path --
+#
+# kafka is DATA-driven: activation depends on the `idioms` PARAMETER (effective
+# ServiceIdioms), NOT active_idioms set membership -- proven below by never putting
+# "aiokafka"/etc in active_idioms while still exercising kafka wiring. The outbox
+# producer's own call-site (`outbox.add_event(...)`, receiver a same-scope AssignFact)
+# resolves at RECEIVER tier through the degraded fallback path (fallback.resolve_service
+# only lays refs at CallFact callee spans of TOP-LEVEL defs -- `add_event` is a method,
+# never top-level, so STATIC never fires here; RECEIVER needs no SCIP at all -- full
+# STATIC-tier proof lives in test_kafka_extractor.py's stubbed-lookup unit test).
+#
+# temporal's @workflow.defn/@activity.defn roles need no SCIP either (pure decorator-text
+# matching) and DO wire through the degraded path; INVOKES_ACTIVITY/start_workflow need a
+# ref at an ARGUMENT's name span, which the degraded fallback never lays down (same
+# documented gap as fastapi_ext's DEPENDS_ON) -- proven unresolved below, full resolution
+# proven at the extract_temporal unit level (test_temporal_extractor.py, stubbed
+# ref_symbol_lookup), matching the brief's own "юнит: стаб; интеграцию покроет T9".
+
+KYC_FIXTURE = Path(__file__).parents[2] / "fixtures" / "services" / "kyc_worker"
+
+OUTBOX_IDIOM = ProducerIdiom(
+    name="outbox",
+    call="app.db.outbox.OutboxRepository.add_event",
+    channel=ChannelSpec(
+        kind="event_type", event_type_from=ValueSpec(arg=0), topic=ValueSpec(const="orders.events"),
+    ),
+)
+
+
+def test_analyze_kafka_inactive_by_default_no_roles_or_channels(tmp_path):
+    """idioms defaults to None -- opt-in, so every pre-existing caller (incl. every
+    other test in this file, and cli.py before this task) is unaffected."""
+    svc = ServiceConfig(name="orders-api", path=ORDERS_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+
+    assert not any(n.roles for n in st.iter_nodes())
+    assert not any(n.kind == "Channel" for n in st.iter_nodes())
+    assert not any(e.type in ("PRODUCES", "CONSUMES") for e in st.iter_edges())
+
+
+def test_analyze_kafka_active_wires_producer_role_channel_and_produces_edge(tmp_path):
+    """Activation is idioms-driven, NOT active_idioms-driven: active_idioms stays
+    empty here on purpose."""
+    svc = ServiceConfig(name="orders-api", path=ORDERS_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        idioms=ServiceIdioms(producers=[OUTBOX_IDIOM]),
+    )
+
+    place = next(n for n in st.iter_nodes() if n.kind == "Function" and n.name == "place")
+    assert place.roles == ("MessageProducer",)
+
+    channel_ids = {n.id for n in st.iter_nodes() if n.kind == "Channel"}
+    assert channel_ids == {"chan:event_type:OrderCreated", "chan:kafka_topic:orders.events"}
+
+    produces = [e for e in st.iter_edges() if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    assert produces[0].src == place.id
+    assert produces[0].dst == "chan:event_type:OrderCreated"
+    assert produces[0].resolution == "heuristic" and produces[0].confidence == 0.8
+
+    assert any(
+        e.type == "CONTAINS" and e.src == "chan:kafka_topic:orders.events"
+        and e.dst == "chan:event_type:OrderCreated"
+        for e in st.iter_edges()
+    )
+
+
+def test_analyze_kafka_active_with_no_producers_or_consumers_is_a_noop(tmp_path):
+    svc = ServiceConfig(name="orders-api", path=ORDERS_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        idioms=ServiceIdioms(),
+    )
+    assert not any(n.roles for n in st.iter_nodes())
+    assert not any(n.kind == "Channel" for n in st.iter_nodes())
+
+
+def test_analyze_temporal_inactive_by_default_no_roles(tmp_path):
+    svc = ServiceConfig(name="kyc-worker", path=KYC_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+
+    assert not any(n.roles for n in st.iter_nodes())
+    assert not any(e.type == "INVOKES_ACTIVITY" for e in st.iter_edges())
+
+
+def test_analyze_temporal_active_wires_workflow_and_activity_roles(tmp_path):
+    svc = ServiceConfig(name="kyc-worker", path=KYC_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        active_idioms=frozenset({"temporal"}),
+    )
+
+    workflow = next(n for n in st.iter_nodes() if n.kind == "Class" and n.name == "KycWorkflow")
+    assert workflow.roles == ("TemporalWorkflow",)
+    assert workflow.props["workflow_name"] == "KycWorkflow"
+
+    activity = next(
+        n for n in st.iter_nodes() if n.kind == "Function" and n.name == "verify_documents"
+    )
+    assert activity.roles == ("TemporalActivity",)
+
+
+def test_analyze_temporal_active_degraded_fallback_cannot_resolve_invokes_activity(tmp_path):
+    """Documented gap (mirrors fastapi_ext's own DEPENDS_ON note): the degraded fallback
+    resolver only lays refs at CallFact callee spans -- `verify_documents` here is an
+    ARGUMENT reference (execute_activity's arg0), never itself a callee span, so no ref
+    ever lands there and ref_symbol_lookup finds nothing through this path. Not a
+    temporal_ext bug -- see test_temporal_extractor.py for proof it resolves correctly
+    given a real/stubbed ref-lookup."""
+    svc = ServiceConfig(name="kyc-worker", path=KYC_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        active_idioms=frozenset({"temporal"}),
+    )
+    assert not any(e.type == "INVOKES_ACTIVITY" for e in st.iter_edges())
+    assert st.claims_for("temporal_start_mark") == []
+
+
+def test_analyze_non_temporal_active_idiom_is_a_noop_for_temporal_wiring(tmp_path):
+    svc = ServiceConfig(name="kyc-worker", path=KYC_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        active_idioms=frozenset({"fastapi"}),
+    )
+    assert not any(n.roles for n in st.iter_nodes())
+
+
+def test_analyze_kafka_and_temporal_can_both_be_active_together(tmp_path):
+    """Sanity: the two extractors don't clobber each other's roles/edges/claims when
+    both fire in the same analyze_service call (as cli.py's real wiring always does)."""
+    svc = ServiceConfig(name="kyc-worker", path=KYC_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    dispatch_idiom = ConsumerIdiom(
+        name="dispatch-map", kind="dispatch_dict",
+        registrar_call="app.consumers.base.register_handlers",
+        topic=ValueSpec(const="orders.events"), event_type_from="dict_key",
+    )
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        active_idioms=frozenset({"temporal"}),
+        idioms=ServiceIdioms(consumers=[dispatch_idiom]),
+    )
+
+    workflow = next(n for n in st.iter_nodes() if n.kind == "Class" and n.name == "KycWorkflow")
+    assert workflow.roles == ("TemporalWorkflow",)
+    # dispatch_dict's registrar_call resolves at IMPORT_NAME tier through the degraded
+    # path (confirmed structurally in this task's report) -- handler ref resolution
+    # itself needs a value-arg SCIP ref, which the fallback never lays down either.
+    assert st.claims_for("temporal_start_mark", service="kyc-worker") == []
