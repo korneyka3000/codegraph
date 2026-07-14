@@ -55,6 +55,11 @@ class ParamFact:
     default_text: str | None
     default_start_byte: int | None
     default_end_byte: int | None
+    # M2 T4 sanctioned extension: byte span of the annotation expression itself (e.g.
+    # `Annotated[Session, Depends(get_db)]`) -- needed for fastapi_ext's DEPENDS_ON
+    # lookup on the annotation-only form (no `=` default present). New LAST field with
+    # a default so every pre-existing positional ParamFact(...) construction still works.
+    annotation_start_byte: int | None = None
 
 
 @dataclass(frozen=True)
@@ -264,6 +269,7 @@ def _build_params(params_node) -> list[ParamFact]:
                 name=_text_or(name_node, ""),
                 annotation_text=_text_or(type_node),
                 default_text=None, default_start_byte=None, default_end_byte=None,
+                annotation_start_byte=type_node.start_byte if type_node is not None else None,
             ))
         elif child.type in ("default_parameter", "typed_default_parameter"):
             name_node = child.child_by_field_name("name")
@@ -275,6 +281,9 @@ def _build_params(params_node) -> list[ParamFact]:
                 default_text=_text_or(value_node),
                 default_start_byte=value_node.start_byte if value_node is not None else None,
                 default_end_byte=value_node.end_byte if value_node is not None else None,
+                # default_parameter (bare `x=5`) never has a "type" field by grammar --
+                # type_node is None there, so this stays None uniformly for that shape.
+                annotation_start_byte=type_node.start_byte if type_node is not None else None,
             ))
         elif child.type in _PARAM_SPLAT_TYPES:
             name_node = _first_identifier_child(child)

@@ -131,6 +131,16 @@ def test_param_fact_field_order_matches_contract():
     assert p.default_end_byte == 26
 
 
+def test_param_fact_annotation_start_byte_appended_field_defaults_to_none():
+    """M2 T4 sanctioned extension (brief-authorized): annotation_start_byte is a new
+    LAST field with a default -- old 5-positional-arg construction sites (incl. the
+    contract test above) keep working unchanged."""
+    p = ParamFact("db", "Session", "Depends(get_db)", 10, 26)
+    assert p.annotation_start_byte is None
+    p2 = ParamFact("db", "Session", "Depends(get_db)", 10, 26, 3)
+    assert p2.annotation_start_byte == 3
+
+
 # -- CallFact.args: positional + keyword, string_value --
 
 
@@ -318,6 +328,51 @@ def test_param_fact_depends_from_orders_route_fixture():
     assert db_param.annotation_text == "Session"
     assert db_param.default_text == "Depends(get_db)"
     assert source[db_param.default_start_byte:db_param.default_end_byte] == b"Depends(get_db)"
+
+
+def test_param_fact_annotation_start_byte_from_orders_route_fixture():
+    """M2 T4 sanctioned extension: annotation_start_byte -- byte-span anchor the
+    fastapi extractor needs for the `Annotated[X, Depends(y)]` form (default_start_byte
+    alone only covers the `= Depends(y)` default-value form)."""
+    facts, source = _fixture_facts("orders_api/app/routes/orders.py")
+    create_order = next(d for d in facts.defs if d.name == "create_order")
+    by_name = {p.name: p for p in create_order.params}
+
+    db_param = by_name["db"]
+    assert db_param.annotation_start_byte is not None
+    end = db_param.annotation_start_byte + len("Session")
+    assert source[db_param.annotation_start_byte:end] == b"Session"
+
+    req_param = by_name["req"]
+    assert req_param.annotation_start_byte is not None
+    end = req_param.annotation_start_byte + len("OrderCreate")
+    assert source[req_param.annotation_start_byte:end] == b"OrderCreate"
+
+
+def test_param_fact_annotation_start_byte_none_when_no_annotation():
+    src = b'''def f(x=5):
+    pass
+'''
+    facts = build_file_facts("x.py", src)
+    f = next(d for d in facts.defs if d.name == "f")
+    assert f.params[0].annotation_start_byte is None
+
+
+def test_param_fact_annotation_start_byte_typed_parameter_annotated_depends():
+    """typed_parameter (annotation only, no default) -- the realistic modern-FastAPI
+    `Annotated[Session, Depends(get_db)]` shape; no M2 fixture uses Annotated (grep-
+    confirmed), so synthetic, matching the M2 T2 precedent for uncovered grammar shapes."""
+    src = b'''def f(db: Annotated[Session, Depends(get_db)]):
+    pass
+'''
+    facts = build_file_facts("x.py", src)
+    f = next(d for d in facts.defs if d.name == "f")
+    db_param = f.params[0]
+    assert db_param.default_text is None
+    assert db_param.annotation_text == "Annotated[Session, Depends(get_db)]"
+    assert db_param.annotation_start_byte is not None
+    end = db_param.annotation_start_byte + len(db_param.annotation_text)
+    assert src[db_param.annotation_start_byte:end] == b"Annotated[Session, Depends(get_db)]"
 
 
 def test_param_fact_bare_identifier_no_annotation_no_default():

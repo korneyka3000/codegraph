@@ -270,6 +270,18 @@ class Staging:
         row = cur.fetchone()
         return row[0] if row else None
 
+    def ref_symbol_at(self, service: str, relpath: str, start_byte: int) -> str | None:
+        """Mirrors def_symbol_at, over scip_refs -- M2 T4's FileContext.ref_symbol_lookup:
+        resolves the symbol a REFERENCE occurrence at (relpath, start_byte) points at
+        (e.g. the `get_db` identifier inside a `Depends(get_db)` default-value expression,
+        which python_core's def-lookup can't answer since that's not a definition site)."""
+        cur = self._db.execute(
+            "SELECT symbol FROM scip_refs WHERE service=? AND relpath=? AND start_byte=? "
+            "ORDER BY symbol LIMIT 1",
+            (service, relpath, start_byte))
+        row = cur.fetchone()
+        return row[0] if row else None
+
     def local_def_symbols(self, service: str, relpath: str) -> set[str]:
         cur = self._db.execute(
             "SELECT symbol FROM scip_defs WHERE service=? AND relpath=? "

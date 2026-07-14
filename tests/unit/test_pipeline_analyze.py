@@ -163,3 +163,89 @@ def test_default_runner_is_constructed_when_none(tmp_path, monkeypatch):
     monkeypatch.setattr("codegraph.pipeline.analyze.ScipRunner", _FakeDefaultScipRunnerClass)
     report = analyze_service(svc, st, tmp_path / "cache", runner=None)
     assert report["degraded"] is True
+
+
+# -- M2 T4: fastapi extractor wiring (active_idioms), degraded/fallback path --
+#
+# Exercised through the SAME degraded fallback path as the tests above (no real
+# scip-python): def_symbol_lookup is covered end-to-end (fallback.resolve_service lays
+# down a synthetic def for every DefFact, including first-party module-level
+# functions), so route/HANDLES/role wiring is provable here. DEPENDS_ON is NOT provable
+# here (see test below and fastapi_ext.py's module docstring for why) -- its full
+# resolution is proven at the extract_fastapi unit level instead
+# (test_fastapi_extractor.py, stubbed ref_symbol_lookup), matching the brief's own
+# "юнит: стаб; интеграцию покроет T9".
+
+ORDERS_FIXTURE = Path(__file__).parents[2] / "fixtures" / "services" / "orders_api"
+
+
+def test_analyze_fastapi_inactive_by_default_no_route_roles_or_channels(tmp_path):
+    """active_idioms defaults to frozenset() -- opt-in, so every pre-existing caller
+    (incl. every other test in this file, and cli.py as of this task) is unaffected."""
+    svc = ServiceConfig(name="orders-api", path=ORDERS_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+
+    nodes = list(st.iter_nodes())
+    assert nodes  # sanity: the service was actually analyzed
+    assert not any(n.roles for n in nodes)
+    assert not any(n.kind == "Channel" for n in nodes)
+    assert not any(e.type in ("HANDLES", "DEPENDS_ON") for e in st.iter_edges())
+
+
+def test_analyze_fastapi_active_wires_route_roles_channels_and_handles(tmp_path):
+    svc = ServiceConfig(name="orders-api", path=ORDERS_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        active_idioms=frozenset({"fastapi"}),
+    )
+
+    by_name = {n.name: n for n in st.iter_nodes() if n.kind == "Function"}
+    create_order, get_order = by_name["create_order"], by_name["get_order"]
+
+    assert create_order.roles == ("RouteHandler",)
+    assert create_order.props["http_method"] == "POST"
+    assert create_order.props["path_template"] == "/orders"
+    assert get_order.roles == ("RouteHandler",)
+    assert get_order.props["http_method"] == "GET"
+    assert get_order.props["path_template"] == "/orders/{order_id}"
+
+    channel_ids = {n.id for n in st.iter_nodes() if n.kind == "Channel"}
+    assert channel_ids == {
+        "chan:http:orders-api:POST /orders",
+        "chan:http:orders-api:GET /orders/{order_id}",
+    }
+
+    handles = {e.src: e.dst for e in st.iter_edges() if e.type == "HANDLES"}
+    assert handles["chan:http:orders-api:POST /orders"] == create_order.id
+    assert handles["chan:http:orders-api:GET /orders/{order_id}"] == get_order.id
+
+
+def test_analyze_fastapi_active_degraded_fallback_cannot_resolve_depends_on(tmp_path):
+    """Documented gap: the degraded fallback resolver builds refs purely from
+    facts.calls (extractors/calls.py's join source), which never visits parameter
+    default/annotation expressions (M1a carried-forward: "calls in default values ...
+    are not visited") -- Depends(get_db)'s `get_db` identifier never gets a ref laid
+    down at its span, so ref_symbol_lookup finds nothing and DEPENDS_ON stays
+    unresolved through this specific path, by design of the fallback resolver (not a
+    fastapi_ext bug -- see test_fastapi_extractor.py for proof it resolves correctly
+    given a real/stubbed ref-lookup)."""
+    svc = ServiceConfig(name="orders-api", path=ORDERS_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        active_idioms=frozenset({"fastapi"}),
+    )
+    assert not any(e.type == "DEPENDS_ON" for e in st.iter_edges())
+
+
+def test_analyze_non_fastapi_active_idiom_is_a_noop_for_fastapi_wiring(tmp_path):
+    svc = ServiceConfig(name="orders-api", path=ORDERS_FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        active_idioms=frozenset({"aiokafka"}),
+    )
+    assert not any(n.roles for n in st.iter_nodes())
+    assert not any(n.kind == "Channel" for n in st.iter_nodes())

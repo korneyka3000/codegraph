@@ -89,6 +89,37 @@ def test_def_symbol_at_deterministic_on_collision(tmp_path):
     assert st.def_symbol_at("a", "m.py", 10) == "SYM_A"  # ORDER BY symbol
 
 
+# -- M2 T4: ref_symbol_at (mirrors def_symbol_at, but over scip_refs -- sanctioned
+# FileContext.ref_symbol_lookup extension needs a ref-occurrence lookup keyed by
+# (service, relpath, start_byte), symmetric to the existing def-lookup) --
+
+
+def test_ref_symbol_at_mirrors_def_symbol_at(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.add_refs("a", [RefRow("m.py", "SYM_F", 100, 103, 5, 0)])
+    assert st.ref_symbol_at("a", "m.py", 100) == "SYM_F"
+    assert st.ref_symbol_at("a", "m.py", 99) is None
+
+
+def test_ref_symbol_at_deterministic_on_collision(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.add_refs("a", [RefRow("m.py", "SYM_B", 10, 12, 1, 0), RefRow("m.py", "SYM_A", 10, 12, 1, 0)])
+    assert st.ref_symbol_at("a", "m.py", 10) == "SYM_A"  # ORDER BY symbol
+
+
+def test_ref_symbol_at_scoped_by_service_and_relpath(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.begin_service("b")
+    st.add_refs("a", [RefRow("m.py", "SYM_A", 10, 12, 1, 0)])
+    st.add_refs("b", [RefRow("m.py", "SYM_B", 10, 12, 1, 0)])
+    assert st.ref_symbol_at("a", "m.py", 10) == "SYM_A"
+    assert st.ref_symbol_at("b", "m.py", 10) == "SYM_B"
+    assert st.ref_symbol_at("a", "other.py", 10) is None
+
+
 def test_schema_version_mismatch_raises(tmp_path):
     st = Staging(tmp_path / "s.db")
     st.set_meta("schema_version", "999")
