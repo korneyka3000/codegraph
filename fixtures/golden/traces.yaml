@@ -5,6 +5,19 @@ traces:
       - service: orders-api
         entry: {symbol: app.routes.orders.create_order}
         via_channel: null
+      # M2 T9 fix wave: containment fan-out branch (T7 segments.derive, ревью-санкционированное
+      # правило): topic-level consumer (run_consumer CONSUMES chan:kafka_topic:orders.events)
+      # получает КАЖДЫЙ event_type, публикуемый под топиком, поэтому PRODUCES place→OrderCreated
+      # в паре с CONTAINS(orders.events → OrderCreated) даёт ВТОРОЙ NEXT_SEGMENT — в run_consumer.
+      # via_channel — EVENT-канал (не topic!): инвариант T7-деривации (linking/segments.py,
+      # модульный докстринг) — via_channel_id всегда именует канал, в который у producer-стороны
+      # есть РЕАЛЬНОЕ boundary-ребро; place продюсит в OrderCreated, прямого ребра в topic у него
+      # нет. Живое подтверждение — фактический вывод M2-гейта: у обоих kyc-сегментов один и тот же
+      # входящий канал chan:event_type:OrderCreated. run_consumer — лист трейса (его дальнейший
+      # dispatch handler(event) — динамический, через EVENT_HANDLERS: НЕ ребро по политике golden).
+      - service: kyc-worker
+        entry: {symbol: app.consumer_main.run_consumer}
+        via_channel: "chan:event_type:OrderCreated"
       - service: kyc-worker
         entry: {symbol: app.consumers.orders.handle_order_created}
         via_channel: "chan:event_type:OrderCreated"

@@ -130,14 +130,33 @@ def _no_outbox_config(cfg: WorkspaceConfig) -> WorkspaceConfig:
     return cfg.model_copy(update={"services": services})
 
 
+def _sorted_triples(triples: set[tuple]) -> list[tuple]:
+    """Deterministic ordering for diagnostics; via_channel can be None (entrypoint),
+    which plain sorted() can't compare against str -- stringify per element."""
+    return sorted(triples, key=lambda t: tuple(str(v) for v in t))
+
+
 def _trace_diff(result: dict) -> list[str]:
-    """Segment-by-segment diff of a trace_process() result against fixtures/golden/
-    traces.yaml's single trace -- returns problem strings (empty if the trace matches
-    exactly). entry.qualified_name is compared to golden's entry.symbol; via_channel
-    (golden, keyed on segment i) is compared against the id of whichever channel in
-    segment i-1's `exits` actually leads (via next_entry_ids) to segment i's entry --
-    see query/traverse.py's own module docstring for why that's the right lookup (a
-    segment doesn't carry its OWN incoming channel, only its outgoing exits)."""
+    """Order-tolerant, set-EXACT comparison of a trace_process() result against
+    fixtures/golden/traces.yaml's single POST /orders trace (controller-adjudicated
+    T9 fix wave). With the containment fan-out at OrderService.place's PRODUCES exit,
+    segment DISCOVERY order is a BFS artifact (traverse.py sorts next_entry_ids by
+    node id, so run_consumer's `consumer_main` module happens to land before
+    handle_order_created's `consumers.orders`), not a semantic property -- so
+    segments are compared as an exact SET of (service, entry_symbol, via_channel)
+    triples, asserting no missing AND no extra. This is NOT a weakening: exact
+    membership both ways plus an exact segment-COUNT match; only positional order is
+    dropped. Per-segment/overall truncated checks are kept as-is.
+
+    via_channel for a found segment is derived by scanning ALL segments' exits for
+    ones whose next_entry_ids contain this segment's entry id (a segment carries its
+    outgoing exits, never its own incoming channel -- see query/traverse.py; the old
+    positional previous-segment lookup was wrong under branching: the
+    handle_order_created segment's real source is segment 0's exit, not segment 1's).
+    No incoming exit -> None, matching golden's `via_channel: null` entrypoint
+    convention; MORE than one distinct incoming channel is reported as its own
+    problem (golden's schema has one via_channel per segment, a multi-channel entry
+    wouldn't be representable)."""
     golden_data = yaml.safe_load(GOLDEN_TRACES.read_text())
     golden_trace = next(
         t for t in golden_data["traces"] if t["entrypoint"] == ENTRYPOINT_SELECTOR
@@ -153,50 +172,44 @@ def _trace_diff(result: dict) -> list[str]:
             f"  golden services: {[g['service'] for g in golden_segments]}"
         )
 
-    # strict=False (explicit, not the implicit default -- ruff B905): lengths CAN
-    # legitimately differ (already reported above as its own problem); zip here
-    # walks only the common prefix so the diff still reports on every segment pair
-    # that DOES line up, rather than raising and losing that diagnostic.
-    for i, (seg, gseg) in enumerate(zip(segments, golden_segments, strict=False)):
-        label = f"trace segment {i} (found service={seg.get('service')!r})"
-        if seg.get("service") != gseg["service"]:
-            problems.append(f"{label}: service != golden {gseg['service']!r}")
+    incoming: dict[str, set[str]] = {}  # entry node id -> channel ids leading to it
+    for seg in segments:
+        for ex in seg.get("exits", []):
+            chan_id = (ex.get("channel") or {}).get("id")
+            if chan_id is None:
+                continue
+            for next_id in ex.get("next_entry_ids", []):
+                incoming.setdefault(next_id, set()).add(chan_id)
 
-        found_qualified = (seg.get("entry") or {}).get("qualified_name")
-        if found_qualified != gseg["entry"]["symbol"]:
-            problems.append(
-                f"{label}: entry qualified_name {found_qualified!r} != "
-                f"golden {gseg['entry']['symbol']!r}"
-            )
+    found_triples: set[tuple] = set()
+    for i, seg in enumerate(segments):
+        label = f"trace segment {i} (found service={seg.get('service')!r})"
         if seg.get("truncated") is True:
             problems.append(
                 f"{label}: truncated=True (steps={seg.get('steps')} exits={seg.get('exits')})"
             )
-
-        if i == 0:
-            if gseg["via_channel"] is not None:
-                problems.append(
-                    f"{label}: golden via_channel expected null for the first "
-                    f"segment, got {gseg['via_channel']!r}"
-                )
-            continue
-
-        prev_seg = segments[i - 1]
-        entry_id = (seg.get("entry") or {}).get("id")
-        via_exits = [
-            ex for ex in prev_seg.get("exits", []) if entry_id in ex.get("next_entry_ids", [])
-        ]
-        if not via_exits:
+        entry = seg.get("entry") or {}
+        vias = sorted(incoming.get(entry.get("id"), ()))
+        if len(vias) > 1:
             problems.append(
-                f"{label}: no exit of segment {i - 1} ({prev_seg.get('service')}) leads "
-                f"to this entry {entry_id!r}; segment {i - 1} exits: {prev_seg.get('exits')}"
+                f"{label}: multiple distinct incoming channels {vias} -- not "
+                "representable as golden's single via_channel"
             )
-            continue
-        via_channel_id = via_exits[0]["channel"].get("id")
-        if via_channel_id != gseg["via_channel"]:
-            problems.append(
-                f"{label}: via_channel {via_channel_id!r} != golden {gseg['via_channel']!r}"
-            )
+        found_triples.add(
+            (seg.get("service"), entry.get("qualified_name"), vias[0] if vias else None)
+        )
+
+    golden_triples = {
+        (g["service"], g["entry"]["symbol"], g["via_channel"]) for g in golden_segments
+    }
+    missing = golden_triples - found_triples
+    extra = found_triples - golden_triples
+    if missing or extra:
+        problems.append(
+            "trace set mismatch (service, entry_symbol, via_channel):\n"
+            f"  missing (in golden, not found): {_sorted_triples(missing)}\n"
+            f"  extra (found, not in golden): {_sorted_triples(extra)}"
+        )
 
     if result.get("truncated") is True:
         problems.append(f"trace: overall result truncated=True: {result}")

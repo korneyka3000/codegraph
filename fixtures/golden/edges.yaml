@@ -41,6 +41,17 @@ edges:
   - src: {service: orders-api, symbol: app.routes.orders.get_order}
     type: DEPENDS_ON
     dst: {service: orders-api, symbol: app.db.session.get_db}
+  # --- orders-api: HANDLES обоих роутов (M2 T9 fix wave: golden отражает код —
+  # КАЖДЫЙ декорированный @router.<verb> роут фикстур размечается, не только
+  # участвующий в golden-трейсе; та же политика полноты, что у CALLS выше.
+  # Порядок «код—канал», как у существующего document-management HANDLES ниже;
+  # template = APIRouter(prefix="/orders") + путь декоратора) ---
+  - src: {service: orders-api, symbol: app.routes.orders.create_order}
+    type: HANDLES
+    dst: {channel: "chan:http:orders-api:POST /orders"}
+  - src: {service: orders-api, symbol: app.routes.orders.get_order}
+    type: HANDLES
+    dst: {channel: "chan:http:orders-api:GET /orders/{order_id}"}
   # --- orders-api: OrderService.place — ctor Order, self-методы, outbox ---
   - src: {service: orders-api, symbol: app.services.order.OrderService.place}
     type: CALLS
@@ -107,11 +118,24 @@ edges:
           symbol: app.clients.document_management_client.DocumentManagementClient.get_document}
     type: CALLS_HTTP
     dst: {channel: "chan:http:document-management:GET /documents/{doc_id}"}
+  # M2 T9 fix wave: ВТОРОЙ метод клиента тоже размечается (session.post(f"{base}/documents")
+  # в create_document — верб POST, путь /documents, резолвится в реальный роут
+  # document-management POST /documents); экстракция per-method-definition, наличие
+  # вызывающих create_document не требуется — та же политика полноты, что у HANDLES.
+  - src: {service: kyc-worker,
+          symbol: app.clients.document_management_client.DocumentManagementClient.create_document}
+    type: CALLS_HTTP
+    dst: {channel: "chan:http:document-management:POST /documents"}
   # --- document-management: HANDLES и builtin aiokafka producer ---
   # HANDLES: в графе ребро направлено Channel→RouteHandler; здесь записано в порядке "код — канал", eval-загрузчик (M2) нормализует направление по типу ребра.
   - src: {service: document-management, symbol: app.routes.documents.get_document}
     type: HANDLES
     dst: {channel: "chan:http:document-management:GET /documents/{doc_id}"}
+  # M2 T9 fix wave: второй роут этого сервиса (@router.post("") при prefix="/documents")
+  # тоже размечается — golden отражает КАЖДЫЙ роут кода, см. комментарий orders-api выше.
+  - src: {service: document-management, symbol: app.routes.documents.create_document}
+    type: HANDLES
+    dst: {channel: "chan:http:document-management:POST /documents"}
   - src: {service: document-management, symbol: app.routes.documents.get_document}
     type: CALLS
     dst: {service: document-management, symbol: app.services.documents.DocumentService}

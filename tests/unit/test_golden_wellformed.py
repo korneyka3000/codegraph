@@ -42,6 +42,8 @@ def test_golden_traces_reference_channels_from_edges():
     }
     trace = traces["traces"][0]
     assert trace["entrypoint"] == "orders-api:POST /orders"
-    assert len(trace["segments"]) == 3
+    # 4 сегмента с M2 T9 fix wave: containment fan-out (T7 segments.derive) добавил
+    # run_consumer-ветку (см. комментарий в traces.yaml) к исходной линейной цепочке.
+    assert len(trace["segments"]) == 4
     for seg in trace["segments"][1:]:
         assert seg["via_channel"] in known_channels
