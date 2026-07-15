@@ -19,6 +19,18 @@ dependencies = [
 [project.scripts]
 codegraph = "codegraph.cli:main"
 
+[project.optional-dependencies]
+local-emb = [
+    "sentence-transformers>=5.6.0",
+    "transformers<5",
+]
+openai = [
+    "openai>=2.45.0",
+]
+voyage = [
+    "voyageai>=0.5.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.2",
@@ -35,10 +47,11 @@ packages = ["src/codegraph"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q -m 'not scip'"
+addopts = "-q -m 'not scip and not emb'"
 markers = [
     "falkordb: requires a running FalkorDB instance (docker compose up -d)",
     "scip: needs node/npx and network (runs real scip-python)",
+    "emb: requires an optional embedding provider package (uv sync --extra local-emb/openai/voyage)",
 ]
 
 [tool.ruff]
