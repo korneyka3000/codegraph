@@ -40,17 +40,60 @@ Crash-recovery: build-граф сбрасывается (delete_graph) ПЕРВ�
 build_graph_from_crashed_run). Заодно сброс снимает и след-риск уровня свойств:
 None-omission (выше) не стирает устаревшее значение на переиспользуемом узле,
 но переиспользуемых узлов теперь не бывает -- build всегда стартует пустым.
+
+M3 T6: Chunk nodes (label ("Chunk",)) + a singleton Meta node (label ("Meta",),
+id "meta") -- a SEPARATE code path from the NodeRec-based loop above, since
+`ChunkRow` (staging's `chunks` table, via `staging.iter_chunks()`) isn't a `NodeRec`
+at all (no `kind`, no `roles` -- see `stores/staging.py`'s own `ChunkRow` docstring
+for why it lives outside the `NodeRec` universe). Two consequences that follow
+directly from that separation, both deliberate (M3 scope, per the T6 brief):
+
+  - Chunk ids are NEVER added to `known_ids` -- `staging.iter_chunks()` is never
+    consulted while building `known_ids` above, only `staging.iter_nodes()` is. M3
+    creates no edges to/from Chunk nodes at all (retrieval hits join back to the graph
+    via each chunk's own `symbol_id` PROPERTY, not a graph edge) -- so this omission is
+    exactly the desired behavior, not an oversight: a (hypothetical) edge row naming a
+    chunk_id as src/dst would be correctly dropped by `batch.upsert_edges`' own
+    known_ids prefilter, same as any other unknown endpoint.
+  - Chunk nodes are written via TWO separate `upsert_nodes` calls (`_chunk_node_
+    batches`, below) -- one for rows that HAVE a real embedding (`vector_props=
+    ("embedding",)`, the `vecf32(r.embedding)` path) and one for rows that don't
+    (embedder was skipped this run, or a chunk simply hasn't been embedded yet).
+    `vecf32(NULL)` is a hard FalkorDB error, so a chunk lacking an embedding MUST NOT
+    have an "embedding" key on its row at all when it goes through `upsert_nodes` --
+    routing it through the vector_props path regardless (with a null placeholder,
+    say) would blow up the whole batch. Splitting into two calls (rather than one
+    call with a conditional per-row Cypher `CASE`) keeps `batch.upsert_nodes` itself
+    completely unaware of "some rows have this prop, some don't" -- documented here,
+    the load-bearing tradeoff being "two possible upsert_nodes calls (only one, if
+    every chunk in this graph either does or doesn't have an embedding, which is the
+    common case)" against "one call with a more complex, chunk-row-dependent Cypher
+    shape".
+
+Meta.embed_model/dim are read from `staging.get_meta("embed_model"/"embed_dim")` --
+written by `pipeline.chunk_embed.run` the last time an embedder was actually used (see
+`_embed_meta`'s own docstring for why staging's own meta table, not a parameter
+threaded in from the caller, is the right source of truth here) -- and are OMITTED
+(not sent as null) when absent, same `_omit_none` convention as every other node's
+props. Meta.schema_version is always present (`core.schema.SCHEMA_VERSION`, a plain
+constant, never absent) -- the Meta node itself is ALWAYS written, even for a graph
+with zero chunks/no embedder ever run (simpler contract than a sometimes-present node:
+every loaded graph has exactly one Meta node, full stop).
 """
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from collections.abc import Callable
 
 from codegraph.core.errors import InvariantError
-from codegraph.core.schema import EdgeRec, NodeRec
+from codegraph.core.schema import SCHEMA_VERSION, EdgeRec, NodeRec
+from codegraph.embedding.codec import unpack_vector
 from codegraph.stores.graph import GraphStore
-from codegraph.stores.staging import Staging
+from codegraph.stores.staging import ChunkRow, Staging
+
+logger = logging.getLogger(__name__)
 
 _CODE_KINDS = frozenset({"Module", "Class", "Function"})
 
@@ -140,20 +183,130 @@ def _edge_row(e: EdgeRec) -> dict:
     return row
 
 
+# -- M3 T6: Chunk nodes + Meta node (see module docstring for why this is a separate
+# code path from the NodeRec-based nodes loop above) --
+
+_CHUNK_LABELS = ("Chunk",)
+_META_LABELS = ("Meta",)
+
+_CHUNK_PROP_FIELDS = (
+    "symbol_id", "service", "relpath", "ord", "start_line", "end_line",
+    "content_hash", "text", "context_header", "embed_model",
+)
+
+
+def _chunk_props(row: ChunkRow) -> dict:
+    """`ChunkRow` -> Chunk node props: the T6 brief's own field list ({id, symbol_id,
+    service, relpath, ord, start_line, end_line, content_hash, text, context_header,
+    embed_model}) PLUS an explicit `kind: "Chunk"` -- every OTHER node kind in this
+    graph carries `kind` as a plain property, not just as a graph label, because
+    `FalkorStore.get_nodes_by_kind`/`stats()` (`MATCH (n) RETURN n.kind, count(n)`,
+    grouped in cli.py's `stats` command) read it as a property (Cypher labels can't be
+    parameterized, see `get_nodes_by_kind`'s own docstring) -- a Chunk/Meta node
+    without `kind` would group into a `None` bucket there, breaking `stats()`'s
+    `sorted()` call the moment a graph has both a kind-bearing node and a Chunk/Meta
+    one (i.e. every real workspace, since Meta is always written). Deliberately
+    excludes `embedding` (travels via a SEPARATE top-level row field for the
+    vector_props/vecf32 path, never inside props -- see `_chunk_node_batches` and
+    `batch.upsert_nodes`' own docstring) and `embedded_hash` (a staging-only
+    bookkeeping column, never graph-visible). None-valued fields are omitted, same
+    `_omit_none` convention as `_node_props` -- concretely `context_header`/
+    `embed_model` for a chunk that hasn't been through `fill_headers_all`/an embed
+    pass (respectively) yet."""
+    core = {
+        "id": row.chunk_id, "kind": "Chunk",
+        **{f: getattr(row, f) for f in _CHUNK_PROP_FIELDS},
+    }
+    return _omit_none(core)
+
+
+def _chunk_node_batches(
+    staging: Staging, dim: int | None = None
+) -> tuple[list[dict], list[dict]]:
+    """Every staged chunk (`staging.iter_chunks()`, ALL services -- never `staging.
+    iter_nodes()`, a completely separate table/id-space, see module docstring), split
+    into two row lists: chunks WITH a real, USABLE embedding (get the `vector_props=
+    ("embedding",)` treatment) and chunks WITHOUT one (embedder skipped this run, not
+    yet embedded for some other reason, or -- see below -- a dimension mismatch) --
+    see module docstring for why this split into two upsert_nodes calls, rather than
+    one, is the load-bearing design choice here (`vecf32(NULL)` is a hard FalkorDB
+    error).
+
+    `dim`, if given (the SAME dimension `ensure_schema` just sized the vector index
+    to, from `_embed_meta`), gates each embedded row's DECODED vector length: a chunk
+    whose stored embedding is a DIFFERENT length gets routed to `without_vector`
+    instead (with a warning logged HERE, naming the actual cause), rather than being
+    silently dropped later by `batch.upsert_nodes`' own per-row bisection-and-skip
+    safety net -- which would also catch a real FalkorDB-side vecf32 dimension error,
+    but only after the fact, with no context tying the warning back to "this chunk's
+    embedding doesn't match the index". Not reachable via the single real production
+    path today (every chunk committed by ONE `chunk_embed.run` call shares the SAME
+    embedder, hence the SAME dimension) -- but `staging.db` persists across separate
+    `codegraph index`/`codegraph load` invocations, and a run that changes
+    `embedding.model` (a different dimension) could plausibly be interrupted between
+    committing some chunks' new-dimension embeddings and this same run's own
+    `chunk_embed.run` finishing (`set_meta("embed_dim", ...)` is the very last thing it
+    does) -- a defensive check here costs little and turns a possible silent per-row
+    drop into a diagnosable warning."""
+    with_vector: list[dict] = []
+    without_vector: list[dict] = []
+    for row in staging.iter_chunks():
+        entry = {"id": row.chunk_id, "props": _chunk_props(row)}
+        if row.embedding is None:
+            without_vector.append(entry)
+            continue
+        vector = unpack_vector(row.embedding)
+        if dim is not None and len(vector) != dim:
+            logger.warning(
+                "chunk %s has a %d-dim embedding but the vector index is %d-dim "
+                "(stale/mismatched staging.db?) -- loading without a vector",
+                row.chunk_id, len(vector), dim,
+            )
+            without_vector.append(entry)
+        else:
+            entry["embedding"] = vector
+            with_vector.append(entry)
+    return with_vector, without_vector
+
+
+def _embed_meta(staging: Staging) -> tuple[str | None, int | None]:
+    """embed_model/dim last written by `pipeline.chunk_embed.run` into staging's own
+    meta table (`set_meta("embed_model", ...)`/`set_meta("embed_dim", ...)`) -- read
+    back here rather than threaded in as a `load_graph` parameter, because staging's
+    meta table persists exactly as long as the chunks/nodes/edges tables themselves do
+    (same SQLite file): `codegraph load` (a separate CLI command, reusing an on-disk
+    staging.db from a PRIOR `codegraph index` run, calling `load_graph` directly with
+    no `chunk_embed.run` call of its own in between) needs to see the SAME embed_model/
+    dim that run last computed, not "whatever this particular load_graph caller
+    happens to know about" -- staging IS the single source of truth here, same as
+    every other input load_graph reads (see module's own opening paragraph).
+
+    Empty-string sentinel (`chunk_embed.run`'s own "no embedder this run" path writes
+    "" rather than leaving a stale value in place, precisely so a `--no-embed` run
+    doesn't leave a PRIOR run's now-inapplicable embed_model/dim behind -- every
+    `codegraph index` run re-chunks EVERY configured service from scratch, so a chunk
+    with no embedding this run truly has none, not "the old one, still valid") reads
+    back as None here, identically to a genuinely-absent key."""
+    model = staging.get_meta("embed_model") or None
+    dim_raw = staging.get_meta("embed_dim") or None
+    return model, int(dim_raw) if dim_raw is not None else None
+
+
 def load_graph(
     staging: Staging,
     store_factory: Callable[[str], GraphStore],
     graph_name: str,
 ) -> dict:
     """staging -> `<graph_name>__build` (предварительно сброшенный) -> ensure_schema ->
-    upsert (nodes then edges, grouped) -> swap_in в graph_name. Возврат -- счётчики
-    для report.build_report."""
+    upsert (nodes then chunks/meta then edges, grouped) -> swap_in в graph_name.
+    Возврат -- счётчики для report.build_report."""
+    embed_model, dim = _embed_meta(staging)
     build_name = f"{graph_name}__build"
     build_store = store_factory(build_name)
     # crash-recovery: снести возможный мусор от прогона, упавшего до swap_in
     # (см. модульный докстринг) -- ДО ensure_schema, чтобы схема легла на пустой граф
     build_store.delete_graph()
-    build_store.ensure_schema()
+    build_store.ensure_schema(dim=dim)
 
     # -- 1. nodes: сгруппировать по labels-набору, попутно собрать known_ids --
     nodes_by_labels: dict[tuple[str, ...], list[dict]] = defaultdict(list)
@@ -169,6 +322,37 @@ def load_graph(
         written = build_store.upsert_nodes(labels, rows)
         nodes_written += written
         nodes_written_by_label[":".join(labels)] = written
+
+    # -- 1b. M3 T6: Chunk nodes (staging.iter_chunks(), a SEPARATE table/id-space from
+    # staging.iter_nodes() above -- chunk ids are never added to known_ids/edges, see
+    # module docstring) + a singleton Meta node (ALWAYS written, even with zero chunks/
+    # no embedder ever run -- see module docstring for both) --
+    chunk_rows_with_vector, chunk_rows_without_vector = _chunk_node_batches(staging, dim=dim)
+    # batch.upsert_nodes already no-ops (returns 0, no Cypher built) on an empty rows
+    # list regardless of vector_props -- no need for an `if rows:` guard around either
+    # call here, only around the resulting nodes_written/-by_label bookkeeping below.
+    chunks_written = build_store.upsert_nodes(
+        _CHUNK_LABELS, chunk_rows_with_vector, vector_props=("embedding",)
+    ) + build_store.upsert_nodes(_CHUNK_LABELS, chunk_rows_without_vector)
+    if chunks_written:
+        nodes_written += chunks_written
+        # Derived from the SAME labels tuple just passed to upsert_nodes (":".join,
+        # identical to how the generic NodeRec loop above keys nodes_written_by_label)
+        # rather than a separately-hardcoded string -- if _CHUNK_LABELS ever grows a
+        # second label, this key follows automatically instead of silently going stale.
+        nodes_written_by_label[":".join(_CHUNK_LABELS)] = chunks_written
+
+    # "kind": "Meta" for the identical reason Chunk gets one -- see _chunk_props'
+    # own docstring (FalkorStore.stats()/get_nodes_by_kind read `kind` as a plain
+    # property, never the graph label).
+    meta_props = _omit_none({
+        "kind": "Meta", "embed_model": embed_model, "dim": dim,
+        "schema_version": SCHEMA_VERSION,
+    })
+    meta_written = build_store.upsert_nodes(_META_LABELS, [{"id": "meta", "props": meta_props}])
+    if meta_written:
+        nodes_written += meta_written
+        nodes_written_by_label[":".join(_META_LABELS)] = meta_written
 
     # -- 2. edges: сгруппировать по type; known_ids уже ПОЛНЫЙ (весь проход nodes
     # выше завершён до этой точки) --

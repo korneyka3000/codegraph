@@ -14,9 +14,12 @@ from rich.tree import Tree
 
 from codegraph.config.loader import ConfigError, effective_idioms, load_workspace
 from codegraph.config.models import WorkspaceConfig
+from codegraph.core.errors import CodegraphError
 from codegraph.doctor import run_env_checks, run_store_probes
+from codegraph.embedding.factory import make_embedder
 from codegraph.linking.workspace import link_workspace
 from codegraph.pipeline.analyze import analyze_service
+from codegraph.pipeline.chunk_embed import run as run_chunk_embed
 from codegraph.pipeline.load import load_graph
 from codegraph.pipeline.report import build_report, print_report, write_report
 from codegraph.pipeline.stages import STAGES
@@ -175,14 +178,36 @@ def doctor(
 TEMPLATE = Path(__file__).parent.parent.parent / "codegraph.example.yaml"
 
 
+def _make_embedder_or_warn(cfg: WorkspaceConfig):
+    """Lazy, graceful S8 embedder construction (M3 T6). `embedding.factory.
+    make_embedder` raises `CodegraphError` (with an actionable hint baked into its own
+    message -- "uv sync --extra local-emb", "OPENAI_API_KEY not set", ...) for every
+    "can't build an embedder right now" case it knows about: provider=local's
+    sentence-transformers extra not installed; provider=openai/voyage missing its API
+    key or SDK package. Any of those degrades S8 to "chunk without embedding"
+    (`run_chunk_embed(..., embedder=None)` still builds Chunk nodes + headers, just
+    skips the embed step -- see its own report's `skipped_no_embedder` counter) rather
+    than failing the whole `codegraph index` run -- mirrors this CLI's other
+    zero-config-friendly degradation path (`analyze_service`'s own SCIP-unavailable
+    fallback). Only ever called when the user did NOT pass `--no-embed` -- that flag's
+    own skip is deliberate, not a degradation, and prints no warning (see `index`)."""
+    try:
+        return make_embedder(cfg.embedding)
+    except CodegraphError as e:
+        console.print(f"[yellow]S8: embeddings skipped ({escape(str(e))})[/]")
+        return None
+
+
 @app.command()
 def index(
     target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
     dry_run: bool = typer.Option(False, "--dry-run"),
     graph: str | None = typer.Option(None, "--graph"),
+    no_embed: bool = typer.Option(False, "--no-embed"),
 ) -> None:
-    """Построить граф workspace: scan → resolve → extract → join → load → report
-    (`--dry-run` — только план пайплайна, без записи)."""
+    """Построить граф workspace: scan → resolve → extract → join → chunk+embed → load →
+    report (`--dry-run` — только план пайплайна, без записи; `--no-embed` — пропустить
+    S8 chunk+embed целиком)."""
     # Path.cwd() читается здесь, а не в default параметра: default-выражения
     # typer вычисляются один раз при импорте модуля, а не при каждом вызове
     # (см. комментарий в doctor).
@@ -213,10 +238,12 @@ def index(
         return
 
     # полный прогон: S1–S6 (analyze_service, per service) → S7 (link_workspace,
-    # cross-service derivation) → S9 (load_graph, blue/green) → S10 (report).
-    # Деградация отдельных сервисов (SCIP недоступен → эвристический fallback) НЕ валит
-    # exit — print_report печатает жёлтый блок, но код возврата остаётся 0 (см.
-    # self-review брифа m1b-task-6).
+    # cross-service derivation) → S8 (chunk_embed, chunk+augment+embed) → S9
+    # (load_graph, blue/green) → S10 (report). Деградация отдельных сервисов (SCIP
+    # недоступен → эвристический fallback) НЕ валит exit — print_report печатает
+    # жёлтый блок, но код возврата остаётся 0 (см. self-review брифа m1b-task-6);
+    # S8's own embedder-construction degradation (см. _make_embedder_or_warn) follows
+    # the identical zero-config-friendly contract.
     codegraph_dir = _workspace_dir(cfg, target_path) / ".codegraph"
     # active_idioms (M2 T4): включает доменные экстракторы S5 (сейчас — fastapi/temporal)
     # по workspace-списку builtin-идиом; cfg.builtin_idioms уже провалидирован
@@ -235,11 +262,18 @@ def index(
         # derived-слоем — NEXT_SEGMENT/CALLS_HTTP/PART_OF_PROCESS). staging-only --
         # FalkorDB не трогает, поэтому без _store_guard (в отличие от load_graph ниже).
         link_report = link_workspace(cfg, staging)
+        # M3 T6: S8 между link_workspace и load_graph — augmentation-заголовки читают
+        # graph-позицию из staged рёбер (включая S7-derived), а load_graph должен
+        # снапшотить staging уже вместе с чанками/эмбеддингами. --no-embed — явный,
+        # тихий (без предупреждения) пропуск; иначе — ленивая, деградирующая сборка
+        # эмбеддера (см. _make_embedder_or_warn).
+        embedder = None if no_embed else _make_embedder_or_warn(cfg)
+        chunk_report = run_chunk_embed(cfg, staging, embedder)
         load_stats = _store_guard(lambda: load_graph(
             staging, lambda name: FalkorStore(cfg.storage.falkordb, name), graph_name
         ))
 
-    report = build_report(per_service, load_stats, link_report)
+    report = build_report(per_service, load_stats, link_report, chunk_report)
     write_report(report, codegraph_dir / "report.json")
     print_report(report, console)
 

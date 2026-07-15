@@ -138,7 +138,17 @@ class _GraphIndex:
     chunked_symbols: set[str]
 
 
-def _build_index(staging: Staging) -> _GraphIndex:
+def _build_index(staging: Staging, chunks: list[ChunkRow] | None = None) -> _GraphIndex:
+    """`chunks`, if given, is used directly for `chunked_symbols` instead of this
+    function issuing its OWN `staging.iter_chunks()` call -- an efficiency-only
+    parameter (code review finding) for a caller that ALREADY has the full,
+    workspace-wide chunk list in hand (`fill_headers_all`, the only caller that passes
+    it) and would otherwise cause the exact same unfiltered query to run twice back to
+    back. `fill_headers`'s own call (its `chunks` variable is SERVICE-scoped, a
+    different, narrower query -- not the same data this function needs for
+    `chunked_symbols`, which must see every service's chunks regardless of which one's
+    headers are being rendered right now) deliberately leaves this at its default and
+    keeps issuing its own workspace-wide `iter_chunks()` call, unchanged."""
     nodes_by_id = {n.id: n for n in staging.iter_nodes()}
     contains_parent: dict[str, str] = {}
     contains_children: dict[str, list[str]] = {}
@@ -150,7 +160,9 @@ def _build_index(staging: Staging) -> _GraphIndex:
             contains_children.setdefault(e.src, []).append(e.dst)
         edges_by_src.setdefault(e.src, []).append(e)
         edges_by_dst.setdefault(e.dst, []).append(e)
-    chunked_symbols = {row.symbol_id for row in staging.iter_chunks()}
+    chunked_symbols = {
+        row.symbol_id for row in (chunks if chunks is not None else staging.iter_chunks())
+    }
     return _GraphIndex(
         nodes_by_id=nodes_by_id,
         contains_parent=contains_parent,
@@ -346,17 +358,52 @@ def augment_text(header: str, chunk_text: str) -> str:
 
 
 def fill_headers(staging: Staging, service: str) -> int:
-    """Orchestration (S8/T6 will call this): `build_header` for every chunk currently
+    """Orchestration, scoped to ONE service: `build_header` for every chunk currently
     staged for `service`, batched into ONE `set_context_headers` call. Idempotent --
     header content is a pure function of currently-staged nodes/edges/chunks, and
     `set_context_headers` is a plain UPDATE-by-chunk_id, so re-running this against
     unchanged staging state re-writes the exact same header strings. Returns the number
     of chunks updated (0 for a service with no staged chunks yet -- skips building the
-    graph index entirely in that case, not just the no-op `set_context_headers` call)."""
+    graph index entirely in that case, not just the no-op `set_context_headers` call).
+
+    NOT the function `chunk_embed.run` (S8/T6) actually calls -- looping THIS function
+    once per service would rebuild `_GraphIndex` (a full nodes/edges/chunks scan) once
+    per service too (O(services x graph), the exact anti-pattern the T4 review flagged
+    as a mandatory M3 T6 carry). See `fill_headers_all` below for the workspace-wide
+    sibling T6 actually uses; this per-service version stays available (and tested)
+    standalone since it's still the more convenient shape for a single-service caller
+    (e.g. a future incremental-reindex path, M4)."""
     chunks = staging.chunks_for_service(service)
     if not chunks:
         return 0
     index = _build_index(staging)
+    rows = [(c.chunk_id, _render_header(index, c)) for c in chunks]
+    staging.set_context_headers(rows)
+    return len(rows)
+
+
+def fill_headers_all(staging: Staging) -> int:
+    """Workspace-wide sibling of `fill_headers` (M3 T6 carry, mandatory per the T4
+    review): renders headers for EVERY currently-staged chunk, across ALL services, in
+    ONE call -- building exactly ONE `_GraphIndex` snapshot for the whole call, instead
+    of `chunk_embed.run` looping `fill_headers(staging, svc.name)` once per service
+    (each of which would independently re-scan the full nodes/edges/chunks tables --
+    O(services x graph) instead of O(graph); see `_GraphIndex`'s own docstring for why
+    that per-call rescan exists at all). Semantics are otherwise IDENTICAL to
+    `fill_headers` run once per service -- same header content per chunk (both go
+    through the same `_render_header`), same idempotency (a pure function of currently-
+    staged nodes/edges/chunks), same one-batched-`set_context_headers`-call shape.
+    Returns the total number of chunks updated (0 -- without ever building the graph
+    index -- if nothing is staged yet anywhere, mirroring `fill_headers`'s own
+    no-chunks-yet shortcut)."""
+    chunks = list(staging.iter_chunks())
+    if not chunks:
+        return 0
+    # Passes the already-fetched `chunks` straight into `_build_index` (its own
+    # `chunked_symbols` computation would otherwise issue the EXACT SAME unfiltered
+    # `staging.iter_chunks()` query a second time back to back -- code review finding;
+    # see `_build_index`'s own docstring for why `fill_headers` itself doesn't do this).
+    index = _build_index(staging, chunks=chunks)
     rows = [(c.chunk_id, _render_header(index, c)) for c in chunks]
     staging.set_context_headers(rows)
     return len(rows)

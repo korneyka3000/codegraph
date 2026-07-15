@@ -78,11 +78,13 @@ class FalkorStore:
             self._graph = self._connect().select_graph(self.graph_name)
         return self._graph
 
-    def ensure_schema(self) -> None:
-        ddl.ensure_schema(self._connect(), self.graph_name)
+    def ensure_schema(self, dim: int | None = None) -> None:
+        ddl.ensure_schema(self._connect(), self.graph_name, dim=dim)
 
-    def upsert_nodes(self, labels: tuple[str, ...], rows: list[dict]) -> int:
-        return batch.upsert_nodes(self._g, labels, rows)
+    def upsert_nodes(
+        self, labels: tuple[str, ...], rows: list[dict], vector_props: tuple[str, ...] = ()
+    ) -> int:
+        return batch.upsert_nodes(self._g, labels, rows, vector_props=vector_props)
 
     def upsert_edges(
         self,

@@ -49,6 +49,13 @@ _IMPORT_HINT = (
     "sentence-transformers not installed -- run `uv sync --extra local-emb` to "
     "install the local-embedding extra (sentence-transformers + torch)."
 )
+_LOAD_HINT = (
+    "failed to load local embedding model {model!r} ({error}) -- this can happen from "
+    "a version-incompatible transformers install (see this module's own \"VERSION "
+    "COMPATIBILITY\" docstring section), a network/HF-Hub-access problem on first "
+    "download, or a bad model name; try `uv sync --extra local-emb` to (re)install a "
+    "known-compatible version, or check network access to huggingface.co."
+)
 
 
 class LocalEmbedder:
@@ -58,17 +65,38 @@ class LocalEmbedder:
         except ImportError as e:
             raise CodegraphError(_IMPORT_HINT) from e
 
-        self._model = SentenceTransformer(model, trust_remote_code=True)
+        try:
+            self._model = SentenceTransformer(model, trust_remote_code=True)
+            # sentence-transformers renamed get_sentence_embedding_dimension() to
+            # get_embedding_dimension() (the old name still works but emits
+            # FutureWarning, confirmed live against sentence-transformers 5.6.0) --
+            # prefer the current name, fall back for older installed versions that
+            # predate the rename rather than pin to just one.
+            if hasattr(self._model, "get_embedding_dimension"):
+                self.dim = self._model.get_embedding_dimension()
+            else:
+                self.dim = self._model.get_sentence_embedding_dimension()
+        except Exception as e:
+            # Broad on purpose (M3 T6 fix, code review finding + sweep follow-up):
+            # BOTH the constructor AND the dimension probe right after it run
+            # arbitrary third-party Hub code (trust_remote_code=True, see module
+            # docstring), and the constructor may hit the network on first download --
+            # ANY exception from either (a known transformers-version ImportError from
+            # deep inside that remote code -- see "VERSION COMPATIBILITY" above -- a
+            # network/HF-Hub error, a bad model name, or a model whose remote code
+            # constructs fine but blows up resolving its own embedding dimension) must
+            # degrade the SAME way a missing package does, not crash the whole
+            # `codegraph index` run. cli.py's `_make_embedder_or_warn` only ever
+            # catches CodegraphError specifically so a genuine bug elsewhere in THIS
+            # codebase still surfaces as a traceback -- narrowing THIS except to one
+            # specific exception type (or leaving the dim probe OUTSIDE the try, as
+            # the first version of this fix did -- the sweep reviewer's catch) would
+            # leave that same CLI-level "S8 degrades gracefully" promise silently
+            # broken for every other failure mode this remote-code-executing call
+            # pair can raise.
+            raise CodegraphError(_LOAD_HINT.format(model=model, error=e)) from e
+
         self.model_id = model
-        # sentence-transformers renamed get_sentence_embedding_dimension() to
-        # get_embedding_dimension() (the old name still works but emits
-        # FutureWarning, confirmed live against sentence-transformers 5.6.0) --
-        # prefer the current name, fall back for older installed versions that
-        # predate the rename rather than pin to just one.
-        if hasattr(self._model, "get_embedding_dimension"):
-            self.dim = self._model.get_embedding_dimension()
-        else:
-            self.dim = self._model.get_sentence_embedding_dimension()
 
     def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:

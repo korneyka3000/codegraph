@@ -176,3 +176,57 @@ def test_upsert_edges_key_props_name_validated():
             key_props=("via_channel_id; DROP TABLE x --",),
         )
     assert g.calls == []  # validation happens before any query
+
+
+# -- M3 T6: vector_props -- `SET n.<prop> = vecf32(r.<prop>)`, additive to the plain
+# `SET n += r.props` MERGE-upsert (Chunk.embedding, see pipeline/load.py). Default
+# stays () -- every OTHER upsert_nodes call site's Cypher shape must not change at all.
+
+
+def test_upsert_nodes_no_vector_props_keeps_bare_merge_pattern():
+    g = FakeGraph()
+    upsert_nodes(g, ("Sym",), [{"id": "a", "props": {}}])
+    cypher = g.calls[0][0]
+    assert cypher == "UNWIND $rows AS r MERGE (n:Sym {id: r.id}) SET n += r.props"
+    assert "vecf32" not in cypher
+
+
+def test_upsert_nodes_vector_props_adds_vecf32_set_clause():
+    g = FakeGraph()
+    rows = [{"id": "chunk:1", "props": {"text": "hi"}, "embedding": [0.1, 0.2, 0.3]}]
+    written = upsert_nodes(g, ("Chunk",), rows, vector_props=("embedding",))
+    assert written == 1
+    cypher = g.calls[0][0]
+    assert (
+        "MERGE (n:Chunk {id: r.id}) SET n += r.props SET n.embedding = vecf32(r.embedding)"
+        in cypher
+    )
+    assert g.calls[0][1]["rows"] == rows
+
+
+def test_upsert_nodes_vector_props_supports_multiple_props():
+    g = FakeGraph()
+    rows = [{"id": "x", "props": {}, "a": [1.0], "b": [2.0]}]
+    upsert_nodes(g, ("Sym",), rows, vector_props=("a", "b"))
+    cypher = g.calls[0][0]
+    assert "SET n.a = vecf32(r.a)" in cypher
+    assert "SET n.b = vecf32(r.b)" in cypher
+
+
+def test_upsert_nodes_vector_props_name_validated():
+    g = FakeGraph()
+    rows = [{"id": "x", "props": {}}]
+    with pytest.raises(InvariantError):
+        upsert_nodes(g, ("Sym",), rows, vector_props=("embedding); DROP GRAPH x --",))
+    assert g.calls == []  # validation happens before any query
+
+
+def test_upsert_nodes_vector_props_bisects_on_failure_like_plain_rows(caplog):
+    g = FakeGraph(fail_on={"BAD"})
+    rows = [
+        {"id": "a", "props": {}, "embedding": [1.0]},
+        {"id": "BAD", "props": {}, "embedding": [1.0]},
+    ]
+    with caplog.at_level(logging.WARNING):
+        written = upsert_nodes(g, ("Chunk",), rows, batch_size=2, vector_props=("embedding",))
+    assert written == 1

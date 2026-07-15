@@ -89,3 +89,78 @@ def test_ensure_schema_creates_fulltext_index_idempotently_and_search_fulltext_f
         assert store.search_fulltext("@{}~*", k=5) == []
     finally:
         store._g.delete()
+
+
+# -- M3 T6: Chunk vector index (only when dim is given) + fulltext(text, context_header) --
+
+VECTOR_GRAPH = "__codegraph_t6_vector__"
+
+
+def test_ensure_schema_creates_chunk_vector_index_only_when_dim_given(falkordb_cfg):
+    store = FalkorStore(falkordb_cfg, VECTOR_GRAPH)
+    try:
+        store.ensure_schema(dim=4)
+        store.ensure_schema(dim=4)  # idempotent -- "already indexed"-class error swallowed
+
+        vec = [0.1, 0.2, 0.3, 0.4]
+        store._g.query(
+            "MERGE (c:Chunk {id: 'chunk:1'}) SET c.embedding = vecf32($v)", {"v": vec}
+        )
+        res = store._g.query(
+            "CALL db.idx.vector.queryNodes('Chunk', 'embedding', 1, vecf32($v)) "
+            "YIELD node RETURN node.id",
+            {"v": vec},
+        )
+        assert res.result_set == [["chunk:1"]]
+    finally:
+        store._g.delete()
+
+
+NO_DIM_GRAPH = "__codegraph_t6_no_dim__"
+
+
+def test_ensure_schema_without_dim_creates_no_vector_index(falkordb_cfg):
+    """dim=None (embedder skipped this run, e.g. --no-embed) -- ensure_schema must not
+    even attempt CREATE VECTOR INDEX; querying Chunk.embedding without one is a
+    RediSearch/FalkorDB error, which is exactly the honest signal wanted here (no
+    silently-empty vector index masquerading as "search ran, found nothing")."""
+    store = FalkorStore(falkordb_cfg, NO_DIM_GRAPH)
+    try:
+        store.ensure_schema(dim=None)
+        with pytest.raises(Exception):  # noqa: B017 -- exact FalkorDB error text not pinned
+            store._g.query(
+                "CALL db.idx.vector.queryNodes('Chunk', 'embedding', 1, vecf32($v)) "
+                "YIELD node RETURN node.id",
+                {"v": [0.1, 0.2, 0.3, 0.4]},
+            )
+    finally:
+        store._g.delete()
+
+
+CHUNK_FULLTEXT_GRAPH = "__codegraph_t6_chunk_fulltext__"
+
+
+def test_ensure_schema_creates_chunk_fulltext_index_and_finds_by_context_header(
+    falkordb_cfg,
+):
+    store = FalkorStore(falkordb_cfg, CHUNK_FULLTEXT_GRAPH)
+    try:
+        store.ensure_schema()
+        store.ensure_schema()  # idempotent
+
+        store.upsert_nodes(("Chunk",), [
+            {
+                "id": "chunk:1",
+                "props": {
+                    "text": "def create_order(): ...",
+                    "context_header": "symbol: app.routes.orders.create_order (Function)",
+                },
+            },
+        ])
+
+        res = store._g.query(
+            "CALL db.idx.fulltext.queryNodes('Chunk', 'create_order') YIELD node RETURN node.id"
+        )
+        assert res.result_set == [["chunk:1"]]
+    finally:
+        store._g.delete()

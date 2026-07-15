@@ -5,11 +5,23 @@ MERGE с multi-label)."""
 
 from __future__ import annotations
 
+import hashlib
+import struct
+
 import pytest
 
+from codegraph.chunking.splitter import ChunkRec
 from codegraph.core.errors import InvariantError
 from codegraph.core.schema import EdgeRec, NodeRec
-from codegraph.pipeline.load import _edge_row, _key_props_for, _labels_for_kind, _node_props
+from codegraph.pipeline.load import (
+    _chunk_node_batches,
+    _chunk_props,
+    _edge_row,
+    _key_props_for,
+    _labels_for_kind,
+    _node_props,
+)
+from codegraph.stores.staging import ChunkRow, Staging
 
 
 def test_code_kind_without_roles():
@@ -121,3 +133,112 @@ def test_edge_row_other_types_get_no_via_channel_id_key_at_all():
     row = _edge_row(e)
     assert "via_channel_id" not in row
     assert set(row) == {"src", "dst", "props"}
+
+
+# -- M3 T6: _chunk_props -- pure ChunkRow -> Chunk-node-props helper (no Staging/live
+# FalkorDB needed; see tests/unit/test_embedding_codec.py for the pack_vector/
+# unpack_vector round-trip and tests/integration/test_pipeline_load.py for the live
+# end-to-end Chunk/Meta node + vecf32 sanity check) --
+
+
+def _row(
+    chunk_id="c#c0", symbol_id="sym:a:f", service="a", relpath="m.py", ord_=0,
+    text="hello", start_line=1, end_line=1, content_hash="hash1",
+    context_header="file: m.py", embedding=None, embed_model=None, embedded_hash=None,
+):
+    return ChunkRow(
+        chunk_id=chunk_id, symbol_id=symbol_id, service=service, relpath=relpath,
+        ord=ord_, text=text, start_line=start_line, end_line=end_line,
+        content_hash=content_hash, context_header=context_header, embedding=embedding,
+        embed_model=embed_model, embedded_hash=embedded_hash,
+    )
+
+
+def test_chunk_props_maps_every_documented_field():
+    row = _row(embed_model="fake-8d")
+    props = _chunk_props(row)
+    assert props == {
+        "id": "c#c0", "kind": "Chunk", "symbol_id": "sym:a:f", "service": "a",
+        "relpath": "m.py", "ord": 0, "start_line": 1, "end_line": 1,
+        "content_hash": "hash1", "text": "hello", "context_header": "file: m.py",
+        "embed_model": "fake-8d",
+    }
+
+
+def test_chunk_props_always_includes_kind_chunk():
+    """FalkorStore.stats()/get_nodes_by_kind group/filter by the `kind` PROPERTY
+    (Cypher labels can't be parameterized) -- a Chunk node missing it would collapse
+    into a `None` bucket in stats(), breaking cli.py's `stats` command's `sorted()`
+    call the moment a graph has both a kind-bearing node and a Chunk node."""
+    assert _chunk_props(_row())["kind"] == "Chunk"
+
+
+def test_chunk_props_omits_none_embed_model_and_none_context_header():
+    row = _row(context_header=None, embed_model=None)
+    props = _chunk_props(row)
+    assert "embed_model" not in props
+    assert "context_header" not in props
+    assert props["id"] == "c#c0"  # unaffected core fields still present
+
+
+def test_chunk_props_never_includes_embedding_or_embedded_hash():
+    """The vector value travels via a SEPARATE top-level row field ("embedding"), not
+    inside props at all -- see batch.upsert_nodes' own vector_props docstring for why
+    (a plain `SET n += {embedding: [...]}"` would store an ordinary array property, not
+    the vecf32-encoded type the vector index needs). embedded_hash is a staging-only
+    bookkeeping column, never a graph-visible property."""
+    row = _row(embedding=b"\x00\x00\x80?", embed_model="m", embedded_hash="hash1")
+    props = _chunk_props(row)
+    assert "embedding" not in props
+    assert "embedded_hash" not in props
+
+
+# -- M3 T6 code-review fix: _chunk_node_batches routes a dimension-mismatched
+# embedding to the without-vector batch instead of vector_props, rather than letting
+# batch.upsert_nodes' own bisection silently drop that one row later with no context
+# tying it back to the real cause --
+
+
+def _staged_chunk_with_embedding(tmp_path, vector: list[float]) -> Staging:
+    st = Staging(tmp_path / "s.db")
+    text = "hello"
+    chunk = ChunkRec(
+        chunk_id="c#c0", symbol_id="c", ord=0, text=text, start_line=1, end_line=1,
+        content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    )
+    st.upsert_chunks("a", "m.py", [chunk])
+    blob = struct.pack(f"<{len(vector)}f", *vector)
+    st.set_embeddings([("c#c0", blob, "model-a", chunk.content_hash)])
+    return st
+
+
+def test_chunk_node_batches_routes_dim_mismatch_to_without_vector(tmp_path):
+    st = _staged_chunk_with_embedding(tmp_path, [1.0, 2.0, 3.0])  # 3-dim
+
+    with_vector, without_vector = _chunk_node_batches(st, dim=8)  # index is 8-dim
+
+    assert with_vector == []
+    assert len(without_vector) == 1
+    assert without_vector[0]["id"] == "c#c0"
+    assert "embedding" not in without_vector[0]
+
+
+def test_chunk_node_batches_matching_dim_goes_to_with_vector(tmp_path):
+    st = _staged_chunk_with_embedding(tmp_path, [1.0, 2.0, 3.0])
+
+    with_vector, without_vector = _chunk_node_batches(st, dim=3)  # matches
+
+    assert without_vector == []
+    assert len(with_vector) == 1
+    assert with_vector[0]["embedding"] == pytest.approx([1.0, 2.0, 3.0])
+
+
+def test_chunk_node_batches_no_dim_given_skips_the_check(tmp_path):
+    """dim=None (the default -- e.g. no embedder ever ran workspace-wide, see
+    _embed_meta) means "no dimension to check against", not "reject everything"."""
+    st = _staged_chunk_with_embedding(tmp_path, [1.0, 2.0, 3.0])
+
+    with_vector, without_vector = _chunk_node_batches(st)  # dim defaults to None
+
+    assert without_vector == []
+    assert len(with_vector) == 1

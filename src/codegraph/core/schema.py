@@ -43,7 +43,23 @@ from codegraph.core import ids
 #     disposable derived cache, never a source of truth -- see that method's own
 #     docstring for why the version check must run BEFORE ensure_schema's DDL, not
 #     after, to guarantee this is the error an old file actually surfaces).
-SCHEMA_VERSION = 3
+#   3 -> 4 (M3 T6, cache-hardening carry from the T3 review): chunks gains
+#     `embedded_hash TEXT` (see stores/staging.py's ChunkRow/chunks_missing_embedding
+#     docstrings for what it's for). Unlike T3's OWN chunks-table addition (which
+#     needed no bump -- `chunks` was a brand new table then, no pre-T3 v3 staging.db
+#     could already have one to collide with), THIS is a real column addition to a
+#     table that has existed, and been populated, since v3 -- a pre-T6 staging.db
+#     genuinely lacks `embedded_hash`, and hitting any of the new
+#     embedded_hash-referencing code (chunks_missing_embedding/set_embeddings) against
+#     one would otherwise raise a raw sqlite3.OperationalError ("no such column"), the
+#     exact bug class the 1 -> 2 version-check-ordering fix above exists to turn into
+#     a loud, actionable InvariantError instead. Bumping SCHEMA_VERSION is what routes
+#     it there: `_check_schema_version_before_ddl` compares the OLD file's stored
+#     schema_version ("3") against this constant (now 4) and raises before
+#     `ensure_schema`'s DDL -- and therefore before any embedded_hash-touching code --
+#     ever runs. No data-preserving upgrade path here either (same "staging is a
+#     disposable derived cache" reasoning as 2 -> 3) -- delete and re-run indexing.
+SCHEMA_VERSION = 4
 NODE_KINDS = frozenset({
     "Service", "Module", "Class", "Function", "Channel", "BusinessProcess",
 })
@@ -60,6 +76,18 @@ EDGE_TYPES = frozenset({
     "INVOKES_ACTIVITY", "CALLS_HTTP", "NEXT_SEGMENT", "PART_OF_PROCESS",
 })
 RESOLUTIONS = frozenset({"static", "dynamic", "heuristic", "trace_validated"})
+# Graph-only labels: valid FalkorDB node labels that are NOT valid NodeRec.kind values
+# (a plain `MATCH`/`MERGE (n:<label>)` label, never `NodeRec.kind`/NODE_KINDS above) --
+# "Sym" is python_core's own structural marker over Module/Class/Function (see
+# pipeline/load._labels_for_kind); "Chunk"/"Meta" (M3 T6) are built from ChunkRow/a
+# hand-built dict in pipeline/load.py, never a NodeRec at all (see stores/staging.py's
+# ChunkRow docstring for why chunks live outside the NodeRec universe entirely).
+# stores/falkordb/batch.py's node-label allowlist unions this in alongside NODE_KINDS/
+# ROLE_KINDS specifically so there is ONE place (this module, already documented
+# elsewhere as the schema's single source of truth) to register every valid graph
+# label a future milestone adds -- not a second, easy-to-miss allowlist literal
+# sitting three modules away in the storage layer.
+GRAPH_ONLY_LABELS = frozenset({"Sym", "Chunk", "Meta"})
 
 
 @dataclass(frozen=True)

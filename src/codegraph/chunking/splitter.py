@@ -114,16 +114,23 @@ def chunk_file(
     max_chars: int = 2000,
 ) -> list[ChunkRec]:
     """See the module docstring for the full rule set (1-6). `symbol_ids` maps a
-    `DefFact.index` to that def's node id (built by the caller the same way
-    `pipeline.analyze`'s own per-file `node_ids` map is -- one entry per `facts.defs`
-    element); every top-level def and, for an oversized class, every direct method MUST
-    have an entry here (a missing one raises a plain KeyError -- chunk_file trusts its
-    caller the same way python_core.extract trusts its own def_ids map, no defensive
-    re-validation). `relpath` is accepted but unused by the pure byte-range logic below
-    -- kept purely so this call's signature stays self-describing at call sites (mirrors
-    `extractors.base.FileContext`'s own `(service, relpath, ...)` shape); see rule 1's
-    note on why content between/after top-level defs at the module level is out of
-    scope for this function regardless of relpath.
+    `DefFact.index` to that def's node id -- one entry per `facts.defs` element, built
+    by the caller (`pipeline.analyze`'s own per-file `node_ids` map zips `facts.defs`
+    positionally against the SAME `extract_python_core` call's freshly-built `NodeRec`
+    list, in-process, since both come from that one call together; `pipeline.
+    chunk_embed`'s own `_symbol_ids_for_file`, a LATER pipeline stage with no access to
+    that ephemeral in-memory list, instead span-matches `(start_byte, end_byte)`
+    against already-staged nodes -- a different technique reaching the identical
+    result, since both ultimately read off the same `NodeRec.id` values `python_core.
+    extract` assigned). Either way, every top-level def and, for an oversized class,
+    every direct method MUST have an entry here (a missing one raises a plain
+    KeyError -- chunk_file trusts its caller the same way python_core.extract trusts
+    its own def_ids map, no defensive re-validation). `relpath` is accepted but unused
+    by the pure byte-range logic below -- kept purely so this call's signature stays
+    self-describing at call sites (mirrors `extractors.base.FileContext`'s own
+    `(service, relpath, ...)` shape); see rule 1's note on why content between/after
+    top-level defs at the module level is out of scope for this function regardless of
+    relpath.
     """
     line_starts = _line_starts(source)
     children_of: dict[int, list[DefFact]] = {}

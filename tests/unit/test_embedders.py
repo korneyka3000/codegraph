@@ -181,6 +181,60 @@ def test_make_embedder_local_missing_package_hint(monkeypatch):
         make_embedder(cfg)
 
 
+def test_local_embedder_model_construction_failure_wraps_as_codegraph_error(monkeypatch):
+    """Code review finding: the pre-fix code only wrapped the `import
+    sentence_transformers` line in try/except -- the SentenceTransformer(...)
+    constructor call itself (which executes arbitrary third-party Hub code, and can
+    hit the network on first download) was completely unguarded, so any OTHER
+    exception it raised (e.g. the documented transformers-version ImportError from
+    inside a model's own remote code, or a network/HF-Hub error) propagated
+    uncaught -- crashing `codegraph index` outright instead of degrading gracefully
+    the same way a missing package does (cli.py's `_make_embedder_or_warn` only ever
+    catches CodegraphError). Installs a fake `sentence_transformers` module (present,
+    so the import itself succeeds) whose `SentenceTransformer` class raises an
+    unrelated exception on construction, standing in for that exact failure mode."""
+    from codegraph.embedding.local import LocalEmbedder
+
+    fake_module = types.ModuleType("sentence_transformers")
+
+    class _BoomSentenceTransformer:
+        def __init__(self, model, trust_remote_code=False):
+            raise RuntimeError("simulated remote-code/network failure")
+
+    fake_module.SentenceTransformer = _BoomSentenceTransformer
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+
+    with pytest.raises(CodegraphError, match="simulated remote-code/network failure"):
+        LocalEmbedder("jinaai/jina-embeddings-v2-base-code")
+
+
+def test_local_embedder_dim_probe_failure_also_wraps_as_codegraph_error(monkeypatch):
+    """Sweep-review follow-up to the fix above: the DIMENSION PROBE right after
+    construction (get_embedding_dimension()/get_sentence_embedding_dimension()) is the
+    same remote-code risk class as the constructor itself -- a model whose Hub-hosted
+    code constructs fine but blows up resolving its own embedding dimension must
+    degrade identically (CodegraphError -> cli's yellow warning), not crash
+    `codegraph index` with a raw traceback. The first version of the fix wrapped only
+    the constructor call, leaving the probe outside the try -- this test pins the
+    corrected placement."""
+    from codegraph.embedding.local import LocalEmbedder
+
+    fake_module = types.ModuleType("sentence_transformers")
+
+    class _DimBoomSentenceTransformer:
+        def __init__(self, model, trust_remote_code=False):
+            pass  # construction succeeds
+
+        def get_embedding_dimension(self):
+            raise RuntimeError("simulated dim-probe failure from remote code")
+
+    fake_module.SentenceTransformer = _DimBoomSentenceTransformer
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+
+    with pytest.raises(CodegraphError, match="simulated dim-probe failure"):
+        LocalEmbedder("jinaai/jina-embeddings-v2-base-code")
+
+
 def test_make_embedder_openai_missing_key_hint(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     cfg = EmbeddingConfig(provider="openai", model="text-embedding-3-small")

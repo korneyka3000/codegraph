@@ -23,9 +23,22 @@ Hop = tuple[str, dict, dict, str]  # (edge_type, edge_props, node_dict, directio
 
 
 class GraphStore(Protocol):
-    def ensure_schema(self) -> None: ...
+    def ensure_schema(self, dim: int | None = None) -> None:
+        """`dim` (M3 T6): dimension of the Chunk.embedding vector index -- only
+        created when given (a workspace with no chunk carrying a live embedding this
+        run has nothing meaningful to size a vector index with); see
+        `stores/falkordb/ddl.py`'s `ensure_schema` for the concrete Cypher shape."""
+        ...
 
-    def upsert_nodes(self, labels: tuple[str, ...], rows: list[dict]) -> int: ...
+    def upsert_nodes(
+        self, labels: tuple[str, ...], rows: list[dict], vector_props: tuple[str, ...] = ()
+    ) -> int:
+        """`vector_props` (M3 T6, e.g. `("embedding",)` for Chunk nodes): each name is
+        read off the row's TOP level (a plain `list[float]`, not inside `props`) and
+        written via `vecf32(...)` rather than a plain property `SET` -- see
+        `stores/falkordb/batch.py`'s `upsert_nodes` for the full rationale/Cypher
+        shape. Default `()` -- identical to the pre-M3-T6 behavior."""
+        ...
 
     def upsert_edges(
         self,

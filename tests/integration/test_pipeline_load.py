@@ -14,9 +14,13 @@ label-группа ("Service",)) + CONTAINS (svc->a) + CALLS (a->b) + ребро
 
 from __future__ import annotations
 
+import struct
+
 import pytest
 
+from codegraph.chunking.splitter import ChunkRec
 from codegraph.core.schema import (
+    SCHEMA_VERSION,
     EdgeRec,
     NodeRec,
     make_channel_node,
@@ -95,8 +99,14 @@ def test_load_graph_writes_labels_edges_drops_ghost_and_swaps(falkordb_cfg, tmp_
         stats = load_graph(st, store_factory, GRAPH_NAME)
 
         # -- return dict: counts + by-type/by-label breakdowns --
-        assert stats["nodes_written"] == 3
-        assert stats["nodes_written_by_label"] == {"Sym:Function": 2, "Service": 1}
+        # M3 T6: every load_graph run ALWAYS writes exactly one Meta node (label
+        # ("Meta",), id "meta") -- see pipeline/load.py's module docstring -- so the
+        # node counts here are +1 versus the pre-M3-T6 shape (3 -> 4), even though
+        # this staging has zero chunks and no embedder was ever involved.
+        assert stats["nodes_written"] == 4
+        assert stats["nodes_written_by_label"] == {
+            "Sym:Function": 2, "Service": 1, "Meta": 1,
+        }
         assert stats["edges_written"] == 2
         assert stats["edges_written_by_type"] == {"CONTAINS": 1, "CALLS": 1}
         assert stats["edges_dropped_missing_endpoint"] == 1
@@ -117,6 +127,7 @@ def test_load_graph_writes_labels_edges_drops_ghost_and_swaps(falkordb_cfg, tmp_
             NODE_A_ID: {"Sym", "Function"},
             NODE_B_ID: {"Sym", "Function"},
             SERVICE_NODE.id: {"Service"},
+            "meta": {"Meta"},
         }
 
         # -- props: None-valued keys omitted; list/bool props round-trip as real
@@ -183,10 +194,11 @@ def test_load_graph_resets_stale_build_graph_from_crashed_run(falkordb_cfg, tmp_
         final_store = FalkorStore(falkordb_cfg, STALE_GRAPH)
         # мусор упавшего прогона НЕ протёк в финальный граф
         assert final_store.get_nodes(["stale-from-crash"]) == []
-        # а реальное содержимое staging -- протекло целиком и ровно оно
-        assert stats["nodes_written"] == 3
+        # а реальное содержимое staging -- протекло целиком и ровно оно (+1 always-on
+        # Meta node, M3 T6 -- see the other test in this file for why)
+        assert stats["nodes_written"] == 4
         rows = final_store.raw("MATCH (n) RETURN n.id").result_set
-        assert {r[0] for r in rows} == {NODE_A_ID, NODE_B_ID, SERVICE_NODE.id}
+        assert {r[0] for r in rows} == {NODE_A_ID, NODE_B_ID, SERVICE_NODE.id, "meta"}
     finally:
         _cleanup(falkordb_cfg, STALE_BUILD, STALE_GRAPH)
 
@@ -233,3 +245,172 @@ def test_load_graph_writes_role_multilabel_and_channel_business_process_labels(
         assert proc_props["entrypoint_id"] == handler.id
     finally:
         _cleanup(falkordb_cfg, ROLES_BUILD, ROLES_GRAPH)
+
+
+# -- M3 T6: Chunk nodes (embedding via vecf32) + fulltext(text, context_header) +
+# Meta node, against a REAL FalkorDB (this task's own self-review requirement: vecf32
+# actually round-trips through db.idx.vector.queryNodes, not just doctor's own probe) --
+
+CHUNK_GRAPH = "__t6chunks__"
+CHUNK_BUILD = f"{CHUNK_GRAPH}__build"
+
+CHUNK_1 = ChunkRec(
+    chunk_id="sym:c:`app`/create_order().#c0", symbol_id="sym:c:`app`/create_order().",
+    ord=0, text="def create_order(): ...", start_line=1, end_line=1,
+    content_hash="hash-create-order",
+)
+CHUNK_2 = ChunkRec(
+    chunk_id="sym:c:`app`/unrelated().#c0", symbol_id="sym:c:`app`/unrelated().",
+    ord=0, text="def unrelated(): ...", start_line=3, end_line=3,
+    content_hash="hash-unrelated",
+)
+CHUNK_3_NOT_EMBEDDED = ChunkRec(
+    chunk_id="sym:c:`app`/not_embedded().#c0", symbol_id="sym:c:`app`/not_embedded().",
+    ord=0, text="def not_embedded(): ...", start_line=5, end_line=5,
+    content_hash="hash-not-embedded",
+)
+
+# Hand-constructed (not FakeEmbedder -- see its own docstring: its vectors carry no
+# semantic relationship between similar texts, only a controlled numeric one is needed
+# here) so cosine distance is fully predictable: QUERY_VEC is close to CHUNK_1's own
+# vector and far from CHUNK_2's.
+CHUNK_1_VEC = [1.0, 0.0, 0.0, 0.0]
+CHUNK_2_VEC = [0.0, 1.0, 0.0, 0.0]
+QUERY_VEC = [0.9, 0.05, 0.05, 0.0]
+
+
+def _vec_blob(vec: list[float]) -> bytes:
+    return struct.pack(f"<{len(vec)}f", *vec)
+
+
+def _chunk_staging(tmp_path) -> Staging:
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("c", "app/orders.py", [CHUNK_1, CHUNK_2, CHUNK_3_NOT_EMBEDDED])
+    st.set_embeddings([
+        (CHUNK_1.chunk_id, _vec_blob(CHUNK_1_VEC), "test-model", CHUNK_1.content_hash),
+        (CHUNK_2.chunk_id, _vec_blob(CHUNK_2_VEC), "test-model", CHUNK_2.content_hash),
+    ])
+    st.set_context_headers([
+        (CHUNK_1.chunk_id, "symbol: app.create_order (Function) · roles: RouteHandler"),
+        (CHUNK_2.chunk_id, "symbol: app.unrelated (Function)"),
+        (CHUNK_3_NOT_EMBEDDED.chunk_id, "symbol: app.not_embedded (Function)"),
+    ])
+    st.set_meta("embed_model", "test-model")
+    st.set_meta("embed_dim", "4")
+    return st
+
+
+def test_load_graph_writes_chunk_nodes_with_vecf32_embedding_and_meta_node(
+    falkordb_cfg, tmp_path,
+):
+    st = _chunk_staging(tmp_path)
+    try:
+        stats = load_graph(st, lambda name: FalkorStore(falkordb_cfg, name), CHUNK_GRAPH)
+
+        # -- load_graph's own return dict: Chunk/Meta folded into the SAME
+        # nodes_written/nodes_written_by_label accounting as every other node kind --
+        assert stats["nodes_written"] == 4  # 3 chunks + 1 meta
+        assert stats["nodes_written_by_label"] == {"Chunk": 3, "Meta": 1}
+
+        final_store = FalkorStore(falkordb_cfg, CHUNK_GRAPH)
+
+        # -- Chunk node props (brief's own field list) --
+        chunk1_props = final_store.get_nodes([CHUNK_1.chunk_id])[0]
+        # "kind": "Chunk" -- FalkorStore.stats()/get_nodes_by_kind group/filter by
+        # this PROPERTY (Cypher labels can't be parameterized); a missing "kind"
+        # here breaks `codegraph stats`'s sorted() the moment a graph has both a
+        # kind-bearing node and a Chunk node (live-verified regression, now fixed).
+        assert chunk1_props["kind"] == "Chunk"
+        assert chunk1_props["symbol_id"] == CHUNK_1.symbol_id
+        assert chunk1_props["service"] == "c"
+        assert chunk1_props["relpath"] == "app/orders.py"
+        assert chunk1_props["ord"] == 0
+        assert chunk1_props["start_line"] == 1
+        assert chunk1_props["end_line"] == 1
+        assert chunk1_props["content_hash"] == CHUNK_1.content_hash
+        assert chunk1_props["text"] == "def create_order(): ..."
+        assert chunk1_props["context_header"].startswith("symbol: app.create_order")
+        assert chunk1_props["embed_model"] == "test-model"
+
+        # -- a chunk with NO embedding still loads -- no "embedding" property key at
+        # all (never a null one; see pipeline/load.py's own module docstring for why
+        # vecf32(NULL) would be a hard error if it were sent) --
+        chunk3_props = final_store.get_nodes([CHUNK_3_NOT_EMBEDDED.chunk_id])[0]
+        assert "embedding" not in chunk3_props
+        assert "embed_model" not in chunk3_props
+        assert chunk3_props["text"] == "def not_embedded(): ..."
+
+        # -- THE live sanity check this task's self-review calls for: vecf32-encoded
+        # embedding actually round-trips through db.idx.vector.queryNodes, returning
+        # the nearest inserted vector for a query vector close to it --
+        res = final_store.raw(
+            "CALL db.idx.vector.queryNodes('Chunk', 'embedding', 2, vecf32($v)) "
+            "YIELD node, score RETURN node.id, score ORDER BY score",
+            {"v": QUERY_VEC},
+        )
+        nearest_ids = [row[0] for row in res.result_set]
+        assert nearest_ids[0] == CHUNK_1.chunk_id  # closest by cosine, not CHUNK_2
+
+        # -- fulltext(text, context_header) finds a chunk by a context_header-only
+        # term (CHUNK_1's own role annotation, not present in its "text" at all) --
+        fulltext_res = final_store.raw(
+            "CALL db.idx.fulltext.queryNodes('Chunk', 'RouteHandler') YIELD node "
+            "RETURN node.id"
+        )
+        assert [row[0] for row in fulltext_res.result_set] == [CHUNK_1.chunk_id]
+
+        # -- fulltext also finds the NOT-embedded chunk -- text/context_header are
+        # independent of whether a chunk ever got an embedding --
+        fulltext_res_3 = final_store.raw(
+            "CALL db.idx.fulltext.queryNodes('Chunk', 'not_embedded') YIELD node "
+            "RETURN node.id"
+        )
+        assert [row[0] for row in fulltext_res_3.result_set] == [
+            CHUNK_3_NOT_EMBEDDED.chunk_id
+        ]
+
+        # -- Meta node: embed_model/dim (from staging meta) + schema_version (constant) --
+        meta_props = final_store.get_nodes(["meta"])[0]
+        assert meta_props["kind"] == "Meta"
+        assert meta_props["embed_model"] == "test-model"
+        assert meta_props["dim"] == 4
+        assert meta_props["schema_version"] == SCHEMA_VERSION
+
+        # -- stats() groups by n.kind: Chunk/Meta must show up as their OWN kind
+        # buckets, never merged into a `None` bucket (regression: cli.py's `stats`
+        # command sorts this dict's keys, which raises TypeError comparing None to a
+        # real kind string the moment a graph has both -- true for every real
+        # workspace, since Meta is always written) --
+        stats = final_store.stats()
+        assert stats["nodes"]["Chunk"] == 3
+        assert stats["nodes"]["Meta"] == 1
+        assert None not in stats["nodes"]
+        sorted(stats["nodes"])  # must not raise TypeError (str vs NoneType)
+    finally:
+        _cleanup(falkordb_cfg, CHUNK_BUILD, CHUNK_GRAPH)
+
+
+NO_EMBED_CHUNK_GRAPH = "__t6chunks_noembed__"
+NO_EMBED_CHUNK_BUILD = f"{NO_EMBED_CHUNK_GRAPH}__build"
+
+
+def test_load_graph_meta_omits_embed_model_and_dim_when_never_embedded(
+    falkordb_cfg, tmp_path,
+):
+    """No embedder was ever run against this staging (embed_model/embed_dim meta keys
+    were never set at all) -- Meta must still be written (schema_version only), and
+    ensure_schema must not attempt to create a vector index with no dimension to size
+    it (dim=None -- see ddl.ensure_schema's own docstring)."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("c", "app/x.py", [CHUNK_3_NOT_EMBEDDED])
+    st.set_context_headers([(CHUNK_3_NOT_EMBEDDED.chunk_id, "symbol: app.not_embedded")])
+    try:
+        load_graph(st, lambda name: FalkorStore(falkordb_cfg, name), NO_EMBED_CHUNK_GRAPH)
+
+        final_store = FalkorStore(falkordb_cfg, NO_EMBED_CHUNK_GRAPH)
+        meta_props = final_store.get_nodes(["meta"])[0]
+        assert "embed_model" not in meta_props
+        assert "dim" not in meta_props
+        assert meta_props["schema_version"] == SCHEMA_VERSION
+    finally:
+        _cleanup(falkordb_cfg, NO_EMBED_CHUNK_BUILD, NO_EMBED_CHUNK_GRAPH)

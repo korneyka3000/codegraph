@@ -24,7 +24,12 @@ def _pct(numerator: int, denominator: int) -> float:
     return 100.0 * numerator / denominator if denominator else 0.0
 
 
-def build_report(per_service: list[dict], load_stats: dict, link_stats: dict | None = None) -> dict:
+def build_report(
+    per_service: list[dict],
+    load_stats: dict,
+    link_stats: dict | None = None,
+    chunk_stats: dict | None = None,
+) -> dict:
     """per_service: список dict'ов analyze_service()-report (ключ "service" включён).
     load_stats: возврат load.load_graph() (nodes_written/edges_written/
     edges_dropped_missing_endpoint + by-type/by-label разбивки). link_stats (M2 T7,
@@ -32,9 +37,14 @@ def build_report(per_service: list[dict], load_stats: dict, link_stats: dict | N
     существующего 2-позиционного вызова): возврат linking.workspace.link_workspace()
     (calls_http/calls_http_unresolved/next_segments/processes/marks/channels_gc --
     последний M2 final review: orphan-Channel-узлы, выметенные в конце link_workspace).
+    chunk_stats (M3 T6, ещё один аддитивный параметр, тем же принципом что link_stats
+    -- дефолт None сохраняет идентичный dict для каждого существующего 2/3-позиционного
+    вызова): возврат pipeline.chunk_embed.run() (chunks_total/embedded/reused/
+    skipped_no_embedder -- S8, между S7-линковкой и S9-load в cli.index).
 
     Возврат -- JSON-сериализуемый dict: {"services", "totals", "load", "health"} + ключ
-    "linking" (ТОЛЬКО если link_stats передан -- см. выше). "health": pct_unresolved_calls
+    "linking" (ТОЛЬКО если link_stats передан) + ключ "chunking" (ТОЛЬКО если
+    chunk_stats передан -- оба независимы друг от друга). "health": pct_unresolved_calls
     = unresolved/(joined+unresolved+external) * 100 (0.0 при нулевом знаменателе --
     сервисы без единого call-сайта, не делить на 0), dropped_edges(+by_type) из
     load_stats, degraded_services -- список {service, reason} для сервисов с
@@ -60,6 +70,8 @@ def build_report(per_service: list[dict], load_stats: dict, link_stats: dict | N
     }
     if link_stats is not None:
         report["linking"] = dict(link_stats)
+    if chunk_stats is not None:
+        report["chunking"] = dict(chunk_stats)
     return report
 
 
@@ -152,3 +164,17 @@ def print_report(report: dict, console: Console) -> None:
             f"processes = {linking.get('processes', 0)}, "
             f"channels_gc = {linking.get('channels_gc', 0)}"
         )
+
+    # M3 T6 (additive, same "absent -> strict no-op" contract as linking above):
+    # "chunking" key only present when build_report was given chunk_stats.
+    chunking = report.get("chunking")
+    if chunking:
+        line = (
+            f"chunking: chunks_total = {chunking.get('chunks_total', 0)}, "
+            f"embedded = {chunking.get('embedded', 0)}, "
+            f"reused = {chunking.get('reused', 0)}"
+        )
+        skipped = chunking.get("skipped_no_embedder", 0)
+        if skipped:
+            line += f" [yellow](skipped_no_embedder = {skipped})[/]"
+        console.print(line)

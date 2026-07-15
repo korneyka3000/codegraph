@@ -37,6 +37,9 @@ LINK_STATS = {
     "calls_http": 5, "calls_http_unresolved": 1,
     "next_segments": 3, "processes": 2, "marks": 1, "channels_gc": 4,
 }
+CHUNK_STATS = {
+    "chunks_total": 42, "embedded": 40, "reused": 2, "skipped_no_embedder": 0,
+}
 
 
 # -- build_report: aggregation --
@@ -119,6 +122,43 @@ def test_build_report_with_link_stats_adds_linking_key():
 
 def test_build_report_link_stats_none_is_same_as_omitted():
     assert build_report([SERVICE_OK], LOAD_STATS, None) == build_report([SERVICE_OK], LOAD_STATS)
+
+
+# -- M3 T6: build_report chunk_stats (additive fourth parameter, mirrors link_stats) --
+
+
+def test_build_report_without_chunk_stats_has_no_chunking_key():
+    """Backward compatibility: every pre-M3-T6 call site (2/3-positional-arg, this
+    file's own tests above included) must see an IDENTICAL report shape -- no
+    "chunking" key at all when chunk_stats is omitted, not even an empty dict."""
+    report = build_report([SERVICE_OK], LOAD_STATS, LINK_STATS)
+    assert "chunking" not in report
+
+
+def test_build_report_with_chunk_stats_adds_chunking_key():
+    report = build_report([SERVICE_OK], LOAD_STATS, LINK_STATS, CHUNK_STATS)
+    assert report["chunking"] == CHUNK_STATS
+    # additive: every pre-existing key/shape is untouched.
+    assert report["linking"] == LINK_STATS
+    assert report["totals"] == {
+        "files": 5, "nodes": 8, "edges": 9,
+        "calls_joined": 6, "calls_unresolved": 2, "calls_external": 1,
+    }
+
+
+def test_build_report_chunk_stats_none_is_same_as_omitted():
+    assert build_report([SERVICE_OK], LOAD_STATS, LINK_STATS, None) == build_report(
+        [SERVICE_OK], LOAD_STATS, LINK_STATS
+    )
+
+
+def test_build_report_chunk_stats_works_without_link_stats():
+    """chunk_stats doesn't require link_stats to also be present -- both are
+    independent additive parameters (a caller could theoretically have one without
+    the other, even though cli.index's real wiring always supplies both)."""
+    report = build_report([SERVICE_OK], LOAD_STATS, None, CHUNK_STATS)
+    assert "linking" not in report
+    assert report["chunking"] == CHUNK_STATS
 
 
 # -- write_report: JSON round-trip --
@@ -224,3 +264,47 @@ def test_print_report_no_linking_line_when_absent():
     print_report(report, console)  # must not raise (no KeyError on missing "linking")
     text = console.export_text()
     assert "linking" not in text.lower()
+
+
+# -- M3 T6: print_report chunking summary (additive) --
+
+
+def test_print_report_shows_chunking_summary_when_present():
+    report = build_report([SERVICE_OK], LOAD_STATS, chunk_stats=CHUNK_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+
+    assert "chunking" in text.lower()
+    for value in ("42", "40", "2"):  # chunks_total, embedded, reused
+        assert value in text
+
+
+def test_print_report_shows_skipped_no_embedder_when_nonzero():
+    degraded_chunk_stats = {
+        "chunks_total": 10, "embedded": 0, "reused": 0, "skipped_no_embedder": 10,
+    }
+    report = build_report([SERVICE_OK], LOAD_STATS, chunk_stats=degraded_chunk_stats)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "skipped_no_embedder" in text.lower()
+    assert "10" in text
+
+
+def test_print_report_hides_skipped_no_embedder_when_zero():
+    report = build_report([SERVICE_OK], LOAD_STATS, chunk_stats=CHUNK_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "skipped_no_embedder" not in text.lower()
+
+
+def test_print_report_no_chunking_line_when_absent():
+    """Backward compatibility: a report built without chunk_stats must not print
+    anything new (no KeyError on the missing "chunking" key)."""
+    report = build_report([SERVICE_OK], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "chunking" not in text.lower()

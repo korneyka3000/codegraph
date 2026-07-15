@@ -654,6 +654,132 @@ def test_fill_headers_returns_zero_for_service_with_no_chunks(tmp_path):
 
 
 # ======================================================================================
+# -- fill_headers_all: M3 T6 carry (one header index for the WHOLE workspace, not one
+# per service -- see chunk_embed.py, the intended real caller) --
+# ======================================================================================
+
+
+def test_fill_headers_all_covers_every_service_in_one_call(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes(
+        [
+            _node("a1", "Function", qualified_name="app.a.f", service="a"),
+            _node("b1", "Function", qualified_name="app.b.f", service="b"),
+        ]
+    )
+    st.upsert_chunks("a", "app/a.py", [_chunk("a1#c0", "a1")])
+    st.upsert_chunks("b", "app/b.py", [_chunk("b1#c0", "b1")])
+
+    updated = augment.fill_headers_all(st)
+    assert updated == 2
+
+    assert _chunk_row(st, "a", "a1").context_header is not None
+    assert _chunk_row(st, "b", "b1").context_header is not None
+
+
+def test_fill_headers_all_matches_per_service_fill_headers_content(tmp_path):
+    """Same header CONTENT as calling fill_headers once per service -- fill_headers_all
+    is purely a batching/perf change (one index build instead of N), not a behavior
+    change."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes(
+        [
+            _node("a1", "Function", qualified_name="app.a.f", service="a", roles=("RouteHandler",)),
+            _node("b1", "Function", qualified_name="app.b.f", service="b"),
+        ]
+    )
+    st.upsert_chunks("a", "app/a.py", [_chunk("a1#c0", "a1")])
+    st.upsert_chunks("b", "app/b.py", [_chunk("b1#c0", "b1")])
+
+    augment.fill_headers_all(st)
+    header_a = _chunk_row(st, "a", "a1").context_header
+    header_b = _chunk_row(st, "b", "b1").context_header
+
+    st2 = Staging(tmp_path / "s2.db")
+    st2.upsert_nodes(
+        [
+            _node("a1", "Function", qualified_name="app.a.f", service="a", roles=("RouteHandler",)),
+            _node("b1", "Function", qualified_name="app.b.f", service="b"),
+        ]
+    )
+    st2.upsert_chunks("a", "app/a.py", [_chunk("a1#c0", "a1")])
+    st2.upsert_chunks("b", "app/b.py", [_chunk("b1#c0", "b1")])
+    augment.fill_headers(st2, "a")
+    augment.fill_headers(st2, "b")
+
+    assert header_a == _chunk_row(st2, "a", "a1").context_header
+    assert header_b == _chunk_row(st2, "b", "b1").context_header
+
+
+def test_fill_headers_all_builds_index_exactly_once(tmp_path, monkeypatch):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes(
+        [
+            _node("a1", "Function", qualified_name="app.a.f", service="a"),
+            _node("b1", "Function", qualified_name="app.b.f", service="b"),
+            _node("c1", "Function", qualified_name="app.c.f", service="c"),
+        ]
+    )
+    st.upsert_chunks("a", "app/a.py", [_chunk("a1#c0", "a1")])
+    st.upsert_chunks("b", "app/b.py", [_chunk("b1#c0", "b1")])
+    st.upsert_chunks("c", "app/c.py", [_chunk("c1#c0", "c1")])
+
+    calls: list[int] = []
+    original = augment._build_index
+
+    def spy(staging, chunks=None):
+        calls.append(1)
+        return original(staging, chunks=chunks)
+
+    monkeypatch.setattr(augment, "_build_index", spy)
+    augment.fill_headers_all(st)
+
+    assert len(calls) == 1
+
+
+def test_fill_headers_all_calls_set_context_headers_exactly_once(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes(
+        [
+            _node("a1", "Function", qualified_name="app.a.f", service="a"),
+            _node("b1", "Function", qualified_name="app.b.f", service="b"),
+        ]
+    )
+    st.upsert_chunks("a", "app/a.py", [_chunk("a1#c0", "a1")])
+    st.upsert_chunks("b", "app/b.py", [_chunk("b1#c0", "b1")])
+
+    calls: list[list[tuple[str, str]]] = []
+    original = st.set_context_headers
+
+    def spy(rows):
+        calls.append(list(rows))
+        return original(rows)
+
+    st.set_context_headers = spy
+    augment.fill_headers_all(st)
+
+    assert len(calls) == 1
+    assert {chunk_id for chunk_id, _ in calls[0]} == {"a1#c0", "b1#c0"}
+
+
+def test_fill_headers_all_returns_zero_when_nothing_staged(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    assert augment.fill_headers_all(st) == 0
+
+
+def test_fill_headers_all_is_idempotent(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_node("fn", "Function", qualified_name="app.m.f", roles=("RouteHandler",))])
+    st.upsert_chunks("svc", "app/m.py", [_chunk("fn#c0", "fn")])
+
+    augment.fill_headers_all(st)
+    first = _chunk_row(st, "svc", "fn").context_header
+    augment.fill_headers_all(st)
+    second = _chunk_row(st, "svc", "fn").context_header
+    assert first == second
+
+
+# ======================================================================================
 # -- real fixtures: degraded pipeline + link (mirrors test_linking_smoke.py) --
 # ======================================================================================
 

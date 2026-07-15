@@ -13,41 +13,72 @@ import re
 from collections.abc import Callable
 
 from codegraph.core.errors import InvariantError
-from codegraph.core.schema import EDGE_TYPES, NODE_KINDS, ROLE_KINDS
+from codegraph.core.schema import EDGE_TYPES, GRAPH_ONLY_LABELS, NODE_KINDS, ROLE_KINDS
 
 logger = logging.getLogger(__name__)
 
-# NODE_KINDS уже содержит Service/Channel/BusinessProcess; "Sym" -- структурный
-# маркер-label для кодовых узлов (не NodeRec.kind сам по себе, см. pipeline/load.
-# _labels_for_kind), ROLE_KINDS -- доп. label'ы поверх kind (multi-label, напр.
-# :Sym:Function:RouteHandler). Растёт автоматически вместе со schema.py -- schema.py
-# остаётся единственным источником истины (fail-closed расширение, Global
-# Constraint 5 плана M2).
-_ALLOWED_NODE_LABELS = frozenset(NODE_KINDS | ROLE_KINDS | {"Sym"})
+# NODE_KINDS уже содержит Service/Channel/BusinessProcess; ROLE_KINDS -- доп. label'ы
+# поверх kind (multi-label, напр. :Sym:Function:RouteHandler); GRAPH_ONLY_LABELS --
+# valid graph labels с НЕТ соответствующего NodeRec.kind (Sym/Chunk/Meta, см.
+# core/schema.py -- единственное место регистрации всех валидных label'ов). Растёт
+# автоматически вместе со schema.py -- schema.py остаётся единственным источником
+# истины (fail-closed расширение, Global Constraint 5 плана M2).
+_ALLOWED_NODE_LABELS = frozenset(NODE_KINDS | ROLE_KINDS | GRAPH_ONLY_LABELS)
 
-# M3 T1: key_props (upsert_edges) -- prop NAMES only ever come from trusted callers
-# (pipeline/load.py's own constant table, not user/config input), but they still get
-# interpolated straight into the Cypher f-string below (same "validate before
-# interpolation" discipline as _validate_labels/_validate_edge_type -- fail-closed,
-# not "we happen to control the only caller today"). Letters/underscore only --
-# comfortably covers every real prop name (e.g. "via_channel_id") while staying a
-# trivially safe allowlist.
-_KEY_PROP_NAME_RE = re.compile(r"^[A-Za-z_]+$")
+# M3 T1: key_props (upsert_edges)/M3 T6: vector_props (upsert_nodes) -- prop NAMES only
+# ever come from trusted callers (pipeline/load.py's own constant tables, not user/
+# config input), but they still get interpolated straight into the Cypher f-string
+# below (same "validate before interpolation" discipline as _validate_labels/
+# _validate_edge_type -- fail-closed, not "we happen to control the only caller
+# today"). Letters/underscore only -- comfortably covers every real prop name (e.g.
+# "via_channel_id", "embedding") while staying a trivially safe allowlist. Shared by
+# both call sites (key_props/vector_props) rather than duplicated per-caller.
+_PROP_NAME_RE = re.compile(r"^[A-Za-z_]+$")
+
+
+def _validate_prop_names(names: tuple[str, ...], label: str) -> None:
+    invalid = [n for n in names if not _PROP_NAME_RE.fullmatch(n)]
+    if invalid:
+        raise InvariantError(f"invalid {label} name(s): {invalid!r}")
 
 
 def upsert_nodes(
-    g, labels: tuple[str, ...], rows: list[dict], batch_size: int = 1000
+    g,
+    labels: tuple[str, ...],
+    rows: list[dict],
+    batch_size: int = 1000,
+    vector_props: tuple[str, ...] = (),
 ) -> int:
     """MERGE-upsert узлов по id: `MERGE (n:<L1:L2> {id: r.id}) SET n += r.props`.
 
     rows: [{"id": ..., "props": {...}}, ...]. При ошибке батча — рекурсивная
     бисекция (см. _bisecting_upsert). Возвращает фактически записанное количество.
+
+    `vector_props` (M3 T6, e.g. `("embedding",)` for Chunk nodes -- see pipeline/
+    load.py): each name gets an ADDITIONAL `SET n.<p> = vecf32(r.<p>)` clause appended
+    after `SET n += r.props`, reading `r.<p>` -- a plain `list[float]` living at the
+    row's TOP level (alongside "id"/"props"), NOT inside `r.props` -- straight from the
+    row dict (mirrors how `upsert_edges`' own `key_props` values live at the row's top
+    level, for the identical reason: the Cypher below reads them as `r.<p>`, not a
+    nested `r.props.<p>`). Deliberately NOT folded into `r.props`/a plain `SET n +=`:
+    FalkorDB's vector index needs the property written via `vecf32(...)` (its own
+    encoded vector type), not a plain list literal -- a plain `SET n += {embedding:
+    [...]}"` would store an ordinary array property that `db.idx.vector.queryNodes`
+    can't use. Every row passed here MUST carry a real (non-null) value for each
+    `vector_props` name -- `vecf32(NULL)` is a hard FalkorDB error, so a caller with
+    some rows lacking an embedding (e.g. chunks that were never embedded) must route
+    those through a SEPARATE `upsert_nodes` call with `vector_props=()` instead (see
+    `pipeline/load.py`'s own two-batch split). Default `()` -- every pre-M3-T6 call
+    site's Cypher shape is unchanged (no extra `SET` clause at all).
     """
     _validate_labels(labels)
+    _validate_prop_names(vector_props, "vector_props")
     if not rows:
         return 0
     label_expr = ":".join(labels)
     cypher = f"UNWIND $rows AS r MERGE (n:{label_expr} {{id: r.id}}) SET n += r.props"
+    for p in vector_props:
+        cypher += f" SET n.{p} = vecf32(r.{p})"
     written = 0
     for i in range(0, len(rows), batch_size):
         chunk = rows[i : i + batch_size]
@@ -87,11 +118,11 @@ def upsert_edges(
     parallel-channel NEXT_SEGMENT pair from staging round-trips as two edges here too,
     not one silently overwritten. key_props names are validated against a
     letters/underscore allowlist before being interpolated into the Cypher f-string
-    (same fail-closed discipline as edge_type/labels below — see _KEY_PROP_NAME_RE).
+    (same fail-closed discipline as edge_type/labels below — see _validate_prop_names).
     Возвращает (written, dropped).
     """
     _validate_edge_type(edge_type)
-    _validate_key_props(key_props)
+    _validate_prop_names(key_props, "key_props")
     filtered = [r for r in rows if r["src"] in known_ids and r["dst"] in known_ids]
     dropped = len(rows) - len(filtered)
     if not filtered:
@@ -123,12 +154,6 @@ def _validate_labels(labels: tuple[str, ...]) -> None:
 def _validate_edge_type(edge_type: str) -> None:
     if edge_type not in EDGE_TYPES:
         raise InvariantError(f"invalid edge type: {edge_type!r}")
-
-
-def _validate_key_props(key_props: tuple[str, ...]) -> None:
-    invalid = [k for k in key_props if not _KEY_PROP_NAME_RE.fullmatch(k)]
-    if invalid:
-        raise InvariantError(f"invalid key_props name(s): {invalid!r}")
 
 
 def _describe_node(row: dict) -> str:
