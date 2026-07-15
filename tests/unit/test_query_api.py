@@ -830,6 +830,18 @@ def test_resolve_selector_store_factory_failure_also_caught():
     assert "falkordb unreachable" in result["error"]
 
 
+def test_resolve_selector_malformed_selector_returns_error_before_store_factory_call():
+    """Same amendment-1-adjacent principle as expand_neighbors'/trace_process's own
+    direction validation (see api.py module docstring): a cheap, pure precondition
+    that's already known to fail should reject BEFORE paying for a store connection."""
+    store = FakeStore()
+    calls: list[FakeStore] = []
+    q = GraphQuery(_factory(store, calls), {})
+    result = q.resolve_selector("not-a-selector")
+    assert "error" in result
+    assert calls == []  # store_factory must never be called
+
+
 def test_resolve_selector_fresh_store_per_call():
     calls: list[FakeStore] = []
     store = FakeStore()

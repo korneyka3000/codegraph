@@ -40,7 +40,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
-from codegraph.core.selectors import QualifiedSelector, RouteSelector, parse_selector
+from codegraph.core.selectors import RouteSelector, parse_selector
 from codegraph.core.spans import LineIndex
 from codegraph.query import traverse
 from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
@@ -370,14 +370,19 @@ class GraphQuery:
         Returns {"node_id": ...} on success, {"error": ...} otherwise -- a malformed
         selector (parse_selector returns None) and a well-formed-but-unresolved one
         are reported with the SAME "entrypoint not found for selector: ..." message
-        (matching the pre-M3 CLI's own undifferentiated wording for both cases)."""
+        (matching the pre-M3 CLI's own undifferentiated wording for both cases). A
+        malformed selector is rejected BEFORE store_factory() is ever called -- same
+        principle as expand_neighbors'/trace_process's own direction validation (see
+        this module's docstring, "Ограничения ответов"): a cheap, pure precondition
+        already known to fail shouldn't pay for a store connection first."""
+        parsed = parse_selector(selector)
+        if parsed is None:
+            return {"error": f"entrypoint not found for selector: {selector}"}
         try:
             store = self.store_factory()
-            parsed = parse_selector(selector)
-            node_id = None
             if isinstance(parsed, RouteSelector):
                 node_id = self._resolve_route_selector(store, parsed)
-            elif isinstance(parsed, QualifiedSelector):
+            else:
                 node = store.find_by_qualified(parsed.service, parsed.qualified)
                 node_id = node.get("id") if node else None
         except (StoreError, StoreUnavailable) as e:
