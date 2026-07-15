@@ -1,7 +1,9 @@
+import hashlib
 import sqlite3
 
 import pytest
 
+from codegraph.chunking.splitter import ChunkRec
 from codegraph.core.errors import InvariantError
 from codegraph.core.schema import SCHEMA_VERSION, EdgeRec, NodeRec
 from codegraph.resolvers.base import DefRow, RefRow
@@ -10,6 +12,14 @@ from codegraph.stores.staging import Staging
 
 def _node(id_, svc, kind="Function"):
     return NodeRec(id=id_, kind=kind, service=svc, name="n", qualified_name="q")
+
+
+def _chunk(chunk_id, symbol_id, ord_, text="hello", start_line=1, end_line=1):
+    return ChunkRec(
+        chunk_id=chunk_id, symbol_id=symbol_id, ord=ord_, text=text,
+        start_line=start_line, end_line=end_line,
+        content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    )
 
 
 def test_roundtrip_and_counts(tmp_path):
@@ -531,3 +541,124 @@ def test_update_edge_props_returns_false_when_edge_missing(tmp_path):
     st = Staging(tmp_path / "s.db")
     ok = st.update_edge_props("sym:a:x", "sym:a:y", "CALLS", {"k": "v"})
     assert ok is False
+
+
+# -- M3 T3: chunks (chunking.splitter.ChunkRec staged for T4/T6) --
+
+
+def test_upsert_chunks_and_chunks_for_service_round_trip(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    c1 = _chunk("sym:a:m/f().#c0", "sym:a:m/f().", 0, text="def f(): pass",
+                start_line=3, end_line=4)
+    st.upsert_chunks("a", "app/m.py", [c1])
+
+    rows = st.chunks_for_service("a")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.chunk_id == c1.chunk_id
+    assert row.symbol_id == c1.symbol_id
+    assert row.service == "a"
+    assert row.relpath == "app/m.py"
+    assert row.ord == 0
+    assert row.text == c1.text
+    assert (row.start_line, row.end_line) == (3, 4)
+    assert row.content_hash == c1.content_hash
+    assert row.context_header is None
+    assert row.embedding is None
+    assert row.embed_model is None
+
+
+def test_chunks_for_service_scoped_by_service(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [_chunk("ca#c0", "ca", 0)])
+    st.upsert_chunks("b", "m.py", [_chunk("cb#c0", "cb", 0)])
+    assert {r.chunk_id for r in st.chunks_for_service("a")} == {"ca#c0"}
+    assert {r.chunk_id for r in st.chunks_for_service("b")} == {"cb#c0"}
+
+
+def test_chunks_missing_embedding_filters_correctly(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [
+        _chunk("c1#c0", "c1", 0), _chunk("c2#c0", "c2", 0), _chunk("c3#c0", "c3", 0),
+    ])
+    st.set_embeddings([("c1#c0", b"\x00\x01", "model-a"), ("c2#c0", b"\x02\x03", "model-old")])
+
+    # c1: embedded under the CURRENT model (up to date) -- not missing.
+    # c2: embedded, but under a DIFFERENT (stale) model -- missing.
+    # c3: never embedded at all -- missing.
+    missing = {r.chunk_id for r in st.chunks_missing_embedding("model-a")}
+    assert missing == {"c2#c0", "c3#c0"}
+
+
+def test_set_embeddings_and_set_context_headers(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [_chunk("c1#c0", "c1", 0)])
+    st.set_embeddings([("c1#c0", b"\x01\x02\x03", "model-a")])
+    st.set_context_headers([("c1#c0", "file: m.py")])
+
+    row = st.chunks_for_service("a")[0]
+    assert row.embedding == b"\x01\x02\x03"
+    assert row.embed_model == "model-a"
+    assert row.context_header == "file: m.py"
+
+
+def test_set_embeddings_noop_for_missing_chunk_id(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.set_embeddings([("nope#c0", b"\x00", "model-a")])  # must not raise
+    st.set_context_headers([("nope#c0", "header")])  # must not raise
+
+
+def test_begin_service_clears_chunks(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [_chunk("ca#c0", "ca", 0)])
+    st.upsert_chunks("b", "m.py", [_chunk("cb#c0", "cb", 0)])
+    st.begin_service("a")
+    assert st.chunks_for_service("a") == []
+    assert len(st.chunks_for_service("b")) == 1
+
+
+def test_counts_includes_chunks(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [_chunk("ca#c0", "ca", 0), _chunk("ca#c1", "ca", 1)])
+    assert st.counts()["chunks"] == 2
+
+
+def test_iter_chunks_across_services(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [_chunk("ca#c0", "ca", 0)])
+    st.upsert_chunks("b", "n.py", [_chunk("cb#c0", "cb", 0)])
+    assert {r.chunk_id for r in st.iter_chunks()} == {"ca#c0", "cb#c0"}
+
+
+def test_upsert_chunks_preserves_embedding_on_conflict_same_content(tmp_path):
+    """Re-upserting the SAME chunk_id (identical content) must not wipe an
+    already-set embedding -- `ON CONFLICT DO UPDATE` only ever touches the
+    content-derived columns, which is what makes T6's chunk_embed.run idempotent on
+    a repeated call (see upsert_chunks' own docstring)."""
+    st = Staging(tmp_path / "s.db")
+    c1 = _chunk("c1#c0", "c1", 0, text="same text")
+    st.upsert_chunks("a", "m.py", [c1])
+    st.set_embeddings([("c1#c0", b"\xaa\xbb", "model-a")])
+
+    st.upsert_chunks("a", "m.py", [c1])  # re-chunk, identical content
+    row = st.chunks_for_service("a")[0]
+    assert row.embedding == b"\xaa\xbb"
+    assert row.embed_model == "model-a"
+
+
+def test_upsert_chunks_updates_text_on_conflict_when_content_changes(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    c1 = _chunk("c1#c0", "c1", 0, text="old text")
+    st.upsert_chunks("a", "m.py", [c1])
+    st.set_embeddings([("c1#c0", b"\xaa", "model-a")])
+
+    c1_edited = _chunk("c1#c0", "c1", 0, text="new text, edited")
+    st.upsert_chunks("a", "m.py", [c1_edited])
+    row = st.chunks_for_service("a")[0]
+    assert row.text == "new text, edited"
+    assert row.content_hash == c1_edited.content_hash
+    # the now-stale embedding survives -- chunks_missing_embedding only ever checks
+    # embedding/embed_model presence, not content_hash freshness (documented
+    # limitation, see upsert_chunks' own docstring).
+    assert row.embedding == b"\xaa"

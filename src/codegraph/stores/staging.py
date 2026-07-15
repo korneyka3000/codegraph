@@ -5,12 +5,39 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
+from codegraph.chunking.splitter import ChunkRec
 from codegraph.core import ids
 from codegraph.core.errors import InvariantError
 from codegraph.core.schema import ROLE_KINDS, SCHEMA_VERSION, EdgeRec, NodeRec
 from codegraph.resolvers.base import DefRow, RefRow
+
+
+@dataclass(frozen=True)
+class ChunkRow:
+    """Full on-disk shape of one `chunks` row -- a superset of `ChunkRec` (chunk_id,
+    symbol_id, ord, text, start_line, end_line, content_hash) plus the staging-only
+    columns `upsert_chunks` injects (service, relpath) and the ones only
+    `set_embeddings`/`set_context_headers` ever populate (context_header, embedding,
+    embed_model). Lives here rather than in `chunking.splitter` alongside `ChunkRec`
+    on purpose: the splitter is storage-agnostic (it has never heard of "service" or
+    "embedding"), this type is exactly the staging table's own column list."""
+
+    chunk_id: str
+    symbol_id: str
+    service: str
+    relpath: str
+    ord: int
+    text: str
+    start_line: int
+    end_line: int
+    content_hash: str
+    context_header: str | None
+    embedding: bytes | None
+    embed_model: str | None
+
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -44,7 +71,18 @@ CREATE TABLE IF NOT EXISTS claims(
   service TEXT, relpath TEXT, kind TEXT, payload_json TEXT,
   PRIMARY KEY(service, relpath, kind, payload_json));
 CREATE INDEX IF NOT EXISTS idx_claims_kind ON claims(kind, service);
+CREATE TABLE IF NOT EXISTS chunks(
+  chunk_id TEXT PRIMARY KEY, symbol_id TEXT, service TEXT, relpath TEXT,
+  ord INTEGER, text TEXT, start_line INTEGER, end_line INTEGER, content_hash TEXT,
+  context_header TEXT, embedding BLOB, embed_model TEXT);
+CREATE INDEX IF NOT EXISTS idx_chunks_service ON chunks(service);
 """
+# M3 T3: `chunks` is a BRAND NEW table, not a reshape of an existing v3 one -- unlike
+# the 2 -> 3 edges-PK migration (core/schema.py's SCHEMA_VERSION history comment),
+# `CREATE TABLE IF NOT EXISTS` for a name no pre-T3 v3 staging.db could already have is
+# purely additive: reopening an old v3 file just gains the chunks table with no version
+# bump and no InvariantError guard needed (there is no old-shaped "chunks" table it
+# could collide with). SCHEMA_VERSION stays 3.
 
 
 def _id_service(node_id: str) -> str | None:
@@ -163,7 +201,13 @@ class Staging:
         prefixes, so it has no such blind spot. See `upsert_edges` and
         `gc_orphan_channels` (the companion fix for the orphaned Channel node itself)."""
         cur = self._db
-        for t in ("files", "scip_defs", "scip_refs"):
+        # M3 T3: "chunks" joins this same simple "WHERE service=?" family (like
+        # files/scip_defs/scip_refs) -- a full per-service wipe, embeddings included;
+        # there's no cross-run embedding cache to preserve here (M3 always re-chunks a
+        # freshly begin_service'd file within the SAME index run -- see chunks table's
+        # own upsert_chunks docstring for where an ON-CONFLICT-preserving upsert still
+        # matters, which is purely a WITHIN-run idempotency concern, not this one).
+        for t in ("files", "scip_defs", "scip_refs", "chunks"):
             cur.execute(f"DELETE FROM {t} WHERE service=?", (service,))  # noqa: S608
         cur.execute("DELETE FROM nodes WHERE service=?", (service,))
         cur.execute("DELETE FROM edges WHERE origin_service=?", (service,))
@@ -420,6 +464,92 @@ class Staging:
             out.append({**payload, "_service": svc, "_relpath": relpath})
         return out
 
+    # -- M3 T3: chunks (chunking.splitter.chunk_file's output, staged for T4's
+    # augmentation and T6's embed+load) --
+
+    def upsert_chunks(self, service: str, relpath: str, rows: list[ChunkRec]) -> None:
+        """`service`/`relpath` apply to EVERY row in one call -- `chunk_file` runs
+        per-file, so a single call always stages one file's worth of chunks.
+
+        Deliberately NOT a blanket `INSERT OR REPLACE`: that would reset
+        context_header/embedding/embed_model to NULL on every call, even when a
+        chunk_id's content hasn't changed at all. `ON CONFLICT(chunk_id) DO UPDATE`
+        instead only ever touches the content-derived columns (symbol_id, service,
+        relpath, ord, text, start_line, end_line, content_hash); embedding/embed_model/
+        context_header survive a re-upsert with the SAME chunk_id untouched. This is
+        what makes `chunks_missing_embedding` a genuine cache check rather than always
+        finding everything "missing" -- T6's chunk_embed.run relies on exactly this for
+        its own idempotency (a second call, same files, embeds nothing new). Note this
+        only ever matters WITHIN one index run's staging lifetime: `begin_service`
+        still deletes chunk rows outright on the NEXT `codegraph index` invocation (see
+        its own docstring) -- there is no cross-run embedding cache in M3, incremental
+        indexing is M4 scope."""
+        self._db.executemany(
+            "INSERT INTO chunks "
+            "(chunk_id, symbol_id, service, relpath, ord, text, start_line, end_line, "
+            "content_hash) VALUES (?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(chunk_id) DO UPDATE SET "
+            "symbol_id=excluded.symbol_id, service=excluded.service, "
+            "relpath=excluded.relpath, ord=excluded.ord, text=excluded.text, "
+            "start_line=excluded.start_line, end_line=excluded.end_line, "
+            "content_hash=excluded.content_hash",
+            [
+                (
+                    c.chunk_id,
+                    c.symbol_id,
+                    service,
+                    relpath,
+                    c.ord,
+                    c.text,
+                    c.start_line,
+                    c.end_line,
+                    c.content_hash,
+                )
+                for c in rows
+            ],
+        )
+        self._db.commit()
+
+    def chunks_for_service(self, service: str) -> list[ChunkRow]:
+        cur = self._db.execute(
+            "SELECT chunk_id, symbol_id, service, relpath, ord, text, start_line, "
+            "end_line, content_hash, context_header, embedding, embed_model "
+            "FROM chunks WHERE service=? ORDER BY relpath, symbol_id, ord",
+            (service,),
+        )
+        return [ChunkRow(*row) for row in cur.fetchall()]
+
+    def chunks_missing_embedding(self, model_id: str) -> list[ChunkRow]:
+        """Every chunk (any service) that either has no embedding yet, or was last
+        embedded under a DIFFERENT model id than `model_id` (e.g. the workspace config
+        switched embedding models -- everything needs re-embedding, not just new
+        chunks)."""
+        cur = self._db.execute(
+            "SELECT chunk_id, symbol_id, service, relpath, ord, text, start_line, "
+            "end_line, content_hash, context_header, embedding, embed_model "
+            "FROM chunks WHERE embedding IS NULL OR embed_model != ? ORDER BY chunk_id",
+            (model_id,),
+        )
+        return [ChunkRow(*row) for row in cur.fetchall()]
+
+    def set_embeddings(self, rows: list[tuple[str, bytes, str]]) -> None:
+        """`rows` -- `(chunk_id, embedding_blob, model_id)`; no-op for a `chunk_id`
+        that doesn't exist (matches `update_edge_props`'s missing-key tolerance)."""
+        self._db.executemany(
+            "UPDATE chunks SET embedding=?, embed_model=? WHERE chunk_id=?",
+            [(blob, model_id, chunk_id) for chunk_id, blob, model_id in rows],
+        )
+        self._db.commit()
+
+    def set_context_headers(self, rows: list[tuple[str, str]]) -> None:
+        """`rows` -- `(chunk_id, header)`; T4's augment.build_header output, stored so
+        it can be embedded (T6) and fulltext-searched (T7) without being recomputed."""
+        self._db.executemany(
+            "UPDATE chunks SET context_header=? WHERE chunk_id=?",
+            [(header, chunk_id) for chunk_id, header in rows],
+        )
+        self._db.commit()
+
     # -- чтение --
 
     def files_for_service(self, service: str) -> list[tuple[str, str]]:
@@ -467,9 +597,14 @@ class Staging:
 
     def counts(self) -> dict:
         out = {}
-        for key, table in (("files", "files"), ("defs", "scip_defs"),
-                           ("refs", "scip_refs"), ("nodes", "nodes"),
-                           ("edges", "edges")):
+        for key, table in (
+            ("files", "files"),
+            ("defs", "scip_defs"),
+            ("refs", "scip_refs"),
+            ("nodes", "nodes"),
+            ("edges", "edges"),
+            ("chunks", "chunks"),
+        ):
             out[key] = self._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
         return out
 
@@ -494,6 +629,15 @@ class Staging:
             yield EdgeRec(src=src, dst=dst, type=type_, resolution=res,
                           confidence=conf, extractor=ext, evidence_file=ef,
                           evidence_line=el, props=json.loads(props))
+
+    def iter_chunks(self) -> Iterator[ChunkRow]:
+        """For load (T6): every staged chunk, across all services."""
+        cur = self._db.execute(
+            "SELECT chunk_id, symbol_id, service, relpath, ord, text, start_line, "
+            "end_line, content_hash, context_header, embedding, embed_model "
+            "FROM chunks ORDER BY service, relpath, symbol_id, ord")
+        for row in cur:
+            yield ChunkRow(*row)
 
     def set_meta(self, key: str, value: str) -> None:
         self._db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
