@@ -78,13 +78,29 @@ def test_value_spec_exactly_one_source():
     assert ValueSpec.model_validate({"kwarg": "event_type"}).kwarg == "event_type"
 
 
-def test_consumer_dispatch_dict_requires_registrar_or_assign():
+def test_consumer_dispatch_dict_requires_registrar_call():
+    # M3 T1: dict_assign removed (was a validated-but-never-consumed alternate
+    # dispatch_dict discovery mechanism -- see ConsumerIdiom's docstring); registrar_call
+    # is now the ONLY way to satisfy kind="dispatch_dict".
     with pytest.raises(ValidationError):
         ConsumerIdiom.model_validate({"name": "x", "kind": "dispatch_dict"})
     ok = ConsumerIdiom.model_validate(
-        {"name": "x", "kind": "dispatch_dict", "dict_assign": "EVENT_HANDLERS"}
+        {"name": "x", "kind": "dispatch_dict",
+         "registrar_call": "app.consumers.base.register_handlers"}
     )
-    assert ok.dict_assign == "EVENT_HANDLERS"
+    assert ok.registrar_call == "app.consumers.base.register_handlers"
+
+
+def test_consumer_dict_assign_field_removed_rejected_as_unknown():
+    # Breaking change (M3 T1, documented on ConsumerIdiom): a codegraph.yaml still
+    # specifying dict_assign now fails loudly via pydantic's extra="forbid" (unknown
+    # field), not a silent no-op -- an explicit signal to migrate to registrar_call.
+    with pytest.raises(ValidationError):
+        ConsumerIdiom.model_validate({
+            "name": "x", "kind": "dispatch_dict",
+            "registrar_call": "app.consumers.base.register_handlers",
+            "dict_assign": "EVENT_HANDLERS",
+        })
 
 
 def test_extra_fields_forbidden():

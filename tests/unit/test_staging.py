@@ -1,7 +1,9 @@
+import sqlite3
+
 import pytest
 
 from codegraph.core.errors import InvariantError
-from codegraph.core.schema import EdgeRec, NodeRec
+from codegraph.core.schema import SCHEMA_VERSION, EdgeRec, NodeRec
 from codegraph.resolvers.base import DefRow, RefRow
 from codegraph.stores.staging import Staging
 
@@ -128,6 +130,45 @@ def test_schema_version_mismatch_raises(tmp_path):
         Staging(tmp_path / "s.db")
 
 
+# -- M3 T1: version-check must run BEFORE ensure_schema's DDL, but only when a meta
+# table already exists (a pre-existing staging.db) -- a naive unconditional swap would
+# instead break the FRESH-file path (querying a meta table that doesn't exist yet raises
+# its own raw sqlite3.OperationalError). See Staging.__init__'s docstring and
+# SCHEMA_VERSION's history comment (core/schema.py) for the M2-final-review bug this
+# closes: ensure_schema's DDL running first could itself raise a raw OperationalError
+# (e.g. an index on a column only the CURRENT schema has) on an old-shaped table,
+# before the actionable InvariantError ever got a chance to fire.
+
+
+def test_v2_like_database_raises_invariant_error_not_operational_error(tmp_path):
+    """Simulates re-opening a genuinely pre-v3 staging.db: a bare sqlite file created
+    BY HAND (bypassing Staging entirely, exactly like an old on-disk file that predates
+    the current DDL) with only a meta table recording schema_version='2'. Staging(path)
+    must detect the mismatch from the meta table before ever running ensure_schema's
+    DDL and raise the actionable InvariantError ("recreate") -- not let executescript()
+    run first and risk surfacing a raw sqlite3.OperationalError instead."""
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    raw.execute("INSERT INTO meta VALUES ('schema_version', '2')")
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(InvariantError, match="recreate") as exc_info:
+        Staging(path)
+    assert not isinstance(exc_info.value, sqlite3.OperationalError)
+
+
+def test_fresh_staging_path_still_initializes_after_version_check_reorder(tmp_path):
+    """The fresh-create path (no pre-existing file, no meta table at all) must keep
+    working after the version-check-before-DDL reorder above -- pins the exact failure
+    mode a NAIVE unconditional swap would introduce (querying meta before it exists)."""
+    path = tmp_path / "fresh.db"
+    assert not path.exists()
+    st = Staging(path)  # must not raise
+    assert st.get_meta("schema_version") == str(SCHEMA_VERSION)
+
+
 def test_local_def_symbols(tmp_path):
     st = Staging(tmp_path / "s.db")
     st.begin_service("a")
@@ -200,6 +241,54 @@ def test_cross_service_edge_wrong_type_with_via_channel_id_still_forbidden(tmp_p
                 "calls", props={"via_channel_id": "chan:kafka_topic:orders"})
     with pytest.raises(InvariantError):
         st.upsert_edges([e])
+
+
+def test_next_segment_parallel_channels_coexist(tmp_path):
+    """M3 T1 PK migration: edges.PRIMARY KEY is now (src,dst,type,via_channel), not
+    (src,dst,type) -- two NEXT_SEGMENT edges between the SAME (src,dst) pair, reached
+    via two DIFFERENT channels (e.g. a producer that fans out over both an event topic
+    AND a direct HTTP call to the same downstream handler), must both survive upsert
+    and both come back out of iter_edges, instead of the second silently clobbering the
+    first via INSERT OR REPLACE on a too-narrow key (the v2 bug)."""
+    st = Staging(tmp_path / "s.db")
+    e1 = EdgeRec("sym:a:`m`/f().", "sym:b:`m`/g().", "NEXT_SEGMENT", "derived", 0.9,
+                 "linking", props={"via_channel_id": "chan:kafka_topic:orders"})
+    e2 = EdgeRec("sym:a:`m`/f().", "sym:b:`m`/g().", "NEXT_SEGMENT", "derived", 0.72,
+                 "linking", props={"via_channel_id": "chan:kafka_topic:shipping"})
+    st.upsert_edges([e1, e2])
+    edges = list(st.iter_edges())
+    assert len(edges) == 2
+    assert {e.props["via_channel_id"] for e in edges} == {
+        "chan:kafka_topic:orders", "chan:kafka_topic:shipping",
+    }
+
+
+def test_next_segment_same_via_channel_replaces_on_full_pk(tmp_path):
+    """Companion to the coexistence test above: re-upserting the SAME (src,dst,type,
+    via_channel) key must still REPLACE (not duplicate) -- the PK widened by exactly
+    one column, it didn't stop being a real dedup key."""
+    st = Staging(tmp_path / "s.db")
+    e1 = EdgeRec("sym:a:`m`/f().", "sym:b:`m`/g().", "NEXT_SEGMENT", "derived", 0.9,
+                 "linking", props={"via_channel_id": "chan:kafka_topic:orders"})
+    e2 = EdgeRec("sym:a:`m`/f().", "sym:b:`m`/g().", "NEXT_SEGMENT", "derived", 0.42,
+                 "linking", props={"via_channel_id": "chan:kafka_topic:orders"})
+    st.upsert_edges([e1])
+    st.upsert_edges([e2])
+    edges = list(st.iter_edges())
+    assert len(edges) == 1 and edges[0].confidence == 0.42
+
+
+def test_edge_without_via_channel_id_still_dedups_as_before(tmp_path):
+    """Edges that never carry via_channel_id in props (the overwhelming majority of
+    types) get the column's DEFAULT '' on both writes -- PK behavior for them is
+    unchanged from v2's (src,dst,type)."""
+    st = Staging(tmp_path / "s.db")
+    e1 = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "PRODUCES", "static", 1.0, "kafka")
+    e2 = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "PRODUCES", "heuristic", 0.6, "kafka")
+    st.upsert_edges([e1])
+    st.upsert_edges([e2])
+    edges = list(st.iter_edges())
+    assert len(edges) == 1 and edges[0].resolution == "heuristic"
 
 
 def test_channel_endpoint_edge_no_cross_service_check(tmp_path):

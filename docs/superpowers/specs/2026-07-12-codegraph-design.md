@@ -110,6 +110,30 @@ ast-tree-multi/
 
 **Индексы FalkorDB** (`ddl.py`, до загрузки): range-индексы + UNIQUE-констрейнты на `Sym.id`, `Channel.id`, `Chunk.id`; range на `qualified_name`, `service`, `Channel.kind/.name`, `Chunk.symbol_id`. Vector: `CREATE VECTOR INDEX FOR (ch:Chunk) ON (ch.embedding) OPTIONS {dimension: $dim, similarityFunction: 'cosine'}` (probe: нет cosine → euclidean + L2-нормализация). Fulltext: `db.idx.fulltext.createNodeIndex('Chunk','text','context_header')` и `('Sym','name','qualified_name','docstring')`.
 
+## Нормативная таблица resolution/confidence
+
+Единый источник значений для `resolution`/`confidence` на каждом ребре (см. «Рёбра» выше): что означает каждое число и где в коде оно живёт. Сверено с кодом на M3 T1 — таблица производная от кода, не наоборот: при расхождении в будущем ревью правит таблицу под код, не код под таблицу.
+
+| Источник | resolution | confidence | file:line |
+|---|---|---|---|
+| `idiom_match` STATIC-ярус — qualified-имя (обычно через SCIP) совпало с паттерном | static | **1.0** | `extractors/idiom_match.py:40` |
+| `idiom_match` RECEIVER-ярус — `receiver.method(...)` + локальный `AssignFact` в том же файле | heuristic | **0.8** | `extractors/idiom_match.py:41` |
+| `idiom_match` IMPORT_NAME-ярус — файловая эвристика (импорт модуля/класса + совпадение имени вызова), без привязки к receiver — самый слабый ярус | heuristic | **0.6** | `extractors/idiom_match.py:42` |
+| `kafka_ext` — резолв канала `value` (литерал/константа) | = яруса выше, как есть | = яруса выше, как есть | `extractors/kafka_ext.py:160-163` |
+| `kafka_ext` — резолв канала `template`/`config_ref` (f-string, env-var) — downgrade БЕЗУСЛОВНО, даже если сам call матчился STATIC-ярусом | heuristic | **min(conf яруса, 0.6)** — потолок 0.6 | `extractors/kafka_ext.py:163` |
+| `http_client_ext` — f-string с ВЕДУЩЕЙ интерполяцией (`<base>`-маркер) — заякорен на `base_url` клиент-класса | static | **1.0** (через `http_routes._RESOLUTION_CONFIDENCE["static"]` при матче на роут) | `extractors/http_client_ext.py:166-167`; `linking/http_routes.py:50-51,116-118` |
+| `http_client_ext` — литеральная строка/const, начинается с `/` | static | **1.0** | `extractors/http_client_ext.py:171-172` |
+| `http_client_ext` — f-string БЕЗ ведущей интерполяции, но начинается с `/` (не привязан к `base_url`) | heuristic | **0.6** | `extractors/http_client_ext.py:168-169` |
+| `http_routes.link` — CALLS_HTTP резолвлен на роут; итоговый confidence зависит от claim'а `resolution_hint` (см. две строки `http_client_ext` выше) | static/heuristic (из claim'а) | **1.0 / 0.6** | `linking/http_routes.py:50-51,116-118` |
+| `http_routes.link` — CALLS_HTTP НЕ резолвлен (нет кандидата-роута; создаётся `Channel(unresolved=true)`) | heuristic | **0.5** — намеренно НИЖЕ любого резолвленного яруса (unresolved-матч слабее даже heuristic-резолвленного) | `linking/http_routes.py:50` |
+| `workspace._apply_temporal_start_marks` — `start_workflow(...)` CALLS-метка (`props.mechanism == "temporal_start"`) | **dynamic** (отдельное значение, не heuristic) | **0.9** — ниже 1.0 (вызов исполняет Temporal SDK, не этот процесс напрямую), выше heuristic-диапазона 0.5–0.8 (оба конца резолвлены точным symbol lookup, не структурной догадкой) | `linking/workspace.py:66` |
+| `segments.derive` — NEXT_SEGMENT (exact-channel И containment-пара — правило одинаковое для обеих) | static ТОЛЬКО если ОБА boundary-ребра static, иначе heuristic | **произведение** `producer_edge.confidence * consumer_edge.confidence`; confidence самого CONTAINS-ребра (containment-пара) в произведение НЕ входит | `linking/segments.py:53-54` (resolution); `linking/segments.py:61-64` (confidence) |
+| `query.traverse.trace_process` — агрегированный confidence всего трейса (derived-метрика поверх уже посчитанных, не своя resolution) | — | **min** по ВСЕМ пройденным рёбрам (steps + NEXT_SEGMENT-переходы за все сегменты); **1.0**, если рёбер не было (единственный узел, нечего оценивать) | `query/traverse.py:229` |
+
+**Расхождение kafka-template vs http-`<base>`-static (зафиксировано, НЕ исправляется в M3 T1):** `kafka_ext` ограничивает `template`/`config_ref`-резолвы confidence 0.6 БЕЗУСЛОВНО — `idiom_match` не несёт понятия «этот call-сайт принадлежит конкретному владельцу канала», паттерн матчится на уровне файла/receiver, без скоупа. `http_client_ext`, наоборот, присваивает `<base>`-заякоренному шаблону `static`/1.0, потому что вызов уже прошёл `file_glob`+`class_glob` скоуп `HttpClientIdiom` (мы УЖЕ уверены, что это метод класса, который idiom объявил конкретным HTTP-клиентом — см. `http_client_ext.py` модульный докстринг, абзац про `<base>`).
+
+**Правило на будущее** (для новых экстракторов и ревью существующих): шаблон с детерминированной подстановкой (f-string с интерполяцией) **внутри** отскоупленного контекста — класс/файл, который idiom уже однозначно связал с конкретным каналом/клиентом (пример: `HttpClientIdiom.class_glob`) — получает `static`. Тот же шаблон **вне** такого скоупа (общий call-site без структурной привязки к владельцу канала — сегодняшний `kafka_ext`) — `heuristic`, потолок 0.6. Текущее поведение kafka не противоречит правилу по злому умыслу: `ProducerIdiom`/`ConsumerIdiom` сегодня не несут понятия «класс = владелец канала» (в отличие от `HttpClientIdiom.class_glob`) — добавить такой скоуп (и тем самым разрешить kafka's `template` подниматься до `static`) — отдельное решение вне рамок этого таска.
+
 ## Пайплайн индексации (S1–S10)
 
 Артефакты в `.codegraph/` (staging.db, `scip/<svc>.scip`, report.json). Staging — служебный кэш: FalkorDB всегда пересоздаваем из него (`codegraph load --from-staging`) — снимает риск in-memory природы Redis.

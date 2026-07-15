@@ -8,8 +8,8 @@ from __future__ import annotations
 import pytest
 
 from codegraph.core.errors import InvariantError
-from codegraph.core.schema import NodeRec
-from codegraph.pipeline.load import _labels_for_kind, _node_props
+from codegraph.core.schema import EdgeRec, NodeRec
+from codegraph.pipeline.load import _edge_row, _key_props_for, _labels_for_kind, _node_props
 
 
 def test_code_kind_without_roles():
@@ -79,3 +79,45 @@ def test_node_props_omits_roles_key_for_channel_and_service_kinds():
     from codegraph.core.schema import make_service_node
 
     assert "roles" not in _node_props(make_service_node("svc"))
+
+
+# -- M3 T1: _edge_row/_key_props_for -- NEXT_SEGMENT's via_channel_id promoted to the
+# row's TOP level (alongside src/dst), since batch.upsert_edges' MERGE-key Cypher reads
+# key_props as r.<k>, not r.props.<k> (see stores/falkordb/batch.py's upsert_edges
+# docstring and core/schema.py's SCHEMA_VERSION "2 -> 3" history comment) --
+
+
+def test_key_props_for_next_segment_is_via_channel_id():
+    assert _key_props_for("NEXT_SEGMENT") == ("via_channel_id",)
+
+
+def test_key_props_for_other_types_is_empty():
+    assert _key_props_for("CALLS") == ()
+    assert _key_props_for("PRODUCES") == ()
+
+
+def test_edge_row_promotes_via_channel_id_to_top_level_for_next_segment():
+    e = EdgeRec(src="a", dst="b", type="NEXT_SEGMENT", resolution="derived", confidence=0.9,
+                extractor="linking",
+                props={"via_channel_id": "chan:kafka_topic:orders", "derived": True})
+    row = _edge_row(e)
+    assert row["src"] == "a" and row["dst"] == "b"
+    assert row["via_channel_id"] == "chan:kafka_topic:orders"
+    # still inside props too -- that's what SET e += r.props actually persists as a
+    # real graph edge property (the top-level copy only feeds the MERGE key).
+    assert row["props"]["via_channel_id"] == "chan:kafka_topic:orders"
+
+
+def test_edge_row_normalizes_missing_via_channel_id_to_empty_string():
+    e = EdgeRec(src="a", dst="b", type="NEXT_SEGMENT", resolution="derived", confidence=0.9,
+                extractor="linking")
+    row = _edge_row(e)
+    assert row["via_channel_id"] == ""
+
+
+def test_edge_row_other_types_get_no_via_channel_id_key_at_all():
+    e = EdgeRec(src="a", dst="b", type="CALLS", resolution="static", confidence=1.0,
+                extractor="calls")
+    row = _edge_row(e)
+    assert "via_channel_id" not in row
+    assert set(row) == {"src", "dst", "props"}

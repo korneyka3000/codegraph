@@ -23,7 +23,27 @@ from codegraph.core import ids
 #     independent of the edge's own endpoints (see Staging.upsert_edges/begin_service
 #     docstrings) -- plus a companion Staging.gc_orphan_channels() sweep for the
 #     orphaned Channel node itself, run at the end of link_workspace.
-SCHEMA_VERSION = 2
+#   2 -> 3 (M3 T1, mandatory M2-final-review carry-item): edges gains
+#     `via_channel TEXT NOT NULL DEFAULT ''`, folded into the PRIMARY KEY --
+#     PRIMARY KEY(src, dst, type, via_channel) instead of (src, dst, type).
+#     linking/segments.py can legitimately derive TWO NEXT_SEGMENT edges between the
+#     SAME (src, dst) pair when a producer reaches the same downstream node via two
+#     DIFFERENT channels (e.g. both a Kafka event AND a direct HTTP call fan out to the
+#     same handler) -- under the old 3-column PK those two edges collided on the same
+#     row and the second INSERT OR REPLACE silently clobbered the first, losing one
+#     via_channel_id's worth of segment topology with no error at all.
+#     Staging.upsert_edges derives via_channel from `props.get("via_channel_id", "")`
+#     (empty string for the overwhelming majority of edges that carry no
+#     via_channel_id at all -- their PK behavior is unchanged from v2). SQLite cannot
+#     ALTER a PRIMARY KEY in place, so this is a straight `CREATE TABLE IF NOT EXISTS`
+#     schema swap, not a live migration: there is no data-preserving upgrade path from
+#     a v2 (or earlier) staging.db. Opening one now is a LOUD failure --
+#     Staging._check_schema_version_before_ddl raises InvariantError, telling the
+#     caller to delete the file and re-run indexing from scratch (staging.db is a
+#     disposable derived cache, never a source of truth -- see that method's own
+#     docstring for why the version check must run BEFORE ensure_schema's DDL, not
+#     after, to guarantee this is the error an old file actually surfaces).
+SCHEMA_VERSION = 3
 NODE_KINDS = frozenset({
     "Service", "Module", "Class", "Function", "Channel", "BusinessProcess",
 })

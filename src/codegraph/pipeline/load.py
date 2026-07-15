@@ -103,6 +103,43 @@ def _edge_props(e: EdgeRec) -> dict:
     return _omit_none({**core, **e.props})
 
 
+# M3 T1: key_props per edge type -- passed through to store.upsert_edges (batch.py)
+# so its MERGE pattern includes these props in the relationship key, not just (src,dst).
+# NEXT_SEGMENT is the only type that currently needs one: linking/segments.py can derive
+# TWO NEXT_SEGMENT edges between the SAME (src,dst) pair when a producer reaches the same
+# downstream node via two DIFFERENT channels (see core/schema.py's SCHEMA_VERSION
+# "2 -> 3" history comment for the staging-side half of this same fix) -- without
+# via_channel_id in the graph MERGE key too, the second edge would silently overwrite the
+# first in FalkorDB even after staging correctly kept both rows. Every other edge type is
+# untouched (empty tuple, i.e. today's (src,dst)-only MERGE key, unchanged).
+_KEY_PROPS_BY_TYPE: dict[str, tuple[str, ...]] = {
+    "NEXT_SEGMENT": ("via_channel_id",),
+}
+
+
+def _key_props_for(edge_type: str) -> tuple[str, ...]:
+    return _KEY_PROPS_BY_TYPE.get(edge_type, ())
+
+
+def _edge_row(e: EdgeRec) -> dict:
+    """Row dict for store.upsert_edges: src/dst always, plus -- for a type listed in
+    _KEY_PROPS_BY_TYPE -- that type's key_props promoted to the row's TOP level (read
+    from e.props, defaulting absence to '' the same way staging.upsert_edges normalizes
+    the via_channel PK column, so a row's key_props value is always present, never
+    sometimes-missing). Top level, not just inside props, because batch.upsert_edges'
+    MERGE pattern reads key_props as `r.<k>` -- a plain dict key lookup, not a nested
+    r.props.<k> (see its own docstring). The value ALSO stays inside props (_edge_props
+    already puts it there via **e.props) completely unchanged -- `SET e += r.props` is
+    what actually persists it as a real, queryable graph edge property (e.g.
+    query/traverse.py's `_resolve_exits` reads via_channel_id off the edge's own
+    properties); the top-level copy exists ONLY to feed the MERGE key and is otherwise
+    redundant with what's already in props."""
+    row: dict = {"src": e.src, "dst": e.dst, "props": _edge_props(e)}
+    for key in _key_props_for(e.type):
+        row[key] = e.props.get(key, "")
+    return row
+
+
 def load_graph(
     staging: Staging,
     store_factory: Callable[[str], GraphStore],
@@ -137,13 +174,15 @@ def load_graph(
     # выше завершён до этой точки) --
     edges_by_type: dict[str, list[dict]] = defaultdict(list)
     for e in staging.iter_edges():
-        edges_by_type[e.type].append({"src": e.src, "dst": e.dst, "props": _edge_props(e)})
+        edges_by_type[e.type].append(_edge_row(e))
 
     edges_written = 0
     edges_written_by_type: dict[str, int] = {}
     edges_dropped_by_type: dict[str, int] = {}
     for edge_type, rows in edges_by_type.items():
-        written, dropped = build_store.upsert_edges(edge_type, rows, known_ids)
+        written, dropped = build_store.upsert_edges(
+            edge_type, rows, known_ids, key_props=_key_props_for(edge_type)
+        )
         edges_written += written
         edges_written_by_type[edge_type] = written
         edges_dropped_by_type[edge_type] = dropped

@@ -149,6 +149,61 @@ def test_neighbors_on_nonexistent_node_returns_empty(falkordb_cfg):
         _cleanup(falkordb_cfg, EMPTY)
 
 
+NEXT_SEGMENT_GRAPH = "__t3nextseg__"
+
+
+def test_upsert_edges_key_props_keeps_parallel_channel_next_segment_distinct_and_idempotent(
+    falkordb_cfg,
+):
+    """M3 T1 live proof: batch.upsert_edges' key_props widens the MERGE key beyond
+    (src,dst) for NEXT_SEGMENT (via_channel_id) -- two edges between the SAME (src,dst)
+    pair, reached via two DIFFERENT channels, must both persist as DISTINCT
+    relationships in FalkorDB (not one silently overwriting the other -- the old
+    (src,dst)-only MERGE key's failure mode, see core/schema.py's SCHEMA_VERSION
+    "2 -> 3" history comment for the staging-side half of the same fix), AND a repeat
+    upsert of the exact same rows must not duplicate them (still 2, not 4) -- true
+    MERGE-idempotency at the store level, not merely "load_graph's blue/green happens
+    to start from an empty build graph every run" (see test_pipeline_load.py for that
+    separate, higher-level proof)."""
+    store = FalkorStore(falkordb_cfg, NEXT_SEGMENT_GRAPH)
+    try:
+        store.ensure_schema()
+        node_a = {"id": "sym:t3ns:a", "props": {"kind": "Function", "name": "a"}}
+        node_b = {"id": "sym:t3ns:b", "props": {"kind": "Function", "name": "b"}}
+        store.upsert_nodes(("Sym", "Function"), [node_a, node_b])
+        known_ids = {node_a["id"], node_b["id"]}
+
+        rows = [
+            {"src": node_a["id"], "dst": node_b["id"],
+             "via_channel_id": "chan:kafka_topic:orders",
+             "props": {"via_channel_id": "chan:kafka_topic:orders"}},
+            {"src": node_a["id"], "dst": node_b["id"],
+             "via_channel_id": "chan:kafka_topic:shipping",
+             "props": {"via_channel_id": "chan:kafka_topic:shipping"}},
+        ]
+
+        written, dropped = store.upsert_edges(
+            "NEXT_SEGMENT", rows, known_ids, key_props=("via_channel_id",)
+        )
+        assert (written, dropped) == (2, 0)
+
+        hops = store.neighbors(node_a["id"], ["NEXT_SEGMENT"], "out", limit=10)
+        assert len(hops) == 2
+        via_ids = {h[1]["via_channel_id"] for h in hops}
+        assert via_ids == {"chan:kafka_topic:orders", "chan:kafka_topic:shipping"}
+
+        # Repeat upsert of the SAME rows -- MERGE must land back on the same two
+        # edges, not create two more.
+        written2, dropped2 = store.upsert_edges(
+            "NEXT_SEGMENT", rows, known_ids, key_props=("via_channel_id",)
+        )
+        assert (written2, dropped2) == (2, 0)
+        hops_again = store.neighbors(node_a["id"], ["NEXT_SEGMENT"], "out", limit=10)
+        assert len(hops_again) == 2
+    finally:
+        _cleanup(falkordb_cfg, NEXT_SEGMENT_GRAPH)
+
+
 EXISTS = "__t6exists__"
 
 

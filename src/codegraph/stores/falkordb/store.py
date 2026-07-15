@@ -85,9 +85,13 @@ class FalkorStore:
         return batch.upsert_nodes(self._g, labels, rows)
 
     def upsert_edges(
-        self, edge_type: str, rows: list[dict], known_ids: set[str]
+        self,
+        edge_type: str,
+        rows: list[dict],
+        known_ids: set[str],
+        key_props: tuple[str, ...] = (),
     ) -> tuple[int, int]:
-        return batch.upsert_edges(self._g, edge_type, rows, known_ids)
+        return batch.upsert_edges(self._g, edge_type, rows, known_ids, key_props=key_props)
 
     def get_nodes(self, ids: Sequence[str]) -> list[dict]:
         """`UNWIND $ids AS i MATCH (n {id: i}) RETURN n` -- id, отсутствующие в графе,

@@ -28,7 +28,11 @@ class GraphStore(Protocol):
     def upsert_nodes(self, labels: tuple[str, ...], rows: list[dict]) -> int: ...
 
     def upsert_edges(
-        self, edge_type: str, rows: list[dict], known_ids: set[str]
+        self,
+        edge_type: str,
+        rows: list[dict],
+        known_ids: set[str],
+        key_props: tuple[str, ...] = (),
     ) -> tuple[int, int]: ...
 
     def get_nodes(self, ids: Sequence[str]) -> list[dict]: ...

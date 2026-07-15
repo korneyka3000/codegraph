@@ -120,6 +120,15 @@ def found_edges(staging: Staging, types: set[str]) -> tuple[set[EdgeTuple], int]
     for e in staging.iter_edges():
         if e.type not in types:
             continue
+        if e.type == "CALLS" and "mechanism" in e.props:
+            # Symmetric with load_golden_edges' own CALLS mechanism-filter (mirrors
+            # calls_eval.load_golden_calls -- see this module's docstring): a
+            # mechanism-tagged CALLS edge (e.g. temporal_start, see
+            # linking/workspace.py's _apply_temporal_start_marks) is not a direct
+            # Python call golden ever records under plain CALLS, so the staged side
+            # must drop it too -- otherwise it would surface in `found` with nothing on
+            # the golden side to match, corrupting precision for no real reason.
+            continue
 
         if e.type == "HANDLES":
             handler = node_lookup.get(e.dst)

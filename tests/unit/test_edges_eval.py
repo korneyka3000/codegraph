@@ -288,6 +288,57 @@ def test_found_edges_filters_by_requested_types_excludes_from_edges_and_dangling
     assert dangling == 0
 
 
+# -- M3 T1: found_edges CALLS mechanism-filter (symmetry with load_golden_edges) --
+
+
+def test_found_edges_calls_mechanism_tagged_excluded_symmetric_with_golden(tmp_path):
+    # A staged CALLS edge carrying props.mechanism (e.g. temporal_start -- see
+    # linking/workspace.py's _apply_temporal_start_marks) is not a direct Python call;
+    # load_golden_edges already excludes the equivalent golden record for type==CALLS
+    # (module docstring / test_load_golden_edges_mechanism_filter_applies_only_to_calls)
+    # -- found_edges must mirror that exclusion on the staged side, or a temporal_start
+    # CALLS edge would show up in `found` with nothing on the golden side to match,
+    # silently corrupting precision for any CALLS-inclusive edges-eval comparison.
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("kyc-worker")
+    st.upsert_nodes([
+        _node("sym:kyc-worker:a", "kyc-worker", "app.consumers.orders.handle_order_created"),
+        _node("sym:kyc-worker:b", "kyc-worker", "app.workflows.kyc.KycWorkflow.run"),
+    ])
+    st.upsert_edges([
+        EdgeRec(src="sym:kyc-worker:a", dst="sym:kyc-worker:b", type="CALLS",
+                resolution="dynamic", confidence=0.9, extractor="linking",
+                props={"mechanism": "temporal_start"}),
+    ])
+
+    edges, dangling = found_edges(st, {"CALLS"})
+
+    # excluded by the mechanism filter, NOT by a dangling join miss (both ends resolve
+    # to real nodes -- if the filter didn't fire, this would be 1 edge / 0 dangling).
+    assert edges == set()
+    assert dangling == 0
+
+
+def test_found_edges_calls_without_mechanism_still_included(tmp_path):
+    # Regression guard: the filter must be scoped to mechanism-TAGGED CALLS only, not
+    # to CALLS as a type -- an ordinary first-party call still surfaces normally.
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("orders-api")
+    st.upsert_nodes([
+        _node("sym:orders-api:a", "orders-api", "app.routes.orders.create_order"),
+        _node("sym:orders-api:b", "orders-api", "app.services.order.OrderService"),
+    ])
+    st.upsert_edges([_edge("sym:orders-api:a", "sym:orders-api:b", "CALLS")])
+
+    edges, dangling = found_edges(st, {"CALLS"})
+
+    assert edges == {
+        ("CALLS", "orders-api", "app.routes.orders.create_order",
+         "orders-api", "app.services.order.OrderService"),
+    }
+    assert dangling == 0
+
+
 def test_found_edges_multiple_types_at_once(tmp_path):
     st = Staging(tmp_path / "s.db")
     st.begin_service("orders-api")

@@ -137,3 +137,42 @@ def test_upsert_edges_allows_new_m2_edge_types():
             g, edge_type, [{"src": "a", "dst": "b", "props": {}}], known_ids={"a", "b"}
         )
         assert (written, dropped) == (1, 0)
+
+
+# -- M3 T1: key_props -- MERGE key widened beyond (src,dst) for edge types that need a
+# distinct per-row disambiguator (NEXT_SEGMENT/via_channel_id -- see pipeline/load.py
+# and core/schema.py's SCHEMA_VERSION "2 -> 3" history comment for why one (src,dst)
+# pair can legitimately carry more than one edge of the same type). Default stays ()
+# -- every OTHER edge type's Cypher shape must not change at all.
+
+
+def test_upsert_edges_no_key_props_keeps_bare_merge_pattern():
+    g = FakeGraph()
+    upsert_edges(g, "CALLS", [{"src": "a", "dst": "b", "props": {}}], known_ids={"a", "b"})
+    assert "MERGE (a)-[e:CALLS]->(b) SET e += r.props" in g.calls[0][0]
+
+
+def test_upsert_edges_key_props_included_in_merge_pattern():
+    g = FakeGraph()
+    rows = [{"src": "a", "dst": "b", "via_channel_id": "chan:kafka_topic:orders",
+             "props": {"via_channel_id": "chan:kafka_topic:orders"}}]
+    written, dropped = upsert_edges(
+        g, "NEXT_SEGMENT", rows, known_ids={"a", "b"}, key_props=("via_channel_id",)
+    )
+    assert (written, dropped) == (1, 0)
+    cypher = g.calls[0][0]
+    assert (
+        "MERGE (a)-[e:NEXT_SEGMENT {via_channel_id: r.via_channel_id}]->(b) SET e += r.props"
+        in cypher
+    )
+
+
+def test_upsert_edges_key_props_name_validated():
+    g = FakeGraph()
+    rows = [{"src": "a", "dst": "b", "props": {}}]
+    with pytest.raises(InvariantError):
+        upsert_edges(
+            g, "NEXT_SEGMENT", rows, known_ids={"a", "b"},
+            key_props=("via_channel_id; DROP TABLE x --",),
+        )
+    assert g.calls == []  # validation happens before any query

@@ -66,12 +66,25 @@ class ProducerIdiom(_Strict):
 
 
 class ConsumerIdiom(_Strict):
+    """M3 T1 breaking change: `dict_assign` (an alternate dispatch_dict discovery
+    mechanism -- matching a module-level `EVENT_HANDLERS = {...}` dict ASSIGNMENT
+    instead of a registrar CALL site) has been REMOVED. It was accepted and validated
+    since M0 (kind="dispatch_dict" could be satisfied by either registrar_call OR
+    dict_assign) but never actually consumed -- kafka_ext.py's dispatch_dict handling
+    (`_extract_dispatch_dict_consumers`) has only ever matched on `idiom.registrar_call`
+    via `match_calls`; a config that set ONLY dict_assign validated successfully but
+    silently produced zero CONSUMES edges, a "validated dead path" flagged in M2's
+    progress.md backlog. dispatch_dict now requires registrar_call unconditionally --
+    a codegraph.yaml still specifying `dict_assign:` fails loading with pydantic's
+    extra="forbid" ValidationError (unknown field), a loud signal to migrate to
+    registrar_call, instead of the previous silent no-op coverage gap.
+    """
+
     name: str
     kind: Literal["call", "decorator", "dispatch_dict"]
     call: str | None = None
     decorator: str | None = None
     registrar_call: str | None = None
-    dict_assign: str | None = None
     topic: ValueSpec | None = None
     event_type_from: EventTypeFrom | None = None
 
@@ -80,7 +93,7 @@ class ConsumerIdiom(_Strict):
         required = {
             "call": ("call",),
             "decorator": ("decorator",),
-            "dispatch_dict": ("registrar_call", "dict_assign"),
+            "dispatch_dict": ("registrar_call",),
         }[self.kind]
         if not any(getattr(self, f) is not None for f in required):
             raise ValueError(f"consumer kind={self.kind} requires one of {required}")

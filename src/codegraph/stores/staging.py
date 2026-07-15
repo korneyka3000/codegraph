@@ -34,10 +34,11 @@ CREATE TABLE IF NOT EXISTS nodes(
   name TEXT, qualified_name TEXT, content_hash TEXT, props TEXT);
 CREATE INDEX IF NOT EXISTS idx_nodes_service ON nodes(service);
 CREATE TABLE IF NOT EXISTS edges(
-  src TEXT, dst TEXT, type TEXT, resolution TEXT, confidence REAL,
+  src TEXT, dst TEXT, type TEXT, via_channel TEXT NOT NULL DEFAULT '',
+  resolution TEXT, confidence REAL,
   extractor TEXT, evidence_file TEXT, evidence_line INTEGER, props TEXT,
   origin_service TEXT,
-  PRIMARY KEY(src, dst, type));
+  PRIMARY KEY(src, dst, type, via_channel));
 CREATE INDEX IF NOT EXISTS idx_edges_origin ON edges(origin_service);
 CREATE TABLE IF NOT EXISTS claims(
   service TEXT, relpath TEXT, kind TEXT, payload_json TEXT,
@@ -56,9 +57,18 @@ def _id_service(node_id: str) -> str | None:
 
 class Staging:
     def __init__(self, path: Path):
+        """Version-check ordering (M3 T1, mandatory M2-final-review carry-item):
+        `_check_schema_version_before_ddl` runs BEFORE `ensure_schema`'s DDL, not
+        after -- see that method's own docstring for the raw sqlite3.OperationalError
+        this order closes. `ensure_schema` + `_check_schema_version` (unchanged,
+        called in that order afterwards) still own the fresh-file path: a brand new
+        file has no meta table yet, so the before-DDL check is a deliberate no-op for
+        it (see its docstring), and `_check_schema_version` writes schema_version for
+        the first time once the DDL has actually created the meta table."""
         path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(path)
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._check_schema_version_before_ddl()
         self.ensure_schema()
         self._check_schema_version()
 
@@ -66,19 +76,51 @@ class Staging:
         self._db.executescript(_DDL)
         self._db.commit()
 
+    def _meta_table_exists(self) -> bool:
+        row = self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+        ).fetchone()
+        return row is not None
+
+    def _check_schema_version_before_ddl(self) -> None:
+        """Guards against `ensure_schema`'s DDL touching a PRE-EXISTING table whose
+        on-disk layout doesn't match SCHEMA_VERSION -- e.g. an index or column the
+        CURRENT schema references but an OLD file's table lacks would raise a raw
+        sqlite3.OperationalError from deep inside `executescript`, instead of the
+        actionable InvariantError below (the exact M2-final-review bug this closes:
+        "v1→v2 инвалидация падает сырым sqlite3.OperationalError"). Only fires when a
+        meta table ALREADY exists -- i.e. this is reopening a pre-existing staging.db,
+        not creating a brand new one: a genuinely fresh file has no meta table yet, so
+        querying it here (before `ensure_schema` has ever run) would itself raise "no
+        such table: meta" -- a naive unconditional version-check-first swap breaks
+        exactly this fresh-create path (see the test pinning it). `ensure_schema` +
+        `_check_schema_version` below already handle the fresh-file and
+        no-schema_version-key-yet cases correctly on their own; this method only ever
+        needs to RAISE, never to write -- mismatch here means stop before touching
+        anything else, no different DDL path to route to."""
+        if not self._meta_table_exists():
+            return
+        current = self.get_meta("schema_version")
+        if current is not None and current != str(SCHEMA_VERSION):
+            raise self._version_mismatch_error(current)
+
     def _check_schema_version(self) -> None:
         current = self.get_meta("schema_version")
         if current is None:
             self.set_meta("schema_version", str(SCHEMA_VERSION))
         elif current != str(SCHEMA_VERSION):
-            raise InvariantError(
-                f"schema_version mismatch: staging has {current!r}, expected "
-                f"{SCHEMA_VERSION!r} — the on-disk table layout changed (see "
-                "core/schema.py SCHEMA_VERSION's history comment for what and why) "
-                "and cannot be read forward; staging is a disposable derived cache, "
-                "not a source of truth — recreate it (delete the file and re-run "
-                "indexing from scratch)"
-            )
+            raise self._version_mismatch_error(current)
+
+    @staticmethod
+    def _version_mismatch_error(current: str) -> InvariantError:
+        return InvariantError(
+            f"schema_version mismatch: staging has {current!r}, expected "
+            f"{SCHEMA_VERSION!r} — the on-disk table layout changed (see "
+            "core/schema.py SCHEMA_VERSION's history comment for what and why) "
+            "and cannot be read forward; staging is a disposable derived cache, "
+            "not a source of truth — recreate it (delete the file and re-run "
+            "indexing from scratch)"
+        )
 
     def close(self) -> None:
         self._db.close()
@@ -251,11 +293,19 @@ class Staging:
                     raise InvariantError(
                         f"cross-service edge forbidden: {e.src} -{e.type}-> {e.dst}"
                     )
-            prepared.append((e.src, e.dst, e.type, e.resolution, e.confidence,
+            # M3 T1: via_channel -- PK column, not just a props entry (see
+            # core/schema.py SCHEMA_VERSION history comment "2 -> 3"). Extracted from
+            # props rather than a dedicated EdgeRec field: via_channel_id already lived
+            # in props (segments.py's own `_next_segment_edge`), and every OTHER edge
+            # type simply has no such prop -- defaulting to '' there reproduces the old
+            # (src,dst,type) dedup behavior for the overwhelming majority of edges
+            # unchanged.
+            via_channel = e.props.get("via_channel_id", "")
+            prepared.append((e.src, e.dst, e.type, via_channel, e.resolution, e.confidence,
                              e.extractor, e.evidence_file, e.evidence_line,
                              json.dumps(e.props), origin_service))
         self._db.executemany(
-            "INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?)", prepared
+            "INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?)", prepared
         )
         self._db.commit()
 
