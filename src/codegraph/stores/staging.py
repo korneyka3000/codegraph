@@ -86,24 +86,25 @@ CREATE TABLE IF NOT EXISTS chunks(
          AND (embedding IS NULL) = (embedded_hash IS NULL)));
 CREATE INDEX IF NOT EXISTS idx_chunks_service ON chunks(service);
 """
-# M3 T3: `chunks` is a BRAND NEW table, not a reshape of an existing v3 one -- unlike
-# the 2 -> 3 edges-PK migration (core/schema.py's SCHEMA_VERSION history comment),
-# `CREATE TABLE IF NOT EXISTS` for a name no pre-T3 v3 staging.db could already have is
-# purely additive: reopening an old v3 file just gains the chunks table with no version
-# bump and no InvariantError guard needed (there is no old-shaped "chunks" table it
-# could collide with). SCHEMA_VERSION stays 3.
+# M3 T3 (history): `chunks` arrived as a BRAND NEW table -- unlike the 2 -> 3
+# edges-PK migration, `CREATE TABLE IF NOT EXISTS` for a name no pre-T3 v3 staging.db
+# could already have was purely additive, so SCHEMA_VERSION stayed 3 AT THE TIME (and
+# through T4/T5: the table's original T3 DDL already included context_header/
+# embedding/embed_model -- T4 only ever wrote INTO context_header, it never changed
+# this DDL).
 #
-# M3 T4 added `context_header` this same way (a plain column addition to _DDL, no
-# version bump) -- M3 T6 now adds `embedded_hash` (cache-hardening carry from the T3
-# review, see ChunkRow's own docstring) the identical way: `CREATE TABLE IF NOT EXISTS`
-# is a no-op against a staging.db that ALREADY has a `chunks` table from a pre-T6 run
-# (T3 or T4 shaped, missing this column) -- reopening one and hitting any of the new
-# embedded_hash-referencing code below would raise a raw sqlite3.OperationalError ("no
-# such column"), not a version-mismatch InvariantError. Same accepted-tradeoff as T4's
-# own column addition: staging.db is a disposable derived cache during active M3
-# development (no external consumers depend on an existing file's exact shape yet) --
-# delete-and-recreate is the expected fix, not a new migration mechanism for every
-# single mid-milestone column tweak.
+# M3 T6: adds `embedded_hash` + the NULL-together CHECK constraint above -- and
+# UNLIKE T3's from-scratch creation, this IS a real reshape of a table every v3
+# staging.db already has and populated. That is exactly what the SCHEMA_VERSION 3 -> 4
+# bump exists for (core/schema.py's "3 -> 4" history entry): reopening a pre-T6 (v3)
+# file fails LOUDLY in Staging.__init__ -- `_check_schema_version_before_ddl` reads
+# the file's stored schema_version ("3"), sees the mismatch with SCHEMA_VERSION (4),
+# and raises InvariantError BEFORE this _DDL (or any embedded_hash-referencing query
+# below) ever runs -- never a raw sqlite3.OperationalError. The error message's
+# "recreate" instruction is the intended REMEDY (staging.db is a disposable derived
+# cache; no data-preserving upgrade path is written for it), not an absence of a
+# migration mechanism -- the version check IS the mechanism, and it works (pinned by
+# tests/unit/test_staging.py's v2- and v3-shaped-database tests).
 
 
 def _id_service(node_id: str) -> str | None:

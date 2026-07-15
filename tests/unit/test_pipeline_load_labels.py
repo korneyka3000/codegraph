@@ -221,6 +221,9 @@ def test_chunk_node_batches_routes_dim_mismatch_to_without_vector(tmp_path):
     assert len(without_vector) == 1
     assert without_vector[0]["id"] == "c#c0"
     assert "embedding" not in without_vector[0]
+    # a Chunk advertising an embed_model whose embedding it doesn't carry is the same
+    # inconsistency at property granularity -- stripped along with the vector.
+    assert "embed_model" not in without_vector[0]["props"]
 
 
 def test_chunk_node_batches_matching_dim_goes_to_with_vector(tmp_path):
@@ -231,14 +234,23 @@ def test_chunk_node_batches_matching_dim_goes_to_with_vector(tmp_path):
     assert without_vector == []
     assert len(with_vector) == 1
     assert with_vector[0]["embedding"] == pytest.approx([1.0, 2.0, 3.0])
+    assert with_vector[0]["props"]["embed_model"] == "model-a"  # kept when vector is kept
 
 
-def test_chunk_node_batches_no_dim_given_skips_the_check(tmp_path):
-    """dim=None (the default -- e.g. no embedder ever ran workspace-wide, see
-    _embed_meta) means "no dimension to check against", not "reject everything"."""
+def test_chunk_node_batches_dim_none_routes_stale_embedding_to_without_vector(tmp_path):
+    """Coordinator fix (reviewer-reproduced leak): dim=None means this run had NO
+    working embedder -- ensure_schema created NO vector index and Meta carries NO
+    embed_model -- so a STALE embedding blob surviving in staging from a PRIOR run
+    (upsert_chunks' ON-CONFLICT contract deliberately preserves it) must NOT leak into
+    the vecf32 batch. The pre-fix guard (`dim is not None and len != dim`) waved it
+    straight through, producing a Chunk carrying embedding+embed_model in a graph
+    whose Meta advertises no model and which has no vector index at all."""
     st = _staged_chunk_with_embedding(tmp_path, [1.0, 2.0, 3.0])
 
     with_vector, without_vector = _chunk_node_batches(st)  # dim defaults to None
 
-    assert without_vector == []
-    assert len(with_vector) == 1
+    assert with_vector == []
+    assert len(without_vector) == 1
+    assert without_vector[0]["id"] == "c#c0"
+    assert "embedding" not in without_vector[0]
+    assert "embed_model" not in without_vector[0]["props"]

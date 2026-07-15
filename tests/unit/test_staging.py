@@ -169,6 +169,33 @@ def test_v2_like_database_raises_invariant_error_not_operational_error(tmp_path)
     assert not isinstance(exc_info.value, sqlite3.OperationalError)
 
 
+def test_v3_pre_t6_database_raises_invariant_error_not_operational_error(tmp_path):
+    """M3 T6's own 3 -> 4 bump, pinned specifically (coordinator fix -- the _DDL
+    comment block cites this test): a v3-shaped staging.db (pre-T6: `chunks` exists
+    but has no `embedded_hash` column and no CHECK constraint) must fail with the
+    loud, actionable InvariantError at Staging() construction -- via the
+    version-check-BEFORE-DDL path -- never by letting any embedded_hash-referencing
+    SQL reach the old table and raise a raw sqlite3.OperationalError ("no such
+    column")."""
+    path = tmp_path / "v3.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    raw.execute("INSERT INTO meta VALUES ('schema_version', '3')")
+    # the v3-era chunks table shape (per T3's original DDL -- no embedded_hash, no
+    # CHECK), so an unguarded embedded_hash query genuinely WOULD OperationalError
+    raw.execute(
+        "CREATE TABLE chunks(chunk_id TEXT PRIMARY KEY, symbol_id TEXT, service TEXT, "
+        "relpath TEXT, ord INTEGER, text TEXT, start_line INTEGER, end_line INTEGER, "
+        "content_hash TEXT, context_header TEXT, embedding BLOB, embed_model TEXT)"
+    )
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(InvariantError, match="recreate") as exc_info:
+        Staging(path)
+    assert not isinstance(exc_info.value, sqlite3.OperationalError)
+
+
 def test_fresh_staging_path_still_initializes_after_version_check_reorder(tmp_path):
     """The fresh-create path (no pre-existing file, no meta table at all) must keep
     working after the version-check-before-DDL reorder above -- pins the exact failure

@@ -232,40 +232,69 @@ def _chunk_node_batches(
     one, is the load-bearing design choice here (`vecf32(NULL)` is a hard FalkorDB
     error).
 
-    `dim`, if given (the SAME dimension `ensure_schema` just sized the vector index
-    to, from `_embed_meta`), gates each embedded row's DECODED vector length: a chunk
-    whose stored embedding is a DIFFERENT length gets routed to `without_vector`
-    instead (with a warning logged HERE, naming the actual cause), rather than being
-    silently dropped later by `batch.upsert_nodes`' own per-row bisection-and-skip
-    safety net -- which would also catch a real FalkorDB-side vecf32 dimension error,
-    but only after the fact, with no context tying the warning back to "this chunk's
-    embedding doesn't match the index". Not reachable via the single real production
-    path today (every chunk committed by ONE `chunk_embed.run` call shares the SAME
-    embedder, hence the SAME dimension) -- but `staging.db` persists across separate
-    `codegraph index`/`codegraph load` invocations, and a run that changes
-    `embedding.model` (a different dimension) could plausibly be interrupted between
-    committing some chunks' new-dimension embeddings and this same run's own
-    `chunk_embed.run` finishing (`set_meta("embed_dim", ...)` is the very last thing it
-    does) -- a defensive check here costs little and turns a possible silent per-row
-    drop into a diagnosable warning."""
+    `dim` is the SAME dimension `ensure_schema` just sized the vector index to (from
+    `_embed_meta`), and it gates embedded rows in BOTH directions:
+
+    - `dim is None` (this run had NO working embedder -- degradation path/`--no-embed`
+      -- so `ensure_schema` created NO vector index and Meta carries NO embed_model):
+      EVERY row goes to `without_vector`, even one whose staging row still holds an
+      embedding blob. Such stale blobs genuinely exist on this path (reviewer-
+      reproduced, M3 T6 coordinator fix): a PRIOR run embedded the workspace, then a
+      LATER run against the SAME staging.db degrades to embedder=None --
+      `chunk_embed.run` correctly clears the workspace embed_model/dim meta, but
+      `upsert_chunks`' ON-CONFLICT contract deliberately preserves each unchanged
+      chunk's embedding column (that preservation is what lets a THIRD run, embedder
+      restored, reuse them all -- embedded==0). The pre-fix guard (`dim is not None
+      and len != dim`) waved those stale blobs straight into the vecf32 batch,
+      producing Chunk nodes carrying embedding+embed_model while Meta advertises no
+      model and no vector index exists -- an inconsistent graph. Stale-skipped rows
+      also get `embed_model` dropped from their props (a Chunk advertising a model
+      whose embedding it doesn't carry is the same inconsistency at property
+      granularity); ONE summary warning is logged, not one per chunk.
+    - `dim` given: a row whose DECODED vector length differs is routed to
+      `without_vector` (per-row warning naming the actual cause, plus the same
+      embed_model drop), rather than being silently dropped later by
+      `batch.upsert_nodes`' own per-row bisection-and-skip safety net -- which would
+      also catch a real FalkorDB-side vecf32 dimension error, but only after the
+      fact, with no context tying it back to "this chunk's embedding doesn't match
+      the index". Not reachable via the single real production path today (every
+      chunk committed by ONE `chunk_embed.run` call shares the SAME embedder, hence
+      the SAME dimension) -- but `staging.db` persists across separate `codegraph
+      index`/`codegraph load` invocations, and an embedding.model switch interrupted
+      mid-run could leave mixed-dimension rows behind."""
     with_vector: list[dict] = []
     without_vector: list[dict] = []
+    stale_skipped = 0
     for row in staging.iter_chunks():
         entry = {"id": row.chunk_id, "props": _chunk_props(row)}
         if row.embedding is None:
             without_vector.append(entry)
             continue
+        if dim is None:
+            entry["props"].pop("embed_model", None)
+            stale_skipped += 1
+            without_vector.append(entry)
+            continue
         vector = unpack_vector(row.embedding)
-        if dim is not None and len(vector) != dim:
+        if len(vector) != dim:
             logger.warning(
                 "chunk %s has a %d-dim embedding but the vector index is %d-dim "
                 "(stale/mismatched staging.db?) -- loading without a vector",
                 row.chunk_id, len(vector), dim,
             )
+            entry["props"].pop("embed_model", None)
             without_vector.append(entry)
         else:
             entry["embedding"] = vector
             with_vector.append(entry)
+    if stale_skipped:
+        logger.warning(
+            "%d chunk(s) carry embeddings from a prior run, but this run has no "
+            "embedder (no vector index, Meta has no embed_model) -- loading them "
+            "without vectors; a later run with the embedder restored will reuse the "
+            "staged embeddings as-is",
+            stale_skipped,
+        )
     return with_vector, without_vector
 
 
