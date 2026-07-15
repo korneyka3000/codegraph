@@ -120,7 +120,9 @@ def link_workspace(cfg: WorkspaceConfig, staging: Staging) -> dict:
     """S7 entry point. staging-only (no FalkorDB access) -- callers don't need a
     store-unavailability guard around this call. Returns a JSON-serializable counters
     dict: {calls_http, calls_http_unresolved, next_segments, processes, marks,
-    channels_gc}."""
+    channels_gc, part_of_process_ambiguous}. The last (M3 T2) is
+    processes.materialize's own `_entry_of`-climb ambiguity count, passed through
+    unchanged -- see linking/processes.py's module docstring for what it means."""
     staging.clear_workspace_layer()
     channels_gc = staging.gc_orphan_channels()
     marks = _apply_temporal_start_marks(staging)
@@ -134,4 +136,5 @@ def link_workspace(cfg: WorkspaceConfig, staging: Staging) -> dict:
         "processes": process_stats["processes"],
         "marks": marks,
         "channels_gc": channels_gc,
+        "part_of_process_ambiguous": process_stats["part_of_process_ambiguous"],
     }

@@ -263,5 +263,32 @@ def test_link_workspace_returns_all_expected_counter_keys(tmp_path):
     report = link_workspace(_cfg(), st)
     assert report.keys() == {
         "calls_http", "calls_http_unresolved", "next_segments", "processes", "marks",
-        "channels_gc",
+        "channels_gc", "part_of_process_ambiguous",
     }
+
+
+def test_link_workspace_propagates_part_of_process_ambiguous_count(tmp_path):
+    """M3 T2: processes.materialize's ambiguous-climb counter (see
+    linking/processes.py's `_entry_of` docstring) must survive the trip through
+    link_workspace's own returned dict, not just materialize's own -- this is what
+    `codegraph index`'s report actually surfaces to a controller."""
+    st = Staging(tmp_path / "s.db")
+    chan = make_channel_node("http_route", owner_service="orders-api", method="POST",
+                              template="/orders", http_method="POST", path_template="/orders")
+    entry = _fn("sym:orders-api:entry", "orders-api", "entry", "q.entry")
+    caller_a = _fn("sym:orders-api:caller-a", "orders-api", "caller-a", "q.caller-a")
+    caller_b = _fn("sym:orders-api:caller-b", "orders-api", "caller-b", "q.caller-b")
+    producer = _fn("sym:orders-api:producer", "orders-api", "producer", "q.producer")
+    consumer = _fn("sym:kyc-worker:consumer", "kyc-worker", "consumer", "q.consumer")
+    st.upsert_nodes([chan, entry, caller_a, caller_b, producer, consumer])
+    st.upsert_edges([
+        _edge(chan.id, entry.id, "HANDLES", extractor="fastapi"),
+        _edge(caller_a.id, producer.id, "CALLS", extractor="calls"),
+        _edge(caller_b.id, producer.id, "CALLS", extractor="calls"),
+        _edge(producer.id, consumer.id, "NEXT_SEGMENT", via_channel_id="chan:x", derived=True),
+    ])
+
+    cfg = _cfg(ProcessDecl(name="Ambiguous flow", entrypoint="orders-api:POST /orders"))
+    report = link_workspace(cfg, st)
+
+    assert report["part_of_process_ambiguous"] == 1

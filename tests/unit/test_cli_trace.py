@@ -1,10 +1,17 @@
-"""CLI `codegraph trace` (M2 T8): CliRunner + monkeypatch codegraph.cli.resolve_selector
-(selector -> entrypoint id, bypassing a real Staging scan) and codegraph.cli.GraphQuery
-(fake trace_process, bypassing real FalkorDB) -- no live store, no SCIP (that's
-tests/eval's M2 gate, marker scip+falkordb). Only codegraph.cli.resolve_selector/
-GraphQuery are monkeypatched by NAME (not via codegraph.linking.processes/
-codegraph.query.api) -- see cli.py's own module docstring on why: patching must target
-the name as resolved from cli.py's global namespace at call time."""
+"""CLI `codegraph trace` (M2 T8; M3 T2 rework): CliRunner + monkeypatch
+codegraph.cli.GraphQuery (fake resolve_selector + trace_process, bypassing real
+FalkorDB) -- no live store, no SCIP (that's tests/eval's gate, marker scip+falkordb).
+Only codegraph.cli.GraphQuery is monkeypatched by NAME (not via codegraph.query.api)
+-- see cli.py's own module docstring on why: patching must target the name as
+resolved from cli.py's global namespace at call time.
+
+M3 T2: `trace` no longer touches Staging/staging.db AT ALL -- selector resolution
+moved from linking.processes.resolve_selector (staging-side) to
+query.api.GraphQuery.resolve_selector (graph-side), closing the M2 final review
+carry-item that `codegraph trace` hard-required a prior `codegraph index` run's
+staging.db on disk purely to resolve the selector string, even though the trace walk
+itself was always graph-only. See test_trace_works_without_a_staging_db below --
+the regression anchor for that fix."""
 
 from __future__ import annotations
 
@@ -13,7 +20,6 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from codegraph.cli import _node_label, app
-from codegraph.stores.staging import Staging
 
 runner = CliRunner()
 
@@ -48,12 +54,6 @@ def _write_workspace(tmp_path: Path, graph_name: str = "wsgraph") -> Path:
         f"version: 1\ngraph_name: {graph_name}\nservices:\n  - name: svc0\n    path: ./svc0\n"
     )
     return root
-
-
-def _with_staging(root: Path) -> Path:
-    staging_path = root / ".codegraph" / "staging.db"
-    Staging(staging_path).close()
-    return staging_path
 
 
 _SUCCESS_RESULT = {
@@ -91,23 +91,34 @@ _SUCCESS_RESULT = {
 }
 
 
-def _fake_graph_query(result: dict):
+def _fake_graph_query(
+    trace_result: dict, resolve_result: dict | None = None, resolve_calls: list | None = None,
+    trace_calls: list | None = None,
+):
+    """Fake replacing codegraph.cli.GraphQuery: resolve_selector returns
+    `resolve_result` (default: a successful resolve to node id "e1", matching
+    `_SUCCESS_RESULT`'s own entry id), trace_process returns `trace_result` unchanged.
+    `resolve_calls`/`trace_calls`, if given, record every call's argument (spy) --
+    used to prove trace_process is skipped when resolve_selector errors."""
+    if resolve_result is None:
+        resolve_result = {"node_id": "e1"}
+
     class _FakeGraphQuery:
         def __init__(self, store_factory, service_paths):
             self.store_factory = store_factory
             self.service_paths = service_paths
 
+        def resolve_selector(self, selector):
+            if resolve_calls is not None:
+                resolve_calls.append(selector)
+            return resolve_result
+
         def trace_process(self, entrypoint_id, **kwargs):
-            return result
+            if trace_calls is not None:
+                trace_calls.append(entrypoint_id)
+            return trace_result
 
     return _FakeGraphQuery
-
-
-def _fake_resolve_selector(entrypoint_id: str | None):
-    def fn(staging, selector):
-        return entrypoint_id
-
-    return fn
 
 
 # -- text format (default) --
@@ -115,8 +126,6 @@ def _fake_resolve_selector(entrypoint_id: str | None):
 
 def test_trace_text_format_prints_segment_chain(tmp_path, monkeypatch):
     root = _write_workspace(tmp_path)
-    _with_staging(root)
-    monkeypatch.setattr("codegraph.cli.resolve_selector", _fake_resolve_selector("e1"))
     monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_SUCCESS_RESULT))
 
     result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
@@ -131,8 +140,6 @@ def test_trace_text_format_prints_segment_chain(tmp_path, monkeypatch):
 
 def test_trace_text_is_default_format(tmp_path, monkeypatch):
     root = _write_workspace(tmp_path)
-    _with_staging(root)
-    monkeypatch.setattr("codegraph.cli.resolve_selector", _fake_resolve_selector("e1"))
     monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_SUCCESS_RESULT))
 
     result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
@@ -145,8 +152,6 @@ def test_trace_text_is_default_format(tmp_path, monkeypatch):
 
 def test_trace_mermaid_format_prints_valid_flowchart(tmp_path, monkeypatch):
     root = _write_workspace(tmp_path)
-    _with_staging(root)
-    monkeypatch.setattr("codegraph.cli.resolve_selector", _fake_resolve_selector("e1"))
     monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_SUCCESS_RESULT))
 
     result = runner.invoke(
@@ -163,8 +168,6 @@ def test_trace_mermaid_format_prints_valid_flowchart(tmp_path, monkeypatch):
 
 def test_trace_invalid_format_is_red_error_exit_1(tmp_path, monkeypatch):
     root = _write_workspace(tmp_path)
-    _with_staging(root)
-    monkeypatch.setattr("codegraph.cli.resolve_selector", _fake_resolve_selector("e1"))
     monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_SUCCESS_RESULT))
 
     result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root), "--format", "yaml"])
@@ -201,8 +204,6 @@ def test_trace_mermaid_escapes_quotes_and_pipes_in_labels(tmp_path, monkeypatch)
         "truncated": False,
     }
     root = _write_workspace(tmp_path)
-    _with_staging(root)
-    monkeypatch.setattr("codegraph.cli.resolve_selector", _fake_resolve_selector("e1"))
     monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(crafted))
 
     result = runner.invoke(
@@ -215,31 +216,31 @@ def test_trace_mermaid_escapes_quotes_and_pipes_in_labels(tmp_path, monkeypatch)
     assert 'Order|Created"x' not in result.output  # no raw pipe/quote in the edge label
 
 
-# -- not-found entrypoint --
+# -- not-found entrypoint (resolve_selector returns an error dict) --
 
 
 def test_trace_entrypoint_not_found_is_red_error_exit_1(tmp_path, monkeypatch):
     root = _write_workspace(tmp_path)
-    _with_staging(root)
-    monkeypatch.setattr("codegraph.cli.resolve_selector", _fake_resolve_selector(None))
-    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_SUCCESS_RESULT))
+    not_found = {"error": "entrypoint not found for selector: orders-api:POST /nope"}
+    trace_calls: list = []
+    monkeypatch.setattr(
+        "codegraph.cli.GraphQuery",
+        _fake_graph_query(_SUCCESS_RESULT, resolve_result=not_found, trace_calls=trace_calls),
+    )
 
     result = runner.invoke(app, ["trace", "orders-api:POST /nope", str(root)])
     assert result.exit_code == 1
     assert "not found" in result.output.lower()
     assert "orders-api:POST /nope" in result.output
     assert "Traceback" not in result.output
+    assert trace_calls == []  # trace_process must never be called once resolve fails
 
 
-# -- trace_process itself returns an error dict (e.g. store unreachable) --
-
-
-def test_trace_process_error_dict_is_red_error_exit_1(tmp_path, monkeypatch):
+def test_trace_resolve_selector_store_unreachable_is_red_error_exit_1(tmp_path, monkeypatch):
     root = _write_workspace(tmp_path)
-    _with_staging(root)
-    monkeypatch.setattr("codegraph.cli.resolve_selector", _fake_resolve_selector("e1"))
+    unreachable = {"error": "falkordb unreachable: connection refused"}
     monkeypatch.setattr(
-        "codegraph.cli.GraphQuery", _fake_graph_query({"error": "falkordb unreachable: boom"})
+        "codegraph.cli.GraphQuery", _fake_graph_query(_SUCCESS_RESULT, resolve_result=unreachable)
     )
 
     result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
@@ -248,12 +249,38 @@ def test_trace_process_error_dict_is_red_error_exit_1(tmp_path, monkeypatch):
     assert "Traceback" not in result.output
 
 
-# -- missing staging DB --
+# -- trace_process itself returns an error dict (e.g. store unreachable) --
 
 
-def test_trace_missing_staging_db_is_red_error_exit_1(tmp_path):
-    root = _write_workspace(tmp_path)  # no staging.db ever created
+def test_trace_process_error_dict_is_red_error_exit_1(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr(
+        "codegraph.cli.GraphQuery",
+        _fake_graph_query({"error": "falkordb unreachable: boom"}),
+    )
+
     result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
     assert result.exit_code == 1
-    assert "staging" in result.output.lower()
+    assert "falkordb unreachable" in result.output
     assert "Traceback" not in result.output
+
+
+# -- M3 T2 regression: trace no longer requires a staging.db at all --
+
+
+def test_trace_works_without_a_staging_db(tmp_path, monkeypatch):
+    """M2 final review carry-item, closed by M3 T2: `codegraph trace` used to require
+    `.codegraph/staging.db` from a prior `codegraph index` run purely to resolve the
+    selector string (linking.processes.resolve_selector, staging-side), even though
+    the actual trace walk was always graph-only. Selector resolution now goes through
+    query.api.GraphQuery.resolve_selector (graph-side) -- trace must succeed even when
+    `.codegraph/` doesn't exist at all."""
+    root = _write_workspace(tmp_path)  # no .codegraph/ directory, no staging.db, ever
+    assert not (root / ".codegraph").exists()
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_SUCCESS_RESULT))
+
+    result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "create_order" in result.output
+    assert not (root / ".codegraph").exists()  # trace still didn't create one

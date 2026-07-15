@@ -73,6 +73,16 @@ class FakeStore:
         self.fulltext_calls.append((query, k, kinds))
         return self.fulltext_result
 
+    def find_by_qualified(self, service, qualified):
+        if self.raise_error:
+            raise self.raise_error
+        matches = sorted(
+            (n for n in self.nodes.values()
+             if n.get("service") == service and n.get("qualified_name") == qualified),
+            key=lambda n: n.get("id") or "",
+        )
+        return matches[0] if matches else None
+
 
 def _factory(store: FakeStore, calls: list[FakeStore] | None = None):
     """store_factory-стаб: всегда отдаёт один и тот же fake (adjacency настраивается
@@ -715,6 +725,118 @@ def test_find_entrypoint_empty_result_is_not_an_error():
     q = GraphQuery(_factory(store), {})
     result = q.find_entrypoint("gibberish query with no matches")
     assert result == {"results": []}
+
+
+# -- M3 T2: resolve_selector -- graph-side selector resolution (no staging.db needed,
+# see cli.py's `trace` command): route-form via Channel(http_route) props + HANDLES,
+# qualified-form via store.find_by_qualified. --
+
+
+def _add_http_route_channel(
+    store: FakeStore, chan_id: str, owner_service: str, method: str, path: str,
+) -> None:
+    store.add_node(
+        chan_id, kind="Channel", channel_kind="http_route",
+        owner_service=owner_service, http_method=method, path_template=path,
+    )
+
+
+def test_resolve_selector_route_form_resolves_channel_handles_to_handler():
+    store = FakeStore()
+    _add_http_route_channel(store, "chan:http:orders-api:POST /orders", "orders-api", "POST",
+                             "/orders")
+    store.add_node("sym:orders-api:create_order", kind="Function", name="create_order")
+    store.add_edge("chan:http:orders-api:POST /orders", "HANDLES", "sym:orders-api:create_order")
+
+    q = GraphQuery(_factory(store), {})
+    result = q.resolve_selector("orders-api:POST /orders")
+
+    assert result == {"node_id": "sym:orders-api:create_order"}
+
+
+def test_resolve_selector_route_form_ignores_channels_for_other_services_or_methods():
+    store = FakeStore()
+    _add_http_route_channel(store, "chan:http:orders-api:POST /orders", "orders-api", "POST",
+                             "/orders")
+    _add_http_route_channel(store, "chan:http:orders-api:GET /orders", "orders-api", "GET",
+                             "/orders")
+    _add_http_route_channel(store, "chan:http:other-svc:POST /orders", "other-svc", "POST",
+                             "/orders")
+    store.add_node("sym:orders-api:create_order", kind="Function", name="create_order")
+    store.add_edge("chan:http:orders-api:POST /orders", "HANDLES", "sym:orders-api:create_order")
+
+    q = GraphQuery(_factory(store), {})
+    result = q.resolve_selector("orders-api:POST /orders")
+
+    assert result == {"node_id": "sym:orders-api:create_order"}
+
+
+def test_resolve_selector_route_form_channel_with_no_handles_edge_is_not_found():
+    store = FakeStore()
+    _add_http_route_channel(store, "chan:http:orders-api:POST /orders", "orders-api", "POST",
+                             "/orders")
+    q = GraphQuery(_factory(store), {})
+    result = q.resolve_selector("orders-api:POST /orders")
+    assert "error" in result
+    assert "not found" in result["error"].lower()
+
+
+def test_resolve_selector_route_form_no_matching_channel_returns_not_found_error():
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    result = q.resolve_selector("orders-api:POST /missing")
+    assert "error" in result
+    assert "orders-api:POST /missing" in result["error"]
+
+
+def test_resolve_selector_qualified_form_delegates_to_find_by_qualified():
+    store = FakeStore()
+    store.add_node("sym:kyc-worker:KycWorkflow", kind="Class", service="kyc-worker",
+                    qualified_name="app.workflows.kyc.KycWorkflow")
+    q = GraphQuery(_factory(store), {})
+    result = q.resolve_selector("kyc-worker:app.workflows.kyc.KycWorkflow")
+    assert result == {"node_id": "sym:kyc-worker:KycWorkflow"}
+
+
+def test_resolve_selector_qualified_form_unresolved_returns_not_found_error():
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    result = q.resolve_selector("kyc-worker:app.nope.Nothing")
+    assert "error" in result
+    assert "kyc-worker:app.nope.Nothing" in result["error"]
+
+
+def test_resolve_selector_malformed_selector_without_colon_is_not_found_error():
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    result = q.resolve_selector("not-a-selector")
+    assert "error" in result
+
+
+def test_resolve_selector_store_unreachable_returns_error_dict():
+    store = FakeStore()
+    store.raise_error = StoreError("boom")
+    q = GraphQuery(_factory(store), {})
+    result = q.resolve_selector("orders-api:POST /orders")
+    assert "falkordb unreachable" in result["error"]
+
+
+def test_resolve_selector_store_factory_failure_also_caught():
+    def failing_factory():
+        raise StoreUnavailable("down")
+
+    q = GraphQuery(failing_factory, {})
+    result = q.resolve_selector("orders-api:POST /orders")
+    assert "falkordb unreachable" in result["error"]
+
+
+def test_resolve_selector_fresh_store_per_call():
+    calls: list[FakeStore] = []
+    store = FakeStore()
+    q = GraphQuery(_factory(store, calls), {})
+    q.resolve_selector("orders-api:POST /missing")
+    q.resolve_selector("kyc-worker:app.nope.Nothing")
+    assert len(calls) == 2
 
 
 def test_find_entrypoint_store_unreachable_returns_error_dict():

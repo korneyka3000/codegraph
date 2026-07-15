@@ -40,6 +40,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
+from codegraph.core.selectors import QualifiedSelector, RouteSelector, parse_selector
 from codegraph.core.spans import LineIndex
 from codegraph.query import traverse
 from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
@@ -345,3 +346,60 @@ class GraphQuery:
         except (StoreError, StoreUnavailable) as e:
             return {"error": f"falkordb unreachable: {e}"}
         return {"results": results}
+
+    def resolve_selector(self, selector: str) -> dict:
+        """M3 T2: resolves a "<service>:<METHOD> <path>" / "<service>:<dotted.name>"
+        selector (core.selectors.parse_selector -- same grammar cli.py's `trace`
+        command exposes, see that module's docstring) straight against the LOADED
+        graph, no staging.db involved at all -- the M2 final review carry-item this
+        closes: `codegraph trace` used to hard-require a prior `codegraph index` run's
+        staging.db on disk purely to resolve the selector string, even though the
+        walk itself was always graph-only.
+
+        Route form: every Channel(http_route) is fetched (`get_nodes_by_kind`,
+        Python-side filter on channel_kind/owner_service/http_method/path_template --
+        no dedicated store method for this, unlike find_by_qualified, since
+        get_nodes_by_kind + neighbors already say everything needed and Channel ids
+        are deterministic on this exact triple so at most one real match is expected;
+        see core/schema.py make_channel_node/core/ids.chan_http) then its HANDLES
+        out-neighbor is the entrypoint -- sorted by id for a deterministic pick on the
+        defensive duplicate-match case, same convention as linking/processes.py's
+        `_route_index`/`_handles_index`.
+        Qualified form: `store.find_by_qualified(service, qualified)`.
+
+        Returns {"node_id": ...} on success, {"error": ...} otherwise -- a malformed
+        selector (parse_selector returns None) and a well-formed-but-unresolved one
+        are reported with the SAME "entrypoint not found for selector: ..." message
+        (matching the pre-M3 CLI's own undifferentiated wording for both cases)."""
+        try:
+            store = self.store_factory()
+            parsed = parse_selector(selector)
+            node_id = None
+            if isinstance(parsed, RouteSelector):
+                node_id = self._resolve_route_selector(store, parsed)
+            elif isinstance(parsed, QualifiedSelector):
+                node = store.find_by_qualified(parsed.service, parsed.qualified)
+                node_id = node.get("id") if node else None
+        except (StoreError, StoreUnavailable) as e:
+            return {"error": f"falkordb unreachable: {e}"}
+        if node_id is None:
+            return {"error": f"entrypoint not found for selector: {selector}"}
+        return {"node_id": node_id}
+
+    @staticmethod
+    def _resolve_route_selector(store: GraphStore, sel: RouteSelector) -> str | None:
+        candidates = sorted(
+            (
+                n for n in store.get_nodes_by_kind("Channel")
+                if n.get("channel_kind") == "http_route"
+                and n.get("owner_service") == sel.service
+                and n.get("http_method") == sel.method
+                and n.get("path_template") == sel.path
+            ),
+            key=lambda n: n.get("id") or "",
+        )
+        if not candidates:
+            return None
+        hops = store.neighbors(candidates[0]["id"], ["HANDLES"], "out", 10)
+        handlers = sorted(hops, key=lambda h: h[2].get("id") or "")
+        return handlers[0][2].get("id") if handlers else None

@@ -39,6 +39,12 @@ class GraphStore(Protocol):
 
     def get_nodes_by_kind(self, kind: str) -> list[dict]: ...  # every node with n.kind == kind
 
+    def find_by_qualified(self, service: str, qualified: str) -> dict | None:
+        """MATCH by (service, qualified_name), ORDER BY id LIMIT 1 -- M3 T2, the
+        qualified-selector-form lookup for query.api.GraphQuery.resolve_selector.
+        None if no node matches."""
+        ...
+
     def search_fulltext(
         self, query: str, k: int, kinds: Sequence[str] | None = None
     ) -> list[dict]:

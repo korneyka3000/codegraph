@@ -207,6 +207,67 @@ def test_upsert_edges_key_props_keeps_parallel_channel_next_segment_distinct_and
 EXISTS = "__t6exists__"
 
 
+FIND_QUALIFIED = "__t2findq__"
+
+
+def test_find_by_qualified_matches_service_and_qualified_name(falkordb_cfg):
+    """M3 T2 live proof: query/api.GraphQuery.resolve_selector's qualified-selector
+    form resolves through this method (no Cypher outside stores/falkordb -- see
+    query/api.py). MATCH is scoped to (service, qualified_name) BOTH -- a node in a
+    DIFFERENT service sharing the same qualified_name must not match."""
+    store = FalkorStore(falkordb_cfg, FIND_QUALIFIED)
+    try:
+        store.ensure_schema()
+        target = {
+            "id": "sym:kyc-worker:KycWorkflow", "props": {
+                "kind": "Class", "service": "kyc-worker",
+                "qualified_name": "app.workflows.kyc.KycWorkflow",
+            },
+        }
+        other_service = {
+            "id": "sym:other-svc:KycWorkflow", "props": {
+                "kind": "Class", "service": "other-svc",
+                "qualified_name": "app.workflows.kyc.KycWorkflow",
+            },
+        }
+        store.upsert_nodes(("Sym", "Class"), [target, other_service])
+
+        found = store.find_by_qualified("kyc-worker", "app.workflows.kyc.KycWorkflow")
+        assert found is not None
+        assert found["id"] == "sym:kyc-worker:KycWorkflow"
+
+        assert store.find_by_qualified("kyc-worker", "app.nope.Nothing") is None
+        assert store.find_by_qualified("no-such-service", "app.workflows.kyc.KycWorkflow") is None
+    finally:
+        _cleanup(falkordb_cfg, FIND_QUALIFIED)
+
+
+def test_find_by_qualified_picks_lowest_id_when_multiple_match(falkordb_cfg):
+    """ORDER BY id LIMIT 1 (brief's own contract) -- deterministic pick, not
+    store-dependent iteration order, on the (should-never-happen-by-construction, but
+    defensively covered) case of a duplicate (service, qualified_name) pair."""
+    store = FalkorStore(falkordb_cfg, FIND_QUALIFIED)
+    try:
+        store.ensure_schema()
+        dup_hi = {
+            "id": "sym:svc:z-dup", "props": {
+                "kind": "Function", "service": "svc", "qualified_name": "app.dup",
+            },
+        }
+        dup_lo = {
+            "id": "sym:svc:a-dup", "props": {
+                "kind": "Function", "service": "svc", "qualified_name": "app.dup",
+            },
+        }
+        store.upsert_nodes(("Sym", "Function"), [dup_hi, dup_lo])
+
+        found = store.find_by_qualified("svc", "app.dup")
+        assert found is not None
+        assert found["id"] == "sym:svc:a-dup"
+    finally:
+        _cleanup(falkordb_cfg, FIND_QUALIFIED)
+
+
 def test_graph_exists_is_read_only_and_flips_after_write(falkordb_cfg):
     """graph_exists() (M1b T6 fix A): False для никогда не индексированного имени,
     и -- критично -- БЕЗ auto-vivify побочного эффекта (в отличие от GRAPH.QUERY,

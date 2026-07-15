@@ -314,3 +314,245 @@ def test_resolve_selector_unresolved_returns_none(tmp_path):
 def test_resolve_selector_malformed_selector_without_colon_returns_none(tmp_path):
     st = Staging(tmp_path / "s.db")
     assert processes.resolve_selector(st, "not-a-selector") is None
+
+
+# -- _entry_of: climb reverse-intra-edges (CALLS/DEPENDS_ON/INVOKES_ACTIVITY) up to a
+# RouteHandler/MessageConsumer/TemporalWorkflow-tagged node, or a node with no
+# incoming intra edge at all (M3 T2) --
+
+
+def test_entry_of_returns_node_itself_when_it_has_no_incoming_intra_edges():
+    assert processes._entry_of("lonely", {}, {}, set()) == "lonely"
+
+
+def test_entry_of_returns_node_itself_when_it_already_carries_an_entry_role():
+    roles_by_id = {"handler": ("RouteHandler",)}
+    # even though "handler" HAS a predecessor, the role check short-circuits the climb.
+    intra_reverse_adj = {"handler": ["caller"]}
+    assert processes._entry_of("handler", intra_reverse_adj, roles_by_id, set()) == "handler"
+
+
+def test_entry_of_climbs_single_hop_to_role_bearing_predecessor():
+    intra_reverse_adj = {"leaf": ["entry"]}
+    roles_by_id = {"entry": ("RouteHandler",)}
+    assert processes._entry_of("leaf", intra_reverse_adj, roles_by_id, set()) == "entry"
+
+
+def test_entry_of_climbs_multiple_hops_through_role_less_intermediates():
+    # leaf <- mid <- mid2 <- entry(MessageConsumer) -- mirrors the KYC fixture's real
+    # shape (client method <- verify_documents <- KycWorkflow.run <- handle_order_created).
+    intra_reverse_adj = {"leaf": ["mid"], "mid": ["mid2"], "mid2": ["entry"]}
+    roles_by_id = {"entry": ("MessageConsumer",)}
+    assert processes._entry_of("leaf", intra_reverse_adj, roles_by_id, set()) == "entry"
+
+
+def test_entry_of_stops_at_first_node_with_no_predecessor_when_no_role_ever_found():
+    intra_reverse_adj = {"leaf": ["root"]}  # "root" has no further predecessors, no role
+    assert processes._entry_of("leaf", intra_reverse_adj, {}, set()) == "root"
+
+
+def test_entry_of_cycle_terminates_via_visited_instead_of_looping_forever():
+    intra_reverse_adj = {"a": ["b"], "b": ["a"]}  # a <-> b cycle, no role anywhere
+    assert processes._entry_of("a", intra_reverse_adj, {}, set()) == "a"
+
+
+def test_entry_of_ambiguous_predecessors_picks_deterministic_sorted_first():
+    intra_reverse_adj = {"leaf": ["caller-b", "caller-a"]}
+    ambiguous = [0]
+    result = processes._entry_of("leaf", intra_reverse_adj, {}, set(), ambiguous)
+    assert result == "caller-a"  # sorted first, regardless of input list order
+    assert ambiguous[0] == 1
+
+
+def test_entry_of_unambiguous_predecessor_does_not_bump_counter():
+    intra_reverse_adj = {"leaf": ["only-caller"]}
+    ambiguous = [0]
+    processes._entry_of("leaf", intra_reverse_adj, {}, set(), ambiguous)
+    assert ambiguous[0] == 0
+
+
+def test_entry_of_ambiguous_counter_is_optional_and_defaults_to_no_tracking():
+    intra_reverse_adj = {"leaf": ["caller-b", "caller-a"]}
+    # no ambiguous arg passed -- must not raise, must still resolve deterministically.
+    assert processes._entry_of("leaf", intra_reverse_adj, {}, set()) == "caller-a"
+
+
+# -- _entry_graph: builds an entry->entry adjacency from NEXT_SEGMENT edges, keyed by
+# the CLIMBED entry of each edge's src (not the raw src itself) -- (M3 T2) --
+
+
+def test_entry_graph_keys_adjacency_by_climbed_entry_not_raw_next_segment_src(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    entry = _fn("sym:a:entry", "a", "entry", "q.entry", roles=("RouteHandler",))
+    mid = _fn("sym:a:mid", "a", "mid", "q.mid")
+    producer = _fn("sym:a:producer", "a", "producer", "q.producer")
+    consumer = _fn("sym:b:consumer", "b", "consumer", "q.consumer", roles=("MessageConsumer",))
+    st.upsert_nodes([entry, mid, producer, consumer])
+    st.upsert_edges([
+        _edge(entry.id, mid.id, "CALLS"),
+        _edge(mid.id, producer.id, "CALLS"),
+        _edge(producer.id, consumer.id, "NEXT_SEGMENT", via_channel_id="chan:x", derived=True),
+    ])
+
+    entry_adj, ambiguous = processes._entry_graph(st)
+
+    assert ambiguous == 0
+    assert entry.id in entry_adj
+    assert [e.dst for e in entry_adj[entry.id]] == [consumer.id]
+    assert producer.id not in entry_adj  # raw NEXT_SEGMENT.src never appears as a key
+
+
+def test_entry_graph_dst_is_used_as_is_never_climbed(tmp_path):
+    """T7's own construction guarantee: NEXT_SEGMENT.dst is ALREADY a segment entry
+    (a CONSUMES src or a HANDLES dst), so _entry_graph must never apply _entry_of to
+    it -- even when dst itself has intra-edge predecessors that would otherwise climb
+    it somewhere else entirely."""
+    st = Staging(tmp_path / "s.db")
+    producer = _fn("sym:a:producer", "a", "producer", "q.producer")
+    consumer = _fn("sym:b:consumer", "b", "consumer", "q.consumer", roles=("MessageConsumer",))
+    decoy_caller = _fn("sym:b:decoy", "b", "decoy", "q.decoy", roles=("RouteHandler",))
+    st.upsert_nodes([producer, consumer, decoy_caller])
+    st.upsert_edges([
+        _edge(decoy_caller.id, consumer.id, "CALLS"),  # would climb consumer -> decoy_caller
+        _edge(producer.id, consumer.id, "NEXT_SEGMENT", via_channel_id="chan:x", derived=True),
+    ])
+
+    entry_adj, _ = processes._entry_graph(st)
+
+    assert [e.dst for e in entry_adj[producer.id]] == [consumer.id]  # untouched, not decoy_caller
+
+
+def test_entry_graph_ambiguous_counts_propagate_from_entry_of(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    producer = _fn("sym:a:producer", "a", "producer", "q.producer")
+    caller_a = _fn("sym:a:caller-a", "a", "caller-a", "q.caller-a")
+    caller_b = _fn("sym:a:caller-b", "a", "caller-b", "q.caller-b")
+    consumer = _fn("sym:b:consumer", "b", "consumer", "q.consumer", roles=("MessageConsumer",))
+    st.upsert_nodes([producer, caller_a, caller_b, consumer])
+    st.upsert_edges([
+        _edge(caller_a.id, producer.id, "CALLS"),
+        _edge(caller_b.id, producer.id, "CALLS"),  # producer has TWO callers -- ambiguous
+        _edge(producer.id, consumer.id, "NEXT_SEGMENT", via_channel_id="chan:x", derived=True),
+    ])
+
+    _, ambiguous = processes._entry_graph(st)
+
+    assert ambiguous == 1
+
+
+# -- PART_OF_PROCESS climbing through intra edges: synthetic real-shape regression
+# anchor (M3 T2) -- mirrors the actual shape verified live against the fixtures'
+# "Order KYC onboarding" chain with real scip-python (see
+# tests/integration/test_processes_real_shape.py + m3-task-2-report.md): a
+# NEXT_SEGMENT.src is a producer/client node buried 2 intra-CALLS hops under its
+# segment's TRUE entry, not the entry itself. Runs in the default suite (no
+# scip/falkordb marker) -- this is what actually executes in CI to prove the BFS is
+# no longer inert (pre-fix: order was ALWAYS 0, full stop, on every real graph -- see
+# the M2 final review finding this task starts from). --
+
+
+def test_part_of_process_climbs_through_intra_edges_to_reach_max_order_two(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    chan = make_channel_node("http_route", owner_service="orders-api", method="POST",
+                              template="/orders", http_method="POST", path_template="/orders")
+    entry = _fn("sym:orders-api:entry", "orders-api", "entry", "q.entry", roles=("RouteHandler",))
+    mid = _fn("sym:orders-api:mid", "orders-api", "mid", "q.mid")
+    producer = _fn("sym:orders-api:producer", "orders-api", "producer", "q.producer")
+    consumer = _fn("sym:kyc-worker:consumer", "kyc-worker", "consumer", "q.consumer",
+                    roles=("MessageConsumer",))
+    mid2 = _fn("sym:kyc-worker:mid2", "kyc-worker", "mid2", "q.mid2")
+    producer2 = _fn("sym:kyc-worker:producer2", "kyc-worker", "producer2", "q.producer2")
+    tail = _fn("sym:doc-mgmt:tail", "doc-mgmt", "tail", "q.tail", roles=("RouteHandler",))
+    st.upsert_nodes([chan, entry, mid, producer, consumer, mid2, producer2, tail])
+    st.upsert_edges([
+        _edge(chan.id, entry.id, "HANDLES"),
+        _edge(entry.id, mid.id, "CALLS"),
+        _edge(mid.id, producer.id, "CALLS"),
+        _edge(producer.id, consumer.id, "NEXT_SEGMENT", via_channel_id="chan:x", derived=True),
+        _edge(consumer.id, mid2.id, "CALLS"),
+        _edge(mid2.id, producer2.id, "INVOKES_ACTIVITY"),
+        _edge(producer2.id, tail.id, "NEXT_SEGMENT", via_channel_id="chan:y", derived=True),
+    ])
+
+    cfg = _cfg(ProcessDecl(name="Order KYC onboarding", entrypoint="orders-api:POST /orders"))
+    processes.materialize(cfg, st)
+
+    part_of = {e.src: e.props["order"] for e in st.iter_edges() if e.type == "PART_OF_PROCESS"}
+    assert part_of == {entry.id: 0, consumer.id: 1, tail.id: 2}
+    assert max(part_of.values()) == 2  # regression pin: pre-fix this was always 0
+
+
+def test_part_of_process_climb_uses_depends_on_edges_too(tmp_path):
+    """DEPENDS_ON (fastapi Depends()-injection edges) is one of the three intra-edge
+    types _entry_of climbs over, alongside CALLS/INVOKES_ACTIVITY."""
+    st = Staging(tmp_path / "s.db")
+    chan = make_channel_node("http_route", owner_service="orders-api", method="POST",
+                              template="/orders", http_method="POST", path_template="/orders")
+    entry = _fn("sym:orders-api:entry", "orders-api", "entry", "q.entry", roles=("RouteHandler",))
+    producer = _fn("sym:orders-api:producer", "orders-api", "producer", "q.producer")
+    consumer = _fn("sym:kyc-worker:consumer", "kyc-worker", "consumer", "q.consumer",
+                    roles=("MessageConsumer",))
+    st.upsert_nodes([chan, entry, producer, consumer])
+    st.upsert_edges([
+        _edge(chan.id, entry.id, "HANDLES"),
+        _edge(entry.id, producer.id, "DEPENDS_ON"),
+        _edge(producer.id, consumer.id, "NEXT_SEGMENT", via_channel_id="chan:x", derived=True),
+    ])
+
+    cfg = _cfg(ProcessDecl(name="Depends flow", entrypoint="orders-api:POST /orders"))
+    processes.materialize(cfg, st)
+
+    part_of = {e.src: e.props["order"] for e in st.iter_edges() if e.type == "PART_OF_PROCESS"}
+    assert part_of == {entry.id: 0, consumer.id: 1}
+
+
+def test_part_of_process_ambiguous_climb_counted_in_materialize_stats(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    chan = make_channel_node("http_route", owner_service="orders-api", method="POST",
+                              template="/orders", http_method="POST", path_template="/orders")
+    entry = _fn("sym:orders-api:entry", "orders-api", "entry", "q.entry", roles=("RouteHandler",))
+    caller_a = _fn("sym:orders-api:caller-a", "orders-api", "caller-a", "q.caller-a")
+    caller_b = _fn("sym:orders-api:caller-b", "orders-api", "caller-b", "q.caller-b")
+    producer = _fn("sym:orders-api:producer", "orders-api", "producer", "q.producer")
+    consumer = _fn("sym:kyc-worker:consumer", "kyc-worker", "consumer", "q.consumer",
+                    roles=("MessageConsumer",))
+    st.upsert_nodes([chan, entry, caller_a, caller_b, producer, consumer])
+    st.upsert_edges([
+        _edge(chan.id, entry.id, "HANDLES"),
+        _edge(caller_a.id, producer.id, "CALLS"),
+        _edge(caller_b.id, producer.id, "CALLS"),  # ambiguous: 2 callers of "producer"
+        _edge(producer.id, consumer.id, "NEXT_SEGMENT", via_channel_id="chan:x", derived=True),
+    ])
+
+    cfg = _cfg(ProcessDecl(name="Ambiguous flow", entrypoint="orders-api:POST /orders"))
+    stats = processes.materialize(cfg, st)
+
+    assert stats["part_of_process_ambiguous"] == 1
+
+
+def test_part_of_process_safety_cap_stops_at_100_nodes(tmp_path):
+    """Safety cap (M3 T2 brief: "максимум узлов 100"): a long NEXT_SEGMENT chain (no
+    cycle -- BFS would otherwise legitimately keep growing order forever) must stop
+    materializing PART_OF_PROCESS members once 100 nodes have been claimed, rather
+    than growing without bound on a pathological/huge real graph."""
+    st = Staging(tmp_path / "s.db")
+    chan = make_channel_node("http_route", owner_service="orders-api", method="POST",
+                              template="/orders", http_method="POST", path_template="/orders")
+    entry = _fn("sym:a:n0", "a", "n0", "q.n0", roles=("RouteHandler",))
+    nodes = [entry]
+    edges = [_edge(chan.id, entry.id, "HANDLES")]
+    n = 150
+    for i in range(1, n):
+        node = _fn(f"sym:a:n{i}", "a", f"n{i}", f"q.n{i}", roles=("MessageConsumer",))
+        nodes.append(node)
+        prev_id = f"sym:a:n{i - 1}"
+        edges.append(_edge(prev_id, node.id, "NEXT_SEGMENT", via_channel_id=f"chan:{i}",
+                            derived=True))
+    st.upsert_nodes([chan, *nodes])
+    st.upsert_edges(edges)
+
+    cfg = _cfg(ProcessDecl(name="Long chain", entrypoint="orders-api:POST /orders"))
+    processes.materialize(cfg, st)
+
+    part_of = [e for e in st.iter_edges() if e.type == "PART_OF_PROCESS"]
+    assert len(part_of) <= 100

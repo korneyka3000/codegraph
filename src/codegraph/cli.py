@@ -15,7 +15,6 @@ from rich.tree import Tree
 from codegraph.config.loader import ConfigError, effective_idioms, load_workspace
 from codegraph.config.models import WorkspaceConfig
 from codegraph.doctor import run_env_checks, run_store_probes
-from codegraph.linking.processes import resolve_selector
 from codegraph.linking.workspace import link_workspace
 from codegraph.pipeline.analyze import analyze_service
 from codegraph.pipeline.load import load_graph
@@ -117,11 +116,17 @@ def _resolve_graph_name(cfg: WorkspaceConfig, graph: str | None) -> str:
 
 
 def _require_staging(cfg: WorkspaceConfig, target_path: Path) -> Path:
-    """staging.db path for `load`/`trace` -- both need a PRIOR `codegraph index` run
-    (staging persists on disk after index completes; trace re-derives an
-    entrypoint id from it the same way `load` re-derives the graph from it -- see
-    linking.processes.resolve_selector). Missing file -> red one-liner + exit 1,
-    same shape/wording both commands used before this was factored out."""
+    """staging.db path for `load` -- needs a PRIOR `codegraph index` run (staging
+    persists on disk after index completes; `load` re-derives the graph from it).
+    Missing file -> red one-liner + exit 1.
+
+    M3 T2: `trace` USED to be this function's other caller (it re-derived an
+    entrypoint id from staging the same way `load` re-derives the graph) -- no
+    longer: selector resolution moved to query.api.GraphQuery.resolve_selector
+    (graph-side, see cli.py's `trace` command), closing the M2 final review
+    carry-item that `codegraph trace` hard-required a staging.db on disk purely to
+    resolve a selector string even though the trace walk itself was always
+    graph-only."""
     path = _workspace_dir(cfg, target_path) / ".codegraph" / "staging.db"
     if not path.exists():
         console.print(f"[red]no staging DB at {path}; run 'codegraph index' first[/]")
@@ -410,8 +415,13 @@ def trace(
 ) -> None:
     """Трассировка бизнес-процесса от selector (route-форма "<service>:<METHOD>
     <path>" или qualified "<service>:<dotted.name>", как в cfg.processes -- см.
-    linking.processes.resolve_selector) через FalkorDB: rich-дерево сегментов
-    (--format text, по умолчанию) или mermaid flowchart (--format mermaid)."""
+    core.selectors.parse_selector) через FalkorDB: rich-дерево сегментов (--format
+    text, по умолчанию) или mermaid flowchart (--format mermaid).
+
+    M3 T2: selector резолвится ПРЯМО из графа (query.api.GraphQuery.resolve_selector),
+    staging.db НЕ читается и не обязан существовать -- закрывает M2-final-review
+    carry-item (trace раньше требовал staging.db исключительно ради резолва
+    selector'а, хотя сам трейс всегда был graph-only)."""
     if output_format not in _TRACE_FORMATS:
         console.print(
             f"[red]invalid --format: {escape(output_format)!r} (expected "
@@ -422,13 +432,6 @@ def trace(
     target_path = target if target is not None else Path.cwd()
     cfg = _load(target_path)
     graph_name = _resolve_graph_name(cfg, graph)
-    staging_path = _require_staging(cfg, target_path)
-
-    with Staging(staging_path) as staging:
-        entrypoint_id = resolve_selector(staging, selector)
-    if entrypoint_id is None:
-        console.print(f"[red]entrypoint not found for selector: {escape(selector)}[/]")
-        raise typer.Exit(1)
 
     service_paths = {svc.name: svc.path for svc in cfg.services}
     gq = GraphQuery(
@@ -436,9 +439,15 @@ def trace(
         service_paths=service_paths,
     )
     # GraphQuery отвечает своим собственным error-dict-контрактом (store
-    # недоступен/entrypoint не найден в графе) -- без _store_guard, как и в MCP
-    # server.py: тут нечего перехватывать, только проверить ключ "error".
-    result = gq.trace_process(entrypoint_id)
+    # недоступен/selector не резолвится/entrypoint не найден в графе) -- без
+    # _store_guard, как и в MCP server.py: тут нечего перехватывать, только
+    # проверить ключ "error".
+    resolved = gq.resolve_selector(selector)
+    if "error" in resolved:
+        console.print(f"[red]{escape(resolved['error'])}[/]")
+        raise typer.Exit(1)
+
+    result = gq.trace_process(resolved["node_id"])
     if "error" in result:
         console.print(f"[red]{escape(result['error'])}[/]")
         raise typer.Exit(1)

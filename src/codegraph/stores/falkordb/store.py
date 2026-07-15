@@ -101,6 +101,28 @@ class FalkorStore:
         )
         return [row[0].properties for row in res.result_set]
 
+    def find_by_qualified(self, service: str, qualified: str) -> dict | None:
+        """`MATCH (n:Sym {service, qualified_name}) RETURN n ORDER BY n.id LIMIT 1` --
+        M3 T2, the qualified-selector-form lookup for query.api.GraphQuery.
+        resolve_selector's graph-side resolution (no staging.db needed, unlike the
+        pre-M3 CLI `trace`, which read this same shape of answer out of Staging's
+        `nodes` table via `_qualified_index`). `:Sym` (not a bare property match, see
+        get_nodes_by_kind's own docstring for why THAT method can't use a label) is
+        deliberate here: qualified_name/service are only meaningful on code nodes
+        (Function/Class/Module), which always carry :Sym (see pipeline/load.py's
+        `_labels_for_kind`), and ddl.py indexes exactly `(:Sym).qualified_name` /
+        `(:Sym).service` -- scoping the MATCH to the label lets FalkorDB use those
+        indexes instead of a full node scan. ORDER BY id LIMIT 1: deterministic pick
+        on the defensive (should never happen by construction -- ids are derived from
+        (service, descriptors), so two DIFFERENT ids sharing (service, qualified_name)
+        would mean two source spans genuinely collided) case of more than one match."""
+        res = self._g.query(
+            "MATCH (n:Sym {service: $service, qualified_name: $qualified}) "
+            "RETURN n ORDER BY n.id LIMIT 1",
+            {"service": service, "qualified": qualified},
+        )
+        return res.result_set[0][0].properties if res.result_set else None
+
     def get_nodes_by_kind(self, kind: str) -> list[dict]:
         """`MATCH (n {kind: $kind}) RETURN n` -- property match on `n.kind` (every
         loaded node carries it, see pipeline/load._NODE_CORE_FIELDS), NOT a label
