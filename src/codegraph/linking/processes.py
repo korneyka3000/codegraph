@@ -31,10 +31,11 @@ the live-probe evidence backing every claim below):
   producer side), and a channel-boundary edge's src is whichever function/method literally
   makes the producing call -- almost never the segment's own entry node. E.g. the "Order
   KYC onboarding" process's entrypoint is `create_order` (the route handler), but the
-  PRODUCES edge into the "OrderCreated" event channel has src=`OrderService.place` (called
-  THREE stack frames below `create_order`, through `service.place(req)`). `create_order`
-  itself has NO outgoing NEXT_SEGMENT edge -- the BFS looked at an empty adjacency list and
-  stopped at order 0, every time, on every graph shaped like this (which is all of them).
+  PRODUCES edge into the "OrderCreated" event channel has src=`OrderService.place` --
+  called DIRECTLY by `create_order` (`service.place(req)`, one call below the handler),
+  but a DIFFERENT node nonetheless. `create_order` itself has NO outgoing NEXT_SEGMENT
+  edge -- the BFS looked at an empty adjacency list and stopped at order 0, every time,
+  on every graph shaped like this (which is all of them).
 
   THE FIX: before grouping NEXT_SEGMENT edges into a walkable adjacency, each edge's SRC is
   first climbed UP to its owning segment entry via `_entry_of` -- reverse-adjacency over
@@ -68,6 +69,25 @@ the live-probe evidence backing every claim below):
   `_MAX_PART_OF_PROCESS_NODES` (100) nodes have been claimed for a single anchor -- a
   defensive bound against a pathological/huge real graph, not expected to ever fire on
   these fixtures (max order on the "Order KYC onboarding" fixture chain is 2).
+
+  Resolver-quality dependency (live-reproduced fact: forced-ScipRunError analyze x3 +
+  link_workspace on fixtures/workspace.yaml -> max PART_OF_PROCESS order == 0 across
+  ALL processes; reviewer-verified, pinned by the degraded test in
+  tests/integration/test_processes_real_shape.py): the climb is only as good as the
+  staged intra edges, and the heuristic degraded resolver (resolvers/fallback.py, used
+  when scip-python is unavailable) only ever builds refs for calls whose callee NAME is
+  a bare top-level def (same file or direct from-import) -- no type inference, no
+  method-call resolution, no refs for non-call name references. On these fixtures that
+  breaks the chain at BOTH critical points: (a) `service.place(req)` -- a method call
+  on a locally-typed variable -- is unresolvable, so degraded's only CALLS edge out of
+  `create_order` targets the OrderService CLASS ctor, `OrderService.place` gets NO
+  incoming intra edge at all, `_entry_of` returns place itself (its own disconnected
+  root), and the NEXT_SEGMENT edge it produces is keyed away from `create_order`'s BFS
+  entirely; (b) kyc-worker's dispatch_dict consumer handler (a bare name used as a dict
+  VALUE, not a call site) never gets a ref either, so `handle_order_created` has no
+  CONSUMES edge/MessageConsumer role and everything past it is likewise unreachable.
+  Degraded mode therefore stalls at max order 0 -- real scip-python is REQUIRED for the
+  full real-shape chain (max order 2, the scip-marked test in the same file).
 
 Edge direction is node -PART_OF_PROCESS-> process ("this node is part of this process",
 readable subject-first). resolution/confidence for order 0 is ("static", 1.0) -- the

@@ -236,10 +236,13 @@ def test_m2_gate(tmp_path, falkordb_cfg):
     # correct, not stale-cache masking of a real difference.
     cache_dir = tmp_path / "scip-cache"
 
-    # Conventional `<root>/.codegraph/staging.db` layout so the CLI-check block below
-    # (`codegraph trace`, CliRunner) resolves this SAME staging/graph through the real
-    # CLI code path (_require_staging), zero-config (no codegraph.yaml needed --
-    # service_paths is unused by `codegraph trace`'s default include_source=False).
+    # Conventional `<root>/.codegraph/staging.db` layout for the pipeline's own
+    # staging file. NOTE (M3 T2): `codegraph trace` no longer reads staging at all --
+    # its selector resolves graph-side via GraphQuery.resolve_selector, so the
+    # CLI-check block below exercises the loaded FalkorDB graph, not this file;
+    # ws_root stays as the zero-config CLI target (no codegraph.yaml needed --
+    # service_paths is unused by `codegraph trace`'s default include_source=False)
+    # and the conventional home for staging.db either way.
     ws_root = tmp_path / "ws"
     ws_root.mkdir()
     staging_path = ws_root / ".codegraph" / "staging.db"
@@ -301,8 +304,12 @@ def test_m2_gate(tmp_path, falkordb_cfg):
                 f"{kyc_entry_id} (orders -> kyc) in the FULL run; not found"
             )
 
-        # -- resolve entrypoint (staging-only; same mechanism `codegraph trace`/
-        # processes.materialize use, see linking/processes.py) --------------------
+        # -- resolve entrypoint (staging-only; same mechanism processes.materialize
+        # uses, see linking/processes.py -- NOT what `codegraph trace` uses anymore:
+        # since M3 T2 the CLI resolves selectors graph-side via
+        # GraphQuery.resolve_selector, which the CLI-check block below exercises
+        # end-to-end; this staging-side resolve feeds the direct gq.trace_process
+        # call and cross-checks the S7 route table independently) -----------------
         entrypoint_id = resolve_selector(staging, ENTRYPOINT_SELECTOR)
         if entrypoint_id is None:
             problems.append(

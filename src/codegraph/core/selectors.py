@@ -31,9 +31,10 @@ _HTTP_VERBS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIO
 
 @dataclass(frozen=True)
 class RouteSelector:
-    """"<service>:<METHOD> <path>", e.g. "orders-api:POST /orders" -- resolves via a
-    Channel(http_route) matching (owner_service=service, http_method=method,
-    path_template=path) EXACTLY, then that channel's HANDLES edge."""
+    """Route form "<service>:<METHOD> <path>", e.g. "orders-api:POST /orders" --
+    resolves via a Channel(http_route) matching (owner_service=service,
+    http_method=method, path_template=path) EXACTLY, then that channel's HANDLES
+    edge."""
 
     service: str
     method: str
@@ -42,7 +43,7 @@ class RouteSelector:
 
 @dataclass(frozen=True)
 class QualifiedSelector:
-    """"<service>:<dotted.qualified.name>", e.g.
+    """Qualified form "<service>:<dotted.qualified.name>", e.g.
     "kyc-worker:app.workflows.kyc.KycWorkflow" -- resolves via a direct
     (service, qualified_name) lookup, no channel/edge hop involved."""
 
