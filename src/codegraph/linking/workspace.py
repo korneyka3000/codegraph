@@ -8,12 +8,30 @@ Fixed pipeline order, each stage consuming the previous stage's output:
      stage in this function creates or updates extractor="linking" state, and if clear
      ran anywhere else it would either do nothing (nothing derived yet) or destroy this
      run's own freshly-derived edges.
-  2. temporal_start_mark claims -> CALLS edges (see `_apply_temporal_start_marks`).
-  3. `http_routes.link` -- claims -> CALLS_HTTP.
-  4. `segments.derive` -- PRODUCES/CONSUMES/CALLS_HTTP/HANDLES/CONTAINS -> NEXT_SEGMENT.
+  2. `staging.gc_orphan_channels()` -- M2 final review fix, must run SECOND (right after
+     clear_workspace_layer, before ANY derivation stage below -- see its own docstring
+     for why this exact position, not "at the end", is load-bearing): sweeps any Channel
+     node left with zero referencing edges. By this point every REAL Channel already has
+     its S5-native edge (HANDLES/PRODUCES/CONSUMES/CONTAINS -- created in the SAME
+     analyze_service batch as the Channel itself, so it survived step 1 untouched,
+     extractor != "linking"); the only Channels that can be edge-LESS here are (a) a
+     stale one left behind by a route/topic/event rename, whose OLD S5 edge was just
+     correctly retired by THIS run's origin_service-scoped begin_service (see
+     Staging.begin_service's docstring) but whose NODE has no per-service home to be
+     swept by begin_service at all, or (b) a "unresolved fallback" Channel from a PRIOR
+     run whose only edge (CALLS_HTTP, extractor="linking") step 1 just wiped. Running
+     GC here, BEFORE http_routes.link (step 4) rebuilds its route table by scanning ALL
+     staged Channel(http_route) nodes, is what actually closes the M2-final bug: leaving
+     a stale Channel visible to that scan for even one more run would let an unrelated,
+     unchanged client claim silently re-match it, recreating a fresh CALLS_HTTP edge
+     into a route that no longer exists in source and keeping the stale Channel "alive"
+     forever (empirically caught by this fix's own double-run regression test).
+  3. temporal_start_mark claims -> CALLS edges (see `_apply_temporal_start_marks`).
+  4. `http_routes.link` -- claims -> CALLS_HTTP.
+  5. `segments.derive` -- PRODUCES/CONSUMES/CALLS_HTTP/HANDLES/CONTAINS -> NEXT_SEGMENT.
      Must run AFTER http_routes.link: one of its two pairing rules consumes CALLS_HTTP
      edges that only exist once http_routes.link has written them.
-  5. `processes.materialize` -- cfg.processes + TemporalWorkflow roles -> BusinessProcess
+  6. `processes.materialize` -- cfg.processes + TemporalWorkflow roles -> BusinessProcess
      + PART_OF_PROCESS. Must run LAST: its BFS trace walks NEXT_SEGMENT edges that only
      exist once segments.derive has written them.
 
@@ -101,8 +119,10 @@ def _apply_temporal_start_marks(staging: Staging) -> int:
 def link_workspace(cfg: WorkspaceConfig, staging: Staging) -> dict:
     """S7 entry point. staging-only (no FalkorDB access) -- callers don't need a
     store-unavailability guard around this call. Returns a JSON-serializable counters
-    dict: {calls_http, calls_http_unresolved, next_segments, processes, marks}."""
+    dict: {calls_http, calls_http_unresolved, next_segments, processes, marks,
+    channels_gc}."""
     staging.clear_workspace_layer()
+    channels_gc = staging.gc_orphan_channels()
     marks = _apply_temporal_start_marks(staging)
     http_stats = http_routes.link(cfg, staging)
     segment_stats = segments.derive(staging)
@@ -113,4 +133,5 @@ def link_workspace(cfg: WorkspaceConfig, staging: Staging) -> dict:
         "next_segments": segment_stats["next_segments"],
         "processes": process_stats["processes"],
         "marks": marks,
+        "channels_gc": channels_gc,
     }

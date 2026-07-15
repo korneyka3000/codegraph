@@ -196,6 +196,57 @@ def test_part_of_process_bfs_cycle_safe(tmp_path):
     assert part_of == {entry.id: 0, a.id: 1}
 
 
+def test_part_of_process_bfs_fan_out_diamond_reconvergence_is_deterministic(tmp_path):
+    """Regression pin (M2 final review, item 6): a node with 2 OUTGOING NEXT_SEGMENT
+    edges (fan-out: entry -> mid_a, entry -> mid_b) whose branches reconverge on the
+    SAME tail node (diamond: mid_a -> tail, mid_b -> tail) must --
+      (a) assign BOTH fan-out children the SAME order (parent order + 1) -- order comes
+          from the PARENT's already-fixed order, not a running counter, so this holds
+          regardless of which branch is visited first within their shared BFS layer;
+      (b) produce exactly ONE PART_OF_PROCESS entry for the reconverging tail, not two
+          and not zero ("if edge.dst not in seen" claims a node exactly once);
+      (c) do so DETERMINISTICALLY across runs: _next_segment_adjacency sorts each
+          node's outgoing edges by dst id, so whichever branch's id sorts first always
+          "wins" the tail's recorded via_edge (and therefore its own resolution/
+          confidence) -- pinned here by giving the two branch->tail edges
+          distinguishable confidence values and asserting the lexicographically-first
+          branch (mid_a < mid_b) is the one recorded, every time.
+    """
+    st = Staging(tmp_path / "s.db")
+    chan = make_channel_node("http_route", owner_service="orders-api", method="POST",
+                              template="/orders", http_method="POST", path_template="/orders")
+    entry = _fn("sym:orders-api:entry", "orders-api", "entry", "q.entry")
+    mid_a = _fn("sym:kyc-worker:mid_a", "kyc-worker", "mid_a", "q.mid_a")
+    mid_b = _fn("sym:kyc-worker:mid_b", "kyc-worker", "mid_b", "q.mid_b")
+    tail = _fn("sym:doc-mgmt:tail", "doc-mgmt", "tail", "q.tail")
+    assert mid_a.id < mid_b.id  # load-bearing for the determinism claim below
+    st.upsert_nodes([chan, entry, mid_a, mid_b, tail])
+    st.upsert_edges([
+        _edge(chan.id, entry.id, "HANDLES"),
+        _edge(entry.id, mid_a.id, "NEXT_SEGMENT", via_channel_id="chan:entry-a", derived=True),
+        _edge(entry.id, mid_b.id, "NEXT_SEGMENT", via_channel_id="chan:entry-b", derived=True),
+        _edge(mid_a.id, tail.id, "NEXT_SEGMENT", resolution="static", confidence=0.9,
+              via_channel_id="chan:from-a", derived=True),
+        _edge(mid_b.id, tail.id, "NEXT_SEGMENT", resolution="heuristic", confidence=0.1,
+              via_channel_id="chan:from-b", derived=True),
+    ])
+
+    cfg = _cfg(ProcessDecl(name="Fan-out flow", entrypoint="orders-api:POST /orders"))
+    processes.materialize(cfg, st)
+
+    part_of = {e.src: e for e in st.iter_edges() if e.type == "PART_OF_PROCESS"}
+    assert set(part_of) == {entry.id, mid_a.id, mid_b.id, tail.id}  # tail: exactly once
+
+    assert part_of[entry.id].props["order"] == 0
+    assert part_of[mid_a.id].props["order"] == 1
+    assert part_of[mid_b.id].props["order"] == 1
+
+    assert part_of[tail.id].props["order"] == 2
+    # deterministic reconvergence winner: mid_a's edge to tail, not mid_b's.
+    assert part_of[tail.id].resolution == "static"
+    assert abs(part_of[tail.id].confidence - 0.9) < 1e-9
+
+
 def test_part_of_process_entry_with_no_next_segment_is_order_zero_only(tmp_path):
     st = Staging(tmp_path / "s.db")
     chan = make_channel_node("http_route", owner_service="orders-api", method="POST",

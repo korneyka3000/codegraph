@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import typer
+from authlib.deprecate import AuthlibDeprecationWarning
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
@@ -15,7 +17,6 @@ from codegraph.config.models import WorkspaceConfig
 from codegraph.doctor import run_env_checks, run_store_probes
 from codegraph.linking.processes import resolve_selector
 from codegraph.linking.workspace import link_workspace
-from codegraph.mcp.server import build_server
 from codegraph.pipeline.analyze import analyze_service
 from codegraph.pipeline.load import load_graph
 from codegraph.pipeline.report import build_report, print_report, write_report
@@ -24,6 +25,31 @@ from codegraph.query.api import GraphQuery
 from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
 from codegraph.stores.falkordb.store import FalkorStore
 from codegraph.stores.staging import Staging
+
+# `fastmcp` (imported below via codegraph.mcp.server, needed for `serve`) transitively
+# imports `fastmcp.server.auth.providers.jwt`, whose own top-level code does
+# `from authlib.jose import ...` -- and authlib.jose's OWN top-level code raises
+# AuthlibDeprecationWarning (authlib 1.7.2: "authlib.jose module is deprecated, please
+# use joserfc instead") on that very import, so every `codegraph` invocation printed it
+# on stderr, unconditionally, before this fix (empirically confirmed: `codegraph doctor
+# --help` alone triggers it, since this module always imports mcp.server at load time).
+#
+# A filter registered BEFORE this point does NOT work here, verified directly: authlib's
+# OWN `authlib/deprecate.py` runs `warnings.simplefilter("always", AuthlibDeprecationWarning)`
+# at ITS OWN import time (a forced, unconditional override for its own warning class) --
+# since `warnings.filterwarnings`/`simplefilter` both PREPEND to `warnings.filters` by
+# default (most-recently-registered checked FIRST), whichever filter is registered LAST
+# wins. Importing `authlib.deprecate` ourselves, above (harmless on its own -- it does
+# NOT import authlib.jose or raise anything by itself), runs that override first; our
+# own "ignore" filter, registered immediately below -- and therefore chronologically
+# LAST -- takes priority over it. Placing this in `main()` would be too late: every
+# import in this module (including the one below) already ran once, at module-import
+# time, before main() is ever invoked (this IS the "app-инициализации" location, not
+# main() -- see this task's own fix report for the two candidate locations named and
+# why only this one actually works).
+warnings.filterwarnings("ignore", category=AuthlibDeprecationWarning)
+
+from codegraph.mcp.server import build_server  # noqa: E402
 
 # analyze_service/link_workspace/load_graph/FalkorStore/Staging/build_server
 # импортированы по имени (не через module-алиас) НАМЕРЕННО: юнит-тесты

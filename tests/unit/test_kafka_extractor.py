@@ -451,6 +451,103 @@ def test_producer_unresolved_channel_no_edge_and_stat_incremented():
     assert result.stats["producer_unresolved_channel"] == 1
 
 
+# -- M2 final review: empty resolved channel name must not crash make_channel_node --
+
+EMPTY_STRING_SRC = b'''from pkg import Client
+
+
+def use():
+    client = Client()
+    client.send("")
+'''
+
+EMPTY_FSTRING_SRC = b'''from pkg import Client
+
+
+def use():
+    client = Client()
+    client.send(f"")
+'''
+
+
+def test_producer_empty_string_channel_name_no_crash_and_stat_incremented():
+    """An empty resolved channel name (bare "" literal here, kind="value") used to
+    reach make_channel_node(name="") and raise ValueError -- crashing the whole
+    `codegraph index` run -- instead of being treated as just another unresolved
+    channel like any other resolution failure."""
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(relpath, "svc", EMPTY_STRING_SRC)
+    idiom = ProducerIdiom(
+        name="p", call="pkg.Client.send",
+        channel=ChannelSpec(kind="kafka_topic", name_from=ValueSpec(arg=0)),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+    assert result.edges == []
+    assert result.channels == []
+    assert result.roles == {}
+    assert result.stats["producer_unresolved_channel"] == 1
+
+
+def test_producer_empty_fstring_channel_name_no_crash_and_stat_incremented():
+    """f"" resolves through a DIFFERENT Resolved.kind ("template", not "value" --
+    _fstring_template("f\\"\\"") joins zero string_content/interpolation children into
+    "") than a bare "" literal -- both empty-value shapes must be guarded
+    independently (see kafka_ext._emit_kafka_topic_produces)."""
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(relpath, "svc", EMPTY_FSTRING_SRC)
+    idiom = ProducerIdiom(
+        name="p", call="pkg.Client.send",
+        channel=ChannelSpec(kind="kafka_topic", name_from=ValueSpec(arg=0)),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+    assert result.edges == []
+    assert result.stats["producer_unresolved_channel"] == 1
+
+
+def test_consumer_empty_string_channel_name_no_crash_and_stat_incremented():
+    """Same empty-name crash class, consumer side (_emit_call_consumer's own
+    consumer_unresolved_topic counter, not the producer one)."""
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(relpath, "svc", EMPTY_STRING_SRC.replace(b"send", b"listen"))
+    idiom = ConsumerIdiom(
+        name="c", kind="call", call="pkg.Client.listen", topic=ValueSpec(arg=0),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[idiom]), consts)
+    assert result.edges == []
+    assert result.roles == {}
+    assert result.stats["consumer_unresolved_topic"] == 1
+
+
+def test_dispatch_dict_empty_string_key_skipped_no_crash():
+    """Same empty-name crash class, dispatch_dict's event-key path (a literal dict key,
+    not a Resolved value -- see kafka_ext._emit_dispatch_dict's `not key_arg.string_value`
+    guard)."""
+    relpath = "m.py"
+    src = b'''def register_handlers(mapping):
+    pass
+
+
+def handler(event):
+    pass
+
+
+register_handlers({"": handler})
+'''
+
+    def ref_lookup(rp, sb):
+        return "scip-python python svc 0.0 `m`/handler()."
+
+    ctx, node_ids, consts = _load(relpath, "svc", src, ref_symbol_lookup=ref_lookup)
+    idiom = ConsumerIdiom(
+        name="d", kind="dispatch_dict", registrar_call="register_handlers",
+        topic=None, event_type_from="dict_key",
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[idiom]), consts)
+    assert result.edges == []
+    assert result.channels == []
+    assert result.roles == {}
+
+
 TEMPLATE_SRC = b'''from pkg import Client
 
 

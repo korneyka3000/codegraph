@@ -51,7 +51,16 @@ _CONFIDENCE = 1.0
 
 _VERBS = frozenset({"get", "post", "put", "delete", "patch", "head", "options"})
 _ROUTER_CALLEES = frozenset({"APIRouter", "FastAPI"})
-_DEPENDS_RE = re.compile(r"Depends\(\s*([A-Za-z_]\w*)\s*[),]")
+# (?<!\w) word-boundary lookbehind (M2 final review fix): without it, re.search matches
+# "Depends(" as a bare substring anywhere in the text, so a param default/annotation
+# like `x: int = MyDepends(factory)` -- an unrelated custom callable that merely ENDS
+# WITH "Depends(...)" -- would be misread as a real FastAPI Depends() call (matching
+# starting right after "My"), wrongly resolving `factory` as a DEPENDS_ON target. The
+# lookbehind requires "Depends(" to NOT be immediately preceded by a word character, so
+# it still matches at the start of text or after whitespace/"["/","/"(" (every real
+# shape: bare `Depends(x)`, `Annotated[X, Depends(x)]`, nested calls) but rejects
+# "MyDepends(" / "some_depends(" / any other identifier merely suffixed with it.
+_DEPENDS_RE = re.compile(r"(?<!\w)Depends\(\s*([A-Za-z_]\w*)\s*[),]")
 
 
 @dataclass(frozen=True)

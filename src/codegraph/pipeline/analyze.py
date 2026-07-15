@@ -209,6 +209,15 @@ def analyze_service(
                 domain_edges.extend(fr.edges)
 
             if kafka_active:
+                # consts is typed `ConstTable | None` above (the ternary's else-branch),
+                # but extract_kafka declares its own `consts: ConstTable` parameter
+                # (non-Optional) -- a real mismatch under a strict type-checker, even
+                # though it can never actually BE None here: `kafka_active` being True
+                # means the `if kafka_active or http_client_active` condition above was
+                # already True, so consts was built, not left None. assert narrows the
+                # type for the checker without changing runtime behavior at all (M2
+                # final review, item 5).
+                assert consts is not None
                 kr = extract_kafka(ctx, node_ids, svc_idioms, consts)
                 for nid, rs in kr.roles.items():
                     domain_roles.setdefault(nid, set()).update(rs)
@@ -227,6 +236,9 @@ def analyze_service(
                 staging.add_claims(svc.name, rp, "temporal_start_mark", tr.claims)
 
             if http_client_active:
+                # Same narrowing as the kafka_active branch above, same reasoning: this
+                # boolean is one of the two disjuncts that guarantee consts was built.
+                assert consts is not None
                 hr = extract_http_client(ctx, node_ids, svc_idioms, consts)
                 # http_call: per-file claim, consumed later by S7 (T7) via
                 # staging.claims_for + the cross-service http_route table (CALLS_HTTP).
@@ -238,7 +250,13 @@ def analyze_service(
     edges.extend(domain_edges)
 
     staging.upsert_nodes(nodes)
-    staging.upsert_edges(edges)
+    # origin_service=svc.name (M2 final review fix): tags this WHOLE batch (python_core
+    # + fastapi/kafka/temporal domain edges) as emitted by THIS service's own S5 run, so
+    # a later begin_service(svc.name) can find and delete it on re-index -- regardless
+    # of whether an individual edge's OWN src happens to be chan:-prefixed (HANDLES,
+    # kafka CONTAINS), which carries no derivable service of its own (see
+    # Staging.upsert_edges/begin_service docstrings for the bug this closes).
+    staging.upsert_edges(edges, origin_service=svc.name)
 
     # 6. join: CALLS (static/1.0 либо heuristic/0.6 при деградации); local_defs_for_file
     # хоистится за пределы build_calls, чтобы не бить SQL на каждый local-символ-callsite —

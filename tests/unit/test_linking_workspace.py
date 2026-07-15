@@ -122,11 +122,91 @@ def test_clear_workspace_layer_removes_stale_business_process(tmp_path):
     assert not any(n.kind == "BusinessProcess" and n.id == "proc:stale" for n in st.iter_nodes())
 
 
-def test_clear_workspace_layer_does_not_remove_channel_nodes(tmp_path):
+def test_clear_workspace_layer_does_not_remove_referenced_channel_nodes(tmp_path):
+    """A Channel node that's still referenced by an edge (the normal, live case) must
+    survive the full link_workspace pipeline -- not blanket-deleted by
+    clear_workspace_layer (T7's own fix, see its docstring) NOR swept by the M2 final
+    review's end-of-pipeline gc_orphan_channels (which only targets Channel nodes with
+    ZERO referencing edges -- see test_link_workspace_gc_removes_unreferenced_channel_
+    node below for that complementary case)."""
     st = Staging(tmp_path / "s.db")
     chan = make_channel_node("kafka_topic", name="orders.events")
-    st.upsert_nodes([chan])
+    producer = _fn("sym:a:producer", "a", "producer", "q.producer")
+    st.upsert_nodes([chan, producer])
+    st.upsert_edges([_edge(producer.id, chan.id, "PRODUCES")])
     link_workspace(_cfg(), st)
+    assert any(n.id == chan.id for n in st.iter_nodes())
+
+
+# -- M2 final review: gc_orphan_channels, run at the end of link_workspace --
+
+
+def test_link_workspace_gc_removes_unreferenced_channel_node(tmp_path):
+    """The regression this fix targets: a Channel node with NO referencing edge at all
+    (e.g. the OLD id left behind by a route/topic rename -- its own edges were already
+    retired by this run's origin_service-scoped begin_service, see Staging.begin_service's
+    docstring, but the Channel NODE itself has no per-service home to be swept by
+    begin_service) must be gone after a full link_workspace pass, and counted in the
+    returned report."""
+    st = Staging(tmp_path / "s.db")
+    orphan = make_channel_node("kafka_topic", name="stale.orphan.topic")
+    st.upsert_nodes([orphan])
+    report = link_workspace(_cfg(), st)
+    assert not any(n.id == orphan.id for n in st.iter_nodes())
+    assert report["channels_gc"] == 1
+
+
+def test_link_workspace_gc_runs_before_http_routes_link_so_stale_channel_is_not_rematched(
+    tmp_path,
+):
+    """Ordering pin for the M2 final review fix (see gc_orphan_channels' own docstring):
+    GC must run BEFORE http_routes.link, or a stale Channel -- edge-less as of
+    clear_workspace_layer, e.g. the old id left behind by a renamed route -- would
+    still be visible to http_routes.link's route-table scan and get incorrectly
+    re-matched by an unrelated claim, keeping it "referenced" and therefore immune to
+    a LATER GC pass (the exact ordering bug this fix's own double-run regression test
+    caught when GC was first, wrongly, placed at the end of link_workspace)."""
+    st = Staging(tmp_path / "s.db")
+    # Edge-less BEFORE link_workspace starts -- stands in for "the old Channel id from
+    # a renamed route, whose own HANDLES edge begin_service already correctly retired
+    # this run" (see Staging.begin_service's docstring); not re-derived by anything in
+    # this scenario, so it should never become referenced again.
+    stale = make_channel_node("http_route", owner_service="svc", method="GET",
+                               template="/x", http_method="GET", path_template="/x")
+    st.upsert_nodes([stale])
+    st.add_claims("caller", "app/client.py", "http_call", [{
+        "src_id": "sym:caller:client", "verb": "GET", "path_template": "/x",
+        "base_url_env": None, "resolution_hint": "static", "evidence_line": 3,
+    }])
+
+    report = link_workspace(_cfg(), st)
+
+    assert report["channels_gc"] == 1
+    assert not any(n.id == stale.id for n in st.iter_nodes())
+    # the claim falls back to UNRESOLVED (a brand new owner="?" channel), instead of
+    # silently re-matching the (correctly removed) stale route.
+    assert report["calls_http_unresolved"] == 1
+    calls_http = next(e for e in st.iter_edges() if e.type == "CALLS_HTTP")
+    assert calls_http.dst != stale.id
+
+
+def test_link_workspace_gc_does_not_remove_channel_gaining_a_fresh_edge_this_run(tmp_path):
+    """Complements the ordering test above: a Channel that legitimately gains its FIRST
+    edge as part of THIS run's own S5 data (HANDLES, staged together with the Channel in
+    the same upsert_edges batch analyze_service always uses -- see analyze.py) must
+    survive, since GC only ever sees Channels that are ALREADY edge-less once
+    clear_workspace_layer has run, and this one never was."""
+    st = Staging(tmp_path / "s.db")
+    chan = make_channel_node("http_route", owner_service="svc", method="GET", template="/x",
+                              http_method="GET", path_template="/x")
+    handler = _fn("sym:svc:handler", "svc", "handler", "q.handler")
+    st.upsert_nodes([chan, handler])
+    st.upsert_edges([_edge(chan.id, handler.id, "HANDLES", extractor="fastapi")],
+                     origin_service="svc")
+
+    report = link_workspace(_cfg(), st)
+
+    assert report["channels_gc"] == 0
     assert any(n.id == chan.id for n in st.iter_nodes())
 
 
@@ -183,4 +263,5 @@ def test_link_workspace_returns_all_expected_counter_keys(tmp_path):
     report = link_workspace(_cfg(), st)
     assert report.keys() == {
         "calls_http", "calls_http_unresolved", "next_segments", "processes", "marks",
+        "channels_gc",
     }

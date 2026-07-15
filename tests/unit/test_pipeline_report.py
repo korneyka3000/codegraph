@@ -35,7 +35,7 @@ LOAD_STATS = {
 }
 LINK_STATS = {
     "calls_http": 5, "calls_http_unresolved": 1,
-    "next_segments": 3, "processes": 2, "marks": 1,
+    "next_segments": 3, "processes": 2, "marks": 1, "channels_gc": 4,
 }
 
 
@@ -211,7 +211,8 @@ def test_print_report_shows_linking_summary_when_present():
     text = console.export_text()
 
     assert "linking" in text.lower()
-    for value in ("5", "1", "3", "2"):  # calls_http/unresolved/next_segments/processes
+    # calls_http/unresolved/next_segments/processes/channels_gc
+    for value in ("5", "1", "3", "2", "4"):
         assert value in text
 
 

@@ -127,7 +127,16 @@ def build_calls(
         )
         for (src, dst), entry in agg.items()
     ]
-    staging.upsert_edges(edges)
+    # origin_service=service (M2 final review fix): S6's own upsert_edges call ("build_calls
+    # пишет сам" -- it writes its own batch, separate from analyze.py's S5 batch above) must
+    # tag its CALLS edges with the SAME service too, or an untagged (origin_service=None)
+    # batch would never be found by ANY begin_service() call. A same-(src,dst) CALLS edge
+    # re-emitted on the next analyze just replaces its own row either way (INSERT OR
+    # REPLACE on the (src,dst,type) PK), but a call site REMOVED from source between two
+    # analyze runs would leave its now-stale CALLS edge undeletable forever -- the exact
+    # same "survives re-index" symptom this whole fix batch targets, just for CALLS instead
+    # of HANDLES/CONTAINS (see Staging.upsert_edges/begin_service docstrings).
+    staging.upsert_edges(edges, origin_service=service)
 
     return JoinStats(
         calls_joined=calls_joined,

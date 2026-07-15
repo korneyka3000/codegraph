@@ -36,9 +36,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_service ON nodes(service);
 CREATE TABLE IF NOT EXISTS edges(
   src TEXT, dst TEXT, type TEXT, resolution TEXT, confidence REAL,
   extractor TEXT, evidence_file TEXT, evidence_line INTEGER, props TEXT,
-  src_service TEXT,
+  origin_service TEXT,
   PRIMARY KEY(src, dst, type));
-CREATE INDEX IF NOT EXISTS idx_edges_service ON edges(src_service);
+CREATE INDEX IF NOT EXISTS idx_edges_origin ON edges(origin_service);
 CREATE TABLE IF NOT EXISTS claims(
   service TEXT, relpath TEXT, kind TEXT, payload_json TEXT,
   PRIMARY KEY(service, relpath, kind, payload_json));
@@ -73,8 +73,11 @@ class Staging:
         elif current != str(SCHEMA_VERSION):
             raise InvariantError(
                 f"schema_version mismatch: staging has {current!r}, expected "
-                f"{SCHEMA_VERSION!r} — recreate the staging DB (delete the file and "
-                "re-run indexing from scratch)"
+                f"{SCHEMA_VERSION!r} — the on-disk table layout changed (see "
+                "core/schema.py SCHEMA_VERSION's history comment for what and why) "
+                "and cannot be read forward; staging is a disposable derived cache, "
+                "not a source of truth — recreate it (delete the file and re-run "
+                "indexing from scratch)"
             )
 
     def close(self) -> None:
@@ -90,19 +93,38 @@ class Staging:
 
     def begin_service(self, service: str) -> None:
         """Сбрасывает S1-S6 слой ОДНОГО сервиса (files/defs/refs/nodes/edges с
-        src_service=service) + его claims. НЕ трогает workspace-слой (Channel/
+        origin_service=service) + его claims. НЕ трогает workspace-слой (Channel/
         BusinessProcess-узлы, extractor="linking"-рёбра, чужие claims) -- те
         живут в отдельном скоупе, чистятся ТОЛЬКО clear_workspace_layer() (см. её
         докстринг и Global Constraint 2 плана M2). Раньше здесь был ещё глобальный
         `DELETE FROM edges WHERE src_service IS NULL` "страховкой от накопления" --
         убран: он стирал ЛЮБОЙ null-src edge (в т.ч. рёбра с chan:/proc: концом) как
         побочный эффект обработки ОДНОГО сервиса, что ломало персистентность
-        workspace-слоя между прогонами S7."""
+        workspace-слоя между прогонами S7.
+
+        M2 FINAL REVIEW FIX (origin_service replaces src_service as the deletion key):
+        `src_service` was derived from `e.src`'s OWN prefix (`_id_service(e.src)`, used
+        for the cross-service INVARIANT check below) -- but that's None for ANY
+        chan:/proc:-prefixed src, regardless of which service's analyze emitted the
+        edge. HANDLES (src=chan:, dst=handler -- fastapi_ext's own convention) and kafka
+        CONTAINS (chan:topic -> chan:event) edges therefore ALWAYS had src_service=NULL,
+        so this DELETE could never find them no matter which service originally wrote
+        them: they silently survived every re-index. Empirically, that meant a renamed
+        route (or renamed kafka topic/event) left its OLD HANDLES/CONTAINS edge -- and
+        the now-orphaned old Channel node it pointed at/from -- staged forever,
+        poisoning S7's route table with a stale pattern on the SECOND `codegraph index`
+        run (false CALLS_HTTP/NEXT_SEGMENT matches against a route that no longer
+        exists in source). origin_service is instead an EXPLICIT "who emitted this
+        batch" fact supplied by the CALLER of upsert_edges (analyze_service always
+        passes svc.name for its own S5/S6 writes; S7/linking-derived batches pass
+        None, the default) -- entirely independent of the edge's own endpoint
+        prefixes, so it has no such blind spot. See `upsert_edges` and
+        `gc_orphan_channels` (the companion fix for the orphaned Channel node itself)."""
         cur = self._db
         for t in ("files", "scip_defs", "scip_refs"):
             cur.execute(f"DELETE FROM {t} WHERE service=?", (service,))  # noqa: S608
         cur.execute("DELETE FROM nodes WHERE service=?", (service,))
-        cur.execute("DELETE FROM edges WHERE src_service=?", (service,))
+        cur.execute("DELETE FROM edges WHERE origin_service=?", (service,))
         cur.execute("DELETE FROM claims WHERE service=?", (service,))
         self._db.commit()
 
@@ -186,7 +208,7 @@ class Staging:
         )
         self._db.commit()
 
-    def upsert_edges(self, rows: list[EdgeRec]) -> None:
+    def upsert_edges(self, rows: list[EdgeRec], origin_service: str | None = None) -> None:
         """Cross-service инвариант (Global Constraint 1 плана M2):
           - endpoints, начинающиеся на "chan:"/"proc:" -- без cross-service проверки
             вовсе (каналы/процессы кросс-сервисны по природе, у них нет "своего"
@@ -195,7 +217,24 @@ class Staging:
             type == "NEXT_SEGMENT" И "via_channel_id" в props (иначе InvariantError).
           - всё прочее (в т.ч. svc:-конец в кросс-сервисной паре) -- как раньше,
             безусловный InvariantError.
-        """
+        Инвариант по-прежнему считается из `_id_service(e.src/dst)` (ss/ds ниже) --
+        это НЕ то же самое, что origin_service (см. следующий абзац); эндпойнт-сервис
+        и сервис-эмиттер -- разные оси.
+
+        `origin_service` -- сервис, чей ОДИН analyze_service-прогон эмитнул ВЕСЬ этот
+        батч рёбер (М2 final review fix): analyze_service передаёт `svc.name` при
+        КАЖДОМ своём вызове upsert_edges (S5 python_core/fastapi/kafka/temporal одним
+        батчем + отдельно S6 build_calls -- см. extractors/calls.py); S7/linking-код
+        (http_routes.link/segments.derive/processes.materialize/workspace._apply_
+        temporal_start_marks) передаёт None (дефолт) -- их рёбра не принадлежат ни
+        одному ОДНОМУ сервису, а чистятся целиком через clear_workspace_layer().
+        Хранится СЫРЫМ (без валидации/дедукции) в edges.origin_service, независимо
+        от e.src/e.dst -- именно поэтому она чинит проблему, которую ss (см. ниже)
+        не могла решить: ss/ds выводятся ИЗ endpoint-префикса (None для chan:/proc:),
+        а origin_service -- явный факт "кто это записал", который для chan:-src рёбер
+        (HANDLES, kafka CONTAINS) настоящий сервис-эмиттер ВСЕГДА имеет, даже когда
+        endpoint сам по себе этого не выражает. `begin_service` теперь чистит
+        edges.origin_service, а не производный ss (см. её докстринг)."""
         prepared = []
         for e in rows:
             ss, ds = _id_service(e.src), _id_service(e.dst)
@@ -214,11 +253,68 @@ class Staging:
                     )
             prepared.append((e.src, e.dst, e.type, e.resolution, e.confidence,
                              e.extractor, e.evidence_file, e.evidence_line,
-                             json.dumps(e.props), ss))
+                             json.dumps(e.props), origin_service))
         self._db.executemany(
             "INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?)", prepared
         )
         self._db.commit()
+
+    def gc_orphan_channels(self) -> int:
+        """M2 final review fix, companion to the origin_service change above: deletes
+        every Channel node (kind='Channel') referenced by ZERO edges (as either src or
+        dst). Intended call site is `linking.workspace.link_workspace`, immediately
+        AFTER `clear_workspace_layer()` and BEFORE every derivation stage (temporal
+        marks, http_routes.link, segments.derive, processes.materialize) -- see that
+        function's own docstring for why this exact position is load-bearing, not just
+        convenient: by the time clear_workspace_layer() has run, every REAL Channel
+        already has its S5-native edge (fastapi_ext's HANDLES, kafka_ext's
+        PRODUCES/CONSUMES/CONTAINS -- created in the SAME analyze_service batch as the
+        Channel itself, extractor != "linking", so untouched by clear_workspace_layer),
+        so a Channel with zero edges at this exact point can only be leftover data, not
+        legitimately in-progress. Running GC BEFORE http_routes.link matters: that stage
+        rebuilds its route table by scanning EVERY staged Channel(http_route) node,
+        stale or not -- if a stale Channel were still present when it scans, a claim
+        that happens to still target the old (renamed-away) pattern would silently
+        re-match it, minting a brand new CALLS_HTTP edge into a route that no longer
+        exists in source and keeping the stale Channel "referenced" (and therefore
+        immune to a LATER GC pass) forever. Running GC any later than immediately-after-
+        clear would reopen exactly this hole; empirically caught by this fix's own
+        double-run regression test (see tests/unit/test_reindex_regression.py) when GC
+        was first (wrongly) placed at the end of link_workspace instead.
+
+        A Channel becomes orphaned this way in two cases this fix specifically closes:
+        (1) a route/topic/event rename makes the extractor emit a NEW deterministic
+        Channel id this run; the OLD id's HANDLES/PRODUCES/CONSUMES/CONTAINS edge is now
+        correctly deleted by begin_service's origin_service-scoped DELETE (see its
+        docstring), but the OLD Channel NODE itself has no per-service deletion at all
+        (Channel.service is always "" -- core/schema.py make_channel_node -- so
+        begin_service's "DELETE FROM nodes WHERE service=?" never touches it either);
+        (2) an http_call claim that resolved to an "unresolved" synthetic fallback
+        Channel in a PRIOR run now resolves to a real route, or simply no longer exists
+        -- clear_workspace_layer wipes the old extractor="linking" CALLS_HTTP edge that
+        pointed at the fallback channel at the START of this same link_workspace run, so
+        the fallback channel has zero edges by the time this method runs, UNLESS some
+        other still-unresolved claim needs the exact same (verb, path) fallback again
+        (in which case http_routes.link, running right after this method, simply
+        recreates the identical deterministic id -- a harmless GC-then-recreate, not
+        data loss).
+
+        Returns the number of Channel nodes removed (0 -- the common case -- is a
+        cheap no-op: no DELETE statement is even issued)."""
+        referenced: set[str] = set()
+        for row in self._db.execute("SELECT src, dst FROM edges"):
+            referenced.add(row[0])
+            referenced.add(row[1])
+        orphan_ids = [
+            row[0] for row in self._db.execute("SELECT id FROM nodes WHERE kind='Channel'")
+            if row[0] not in referenced
+        ]
+        if orphan_ids:
+            self._db.executemany(
+                "DELETE FROM nodes WHERE id=?", [(oid,) for oid in orphan_ids]
+            )
+            self._db.commit()
+        return len(orphan_ids)
 
     def update_edge_props(self, src: str, dst: str, type: str, merge: dict) -> bool:  # noqa: A002
         """Json-merge поверх существующих props ребра (src,dst,type) -- shallow

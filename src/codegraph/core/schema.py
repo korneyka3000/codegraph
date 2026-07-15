@@ -7,7 +7,23 @@ from typing import Literal
 
 from codegraph.core import ids
 
-SCHEMA_VERSION = 1
+# Schema history (staging.db on-disk layout -- see stores/staging.py's _DDL and
+# _check_schema_version):
+#   1 -> 2 (M2 final whole-milestone review, fix-now batch): edges.origin_service
+#     replaces edges.src_service as begin_service()'s deletion key. src_service was
+#     derived from an edge's OWN src prefix (_id_service(e.src)), which is None for
+#     any chan:/proc:-prefixed src regardless of which service's analyze emitted the
+#     edge -- HANDLES (src=chan:, fastapi_ext's own convention) and kafka CONTAINS
+#     (chan:topic -> chan:event) edges therefore always had src_service=NULL, so
+#     begin_service(service)'s old "WHERE src_service=?" could never delete them: they
+#     silently survived every re-index, and a renamed route/topic/event left a stale
+#     HANDLES/CONTAINS edge (plus its now-orphaned Channel node) poisoning S7's route
+#     table on the SECOND `codegraph index` run. origin_service is an explicit "which
+#     service's analyze wrote this batch" fact supplied by the CALLER of upsert_edges,
+#     independent of the edge's own endpoints (see Staging.upsert_edges/begin_service
+#     docstrings) -- plus a companion Staging.gc_orphan_channels() sweep for the
+#     orphaned Channel node itself, run at the end of link_workspace.
+SCHEMA_VERSION = 2
 NODE_KINDS = frozenset({
     "Service", "Module", "Class", "Function", "Channel", "BusinessProcess",
 })

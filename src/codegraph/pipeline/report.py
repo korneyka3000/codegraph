@@ -30,7 +30,8 @@ def build_report(per_service: list[dict], load_stats: dict, link_stats: dict | N
     edges_dropped_missing_endpoint + by-type/by-label разбивки). link_stats (M2 T7,
     аддитивный параметр -- дефолт None сохраняет ПОЛНОСТЬЮ идентичный dict для каждого
     существующего 2-позиционного вызова): возврат linking.workspace.link_workspace()
-    (calls_http/calls_http_unresolved/next_segments/processes/marks).
+    (calls_http/calls_http_unresolved/next_segments/processes/marks/channels_gc --
+    последний M2 final review: orphan-Channel-узлы, выметенные в конце link_workspace).
 
     Возврат -- JSON-сериализуемый dict: {"services", "totals", "load", "health"} + ключ
     "linking" (ТОЛЬКО если link_stats передан -- см. выше). "health": pct_unresolved_calls
@@ -148,5 +149,6 @@ def print_report(report: dict, console: Console) -> None:
             f"linking: channels calls_http = {linking.get('calls_http', 0)} "
             f"(unresolved={linking.get('calls_http_unresolved', 0)}), "
             f"next_segments = {linking.get('next_segments', 0)}, "
-            f"processes = {linking.get('processes', 0)}"
+            f"processes = {linking.get('processes', 0)}, "
+            f"channels_gc = {linking.get('channels_gc', 0)}"
         )

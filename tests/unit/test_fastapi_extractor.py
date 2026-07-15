@@ -351,6 +351,54 @@ async def handler(db: Annotated[Session, Depends(get_dep)]):
     assert depends[0].props == {"via": "annotated"}
 
 
+# -- M2 final review: _DEPENDS_RE word-boundary lookbehind --
+
+
+def test_depends_on_lookalike_mydepends_call_is_not_matched_as_real_depends():
+    """Regression: a param default that merely ENDS WITH "Depends(...)" -- e.g. a
+    same-file custom `MyDepends` callable entirely unrelated to FastAPI's own
+    Depends() -- must not be misread as a real Depends() call. Before the
+    `(?<!\\w)` lookbehind, _DEPENDS_RE.search matched the "Depends(" substring
+    starting right after "My" (re.search has no left boundary of its own), wrongly
+    resolving `factory` as a DEPENDS_ON target."""
+    src = b'''from fastapi import APIRouter
+
+
+def MyDepends(x):
+    return x
+
+
+router = APIRouter()
+
+
+@router.get("/x")
+async def handler(db=MyDepends(factory)):
+    pass
+'''
+    relpath = "m.py"
+
+    # Would resolve if the extractor ever called it -- proves the regex itself rejects
+    # the match (no lookup attempted), not merely that some stub happens to return None.
+    def ref_lookup(rp, sb):
+        return "scip-python python svc 0.0 `m`/factory()."
+
+    ctx, node_ids = _load(relpath, "svc", src, ref_symbol_lookup=ref_lookup)
+    result = extract_fastapi(ctx, node_ids)
+
+    assert not any(e.type == "DEPENDS_ON" for e in result.edges)
+    # the outer "Depends(" substring pre-check still lets it through to attempt
+    # resolution (a fast-path heuristic, not itself boundary-aware) -- _resolve_depends_
+    # target's own regex is what correctly rejects it, counted as unresolved same as any
+    # other failed resolution.
+    assert result.stats["depends_unresolved"] == 1
+    assert result.stats["depends_resolved"] == 0
+    # legitimate shapes still match after the lookbehind (not an over-broad rejection):
+    # bare `Depends(x)` as the whole default (create_order/get_order tests above) and
+    # `Annotated[X, Depends(x)]` (comma+space-preceded -- test_depends_on_annotated_
+    # form_via_annotated) both already pass, covering start-of-text and mid-text
+    # legitimate positions respectively.
+
+
 # -- prefix / template edge cases (APIRouter prefix, FastAPI no-prefix, both-empty) --
 
 

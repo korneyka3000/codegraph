@@ -194,7 +194,17 @@ def _emit_kafka_topic_produces(
     if resolved.kind == "unresolved":
         sink.stats["producer_unresolved_channel"] += 1
         return
-    chan = make_channel_node("kafka_topic", name=_channel_name(resolved))
+    name = _channel_name(resolved)
+    if not name:
+        # M2 final review fix: an empty resolved value ("" literal, or an f-string with
+        # no static content at all, e.g. f"" -- both resolve to kind="value"/"template"
+        # with value="", NOT kind="unresolved") used to reach make_channel_node(name="")
+        # below, which raises ValueError ("requires name") -- crashing the whole
+        # `codegraph index` run instead of being treated as just another unresolved
+        # channel, same as any other resolution failure.
+        sink.stats["producer_unresolved_channel"] += 1
+        return
+    chan = make_channel_node("kafka_topic", name=name)
     resolution, confidence = _resolution_for(m.tier, resolved)
     sink.channels.append(chan)
     sink.edges.append(EdgeRec(
@@ -215,8 +225,15 @@ def _emit_event_type_produces(
     if event_resolved.kind == "unresolved":
         sink.stats["producer_unresolved_channel"] += 1
         return
+    event_name = _channel_name(event_resolved)
+    if not event_name:
+        # M2 final review fix: same empty-name guard as _emit_kafka_topic_produces --
+        # see its comment for why this can't be folded into the "unresolved" branch
+        # above (kind="value"/"template" with value="" is a DIFFERENT Resolved shape).
+        sink.stats["producer_unresolved_channel"] += 1
+        return
 
-    event_chan = make_channel_node("event_type", name=_channel_name(event_resolved))
+    event_chan = make_channel_node("event_type", name=event_name)
     event_res, event_conf = _resolution_for(m.tier, event_resolved)
     sink.channels.append(event_chan)
     sink.edges.append(EdgeRec(
@@ -233,7 +250,14 @@ def _emit_event_type_produces(
     topic_resolved = resolve_value_spec(channel.topic, m.call, consts)
     if topic_resolved.kind == "unresolved":
         return
-    topic_chan = make_channel_node("kafka_topic", name=_channel_name(topic_resolved))
+    topic_name = _channel_name(topic_resolved)
+    if not topic_name:
+        # M2 final review fix: same empty-name guard, kept silent (no counter bump) to
+        # match this branch's PRE-EXISTING "unresolved topic" convention just above (it
+        # never counted a stat either -- the containment edge/topic channel are simply
+        # skipped, the already-emitted event PRODUCES edge above is unaffected).
+        return
+    topic_chan = make_channel_node("kafka_topic", name=topic_name)
     topic_res, topic_conf = _resolution_for(m.tier, topic_resolved)
     sink.channels.append(topic_chan)
     sink.edges.append(EdgeRec(
@@ -296,8 +320,16 @@ def _emit_call_consumer(
     if resolved.kind == "unresolved":
         sink.stats["consumer_unresolved_topic"] += 1
         return
+    name = _channel_name(resolved)
+    if not name:
+        # M2 final review fix: same empty-name guard as the producer side (see
+        # _emit_kafka_topic_produces) -- an empty resolved topic value must not crash
+        # make_channel_node, and is exactly as "unresolved" as any other failed
+        # resolution for the purposes of this counter.
+        sink.stats["consumer_unresolved_topic"] += 1
+        return
 
-    chan = make_channel_node("kafka_topic", name=_channel_name(resolved))
+    chan = make_channel_node("kafka_topic", name=name)
     resolution, confidence = _resolution_for(m.tier, resolved)
     sink.channels.append(chan)
     sink.edges.append(EdgeRec(
@@ -338,7 +370,12 @@ def _emit_dispatch_dict(
 
     resolved_events: list[NodeRec] = []
     for key_arg, value_arg in dict_arg.dict_items:
-        if key_arg.value_kind != "string" or key_arg.string_value is None:
+        # `not key_arg.string_value` (M2 final review fix) rather than `is None`:
+        # catches an empty-string key ("": handler) too, which used to reach
+        # make_channel_node(name="") below and raise ValueError -- same empty-name
+        # crash class as the producer/consumer paths above, just via a dict key
+        # literal instead of a Resolved value.
+        if key_arg.value_kind != "string" or not key_arg.string_value:
             continue
         handler_id = _resolve_dispatch_handler(ctx, value_arg)
         if handler_id is None:
@@ -362,7 +399,14 @@ def _emit_dispatch_dict(
     topic_resolved = resolve_value_spec(idiom.topic, m.call, consts)
     if topic_resolved.kind == "unresolved":
         return
-    topic_chan = make_channel_node("kafka_topic", name=_channel_name(topic_resolved))
+    topic_name = _channel_name(topic_resolved)
+    if not topic_name:
+        # M2 final review fix: same empty-name guard, silent like the "unresolved"
+        # branch just above it (this topic-containment pairing is best-effort on top
+        # of the already-emitted per-event CONSUMES edges, same convention as
+        # _emit_event_type_produces' own topic_chan guard).
+        return
+    topic_chan = make_channel_node("kafka_topic", name=topic_name)
     sink.channels.append(topic_chan)
     topic_res, topic_conf = _resolution_for(m.tier, topic_resolved)
     for event_chan in resolved_events:

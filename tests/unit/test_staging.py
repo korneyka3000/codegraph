@@ -223,17 +223,74 @@ def test_process_endpoint_edge_no_cross_service_check(tmp_path):
 
 def test_begin_service_does_not_wipe_other_services_null_src_edges(tmp_path):
     st = Staging(tmp_path / "s.db")
-    # proc: src -> NULL src_service; must survive an unrelated service's
-    # begin_service (old code deleted ALL null-src edges globally as a side
-    # effect of ANY single service's begin_service call -- this is the fixed
-    # regression: workspace-layer edges are now cleared ONLY by
-    # clear_workspace_layer(), never as a side effect of begin_service).
+    # proc: src, no origin_service (S7-linking-derived, the default) -- must survive an
+    # unrelated service's begin_service (old M1b code deleted ALL null-src edges
+    # globally as a side effect of ANY single service's begin_service call -- that
+    # regression is fixed by scoping deletion to clear_workspace_layer() alone, never
+    # a side effect of begin_service). See the origin_service-specific tests below
+    # (M2 final review) for a second, narrower survival gap in the SAME edges-outlive-
+    # a-re-index family: a chan:-src edge that DOES belong to one service's own S5 run.
     e = EdgeRec("proc:place-order", "sym:a:`m`/f().", "PART_OF_PROCESS",
                 "derived", 1.0, "linking")
     st.upsert_edges([e])
     st.begin_service("b")  # unrelated service; never touched "a" or the process
     edges = list(st.iter_edges())
     assert len(edges) == 1 and edges[0].type == "PART_OF_PROCESS"
+
+
+# -- M2 final review: origin_service (replaces src_service as begin_service's deletion
+# key -- see Staging.upsert_edges/begin_service docstrings for the stale-layer bug this
+# closes: a chan:-src edge like HANDLES has no derivable _id_service(src) at all, so the
+# OLD scheme could never find it on re-index no matter which service wrote it) --
+
+
+def test_begin_service_deletes_chan_src_edge_tagged_with_its_own_origin_service(tmp_path):
+    """The core regression proof: a HANDLES-shaped edge (src=chan:, a prefix
+    _id_service can't attribute to any service -- see staging.py's _id_service) is
+    still deleted by ITS OWN emitting service's begin_service, because origin_service
+    is passed explicitly by the caller rather than derived from e.src's prefix."""
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("chan:http:a:GET /x", "sym:a:`m`/handler().", "HANDLES",
+                "static", 1.0, "fastapi")
+    st.upsert_edges([e], origin_service="a")
+    st.begin_service("a")
+    assert list(st.iter_edges()) == []
+
+
+def test_begin_service_does_not_delete_chan_src_edge_of_a_different_origin_service(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("chan:http:b:GET /x", "sym:b:`m`/handler().", "HANDLES",
+                "static", 1.0, "fastapi")
+    st.upsert_edges([e], origin_service="b")
+    st.begin_service("a")  # unrelated service
+    edges = list(st.iter_edges())
+    assert len(edges) == 1 and edges[0].src == "chan:http:b:GET /x"
+
+
+def test_begin_service_does_not_delete_edges_with_no_origin_service(tmp_path):
+    """origin_service=None (the default -- S7/linking-derived batches, e.g.
+    NEXT_SEGMENT/CALLS_HTTP/PART_OF_PROCESS) must be immune to EVERY service's
+    begin_service, same contract as the pre-existing null-src test above, now proven
+    directly against the new column instead of the retired src_service one."""
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("sym:a:`m`/f().", "sym:b:`m`/g().", "NEXT_SEGMENT", "derived", 0.9,
+                "linking", props={"via_channel_id": "chan:kafka_topic:orders"})
+    st.upsert_edges([e])  # origin_service defaults to None
+    st.begin_service("a")
+    st.begin_service("b")
+    assert len(list(st.iter_edges())) == 1
+
+
+def test_begin_service_deletes_regular_sym_src_edge_tagged_with_origin_service(tmp_path):
+    """Sanity: the ordinary sym->sym case (e.g. a CALLS edge -- see extractors/calls.py)
+    keeps working exactly as before under the new column; origin_service and the
+    edge's own src-derived service happen to coincide here, but deletion now goes
+    through origin_service, not the coincidence."""
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "CALLS", "static", 1.0, "calls")
+    st.upsert_edges([e], origin_service="a")
+    st.begin_service("a")
+    assert list(st.iter_edges()) == []
 
 
 # -- M2: claims --
@@ -265,6 +322,25 @@ def test_claims_filtered_by_kind_and_service(tmp_path):
 
     claims_a_consumer = st.claims_for("kafka_consumer")
     assert len(claims_a_consumer) == 1 and claims_a_consumer[0]["topic"] == "t3"
+
+
+def test_claims_for_injected_service_and_relpath_win_over_payload_collision(tmp_path):
+    """claims_for's docstring has always claimed the injected "_service"/"_relpath"
+    win over same-named keys already present in the payload itself ("staging-метаданные
+    авторитетнее произвольного содержимого claim'а") -- documented since T1 but never
+    actually tested (progress.md M2 T1 backlog). {**payload, "_service": svc,
+    "_relpath": relpath} does put the injected keys last, so this should already pass;
+    this test pins that contract directly instead of leaving it merely asserted in
+    prose."""
+    st = Staging(tmp_path / "s.db")
+    st.add_claims("real-service", "real/path.py", "kafka_producer", [{
+        "topic": "orders.created", "_service": "fake-service", "_relpath": "fake/path.py",
+    }])
+    claims = st.claims_for("kafka_producer")
+    assert len(claims) == 1
+    assert claims[0]["_service"] == "real-service"
+    assert claims[0]["_relpath"] == "real/path.py"
+    assert claims[0]["topic"] == "orders.created"
 
 
 def test_claims_for_unknown_kind_returns_empty_list(tmp_path):
