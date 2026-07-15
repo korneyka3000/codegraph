@@ -42,7 +42,8 @@ from typing import Literal
 
 from codegraph.core.selectors import RouteSelector, parse_selector
 from codegraph.core.spans import LineIndex
-from codegraph.query import traverse
+from codegraph.embedding.base import Embedder
+from codegraph.query import retrieval, traverse
 from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
 from codegraph.stores.graph import GraphStore
 
@@ -62,18 +63,60 @@ _MAX_HOPS_MIN, _MAX_HOPS_MAX = 1, 12  # find_paths max_hops clamp
 _FIND_ENTRYPOINT_K_MIN, _FIND_ENTRYPOINT_K_MAX = 1, 20  # find_entrypoint k clamp
 _BUSINESS_PROCESS_KIND = "BusinessProcess"
 
+# -- M3 T7: search_code --
+_VALID_SEARCH_MODES = frozenset({"hybrid", "vector", "text"})
+_SEARCH_CODE_K_MIN, _SEARCH_CODE_K_MAX = 1, 20
+
 
 class GraphQuery:
     """service_paths: {service_name: абсолютный путь корня сервиса на диске} -- источник
     для get_source (сервис -> корень -> relpath). Строится вызывающей стороной
     (mcp/server.py: build_server из cfg.services, уже резолвленных config.loader в
-    абсолютные пути)."""
+    абсолютные пути).
+
+    embedder_factory (M3 T7, опционален -- None сохраняет ровно M2-поведение:
+    find_entrypoint остаётся чистым fulltext, search_code недоступен на уровне MCP
+    (build_server всегда даёт свой default), а _get_embedder() ниже тривиально
+    возвращает None без единого вызова factory): в ОТЛИЧИЕ от store_factory,
+    embedder НЕ пересоздаётся на каждый вызов -- см. _get_embedder's докстринг про
+    то, почему fresh-per-call здесь НЕ применяется (эмбеддер -- тяжёлая модель, а не
+    тонкий сетевой хендл с проблемой протухающего schema-кэша, см. модульный
+    докстринг про store_factory)."""
 
     def __init__(
-        self, store_factory: Callable[[], GraphStore], service_paths: dict[str, Path]
+        self,
+        store_factory: Callable[[], GraphStore],
+        service_paths: dict[str, Path],
+        embedder_factory: Callable[[], Embedder | None] | None = None,
     ) -> None:
         self.store_factory = store_factory
         self.service_paths = service_paths
+        self.embedder_factory = embedder_factory
+        self._embedder: Embedder | None = None
+
+    def _get_embedder(self) -> Embedder | None:
+        """Ленивое, но НЕ fresh-per-call создание embedder'а -- см. класс-докстринг.
+        Кэшируется на self ПОСЛЕ ПЕРВОГО УСПЕШНОГО создания (embedder_factory()
+        вернул не-None): построение реального embedder'а -- тяжёлая операция
+        (загрузка модели sentence-transformers, HTTP-хендл к OpenAI/Voyage), которую
+        не нужно повторять на каждый MCP tool-call, В ОТЛИЧИЕ ОТ store_factory,
+        которую нужно вызывать заново на каждый вызов (см. модульный докстринг про
+        RENAME/schema-кэш FalkorDB-клиента -- у embedder'а нет аналогичной "живая
+        модель под чужими данными" проблемы, кэш безопасен весь срок жизни
+        GraphQuery). Неуспех (factory() вернула None -- напр. `_default_embedder_
+        factory` в mcp/server.py поймала CodegraphError) НЕ кэшируется -- следующий
+        вызов пробует factory() заново, а не запоминает "недоступен" навсегда; это
+        дёшево (тот же catch-and-return-None, что уже произошёл один раз) и на
+        случай, если причина недоступности была временной (напр. сетевой сбой при
+        первой загрузке HF-модели)."""
+        if self._embedder is not None:
+            return self._embedder
+        if self.embedder_factory is None:
+            return None
+        embedder = self.embedder_factory()
+        if embedder is not None:
+            self._embedder = embedder
+        return embedder
 
     def graph_stats(self) -> dict:
         try:
@@ -336,16 +379,43 @@ class GraphQuery:
         kinds: Sequence[str] | None = None,
         k: int = 5,
     ) -> dict:
-        """store.search_fulltext делает и sanitize, и сам fulltext-запрос (см. её
-        докстринг) -- пустой результат (в т.ч. запрос, целиком состоящий из
-        RediSearch-спецсимволов) НЕ ошибка, обычный {"results": []}."""
+        """v2 (M3 T7): тонкая обёртка над retrieval.find_entrypoint (store_factory +
+        embedder через self._get_embedder() + StoreError-граница) -- вся RRF-
+        фьюжн/деградационная логика живёт там (см. её докстринг). store.search_fulltext
+        делает и sanitize, и сам fulltext-запрос -- пустой результат (в т.ч. запрос,
+        целиком состоящий из RediSearch-спецсимволов, или граф без единого совпадения)
+        НЕ ошибка, обычный {"results": [], "mode_used": ...}."""
         k = max(_FIND_ENTRYPOINT_K_MIN, min(_FIND_ENTRYPOINT_K_MAX, k))
         try:
             store = self.store_factory()
-            results = store.search_fulltext(query, k, kinds=kinds)
+            embedder = self._get_embedder()
+            return retrieval.find_entrypoint(store, embedder, query, k=k, kinds=kinds)
         except (StoreError, StoreUnavailable) as e:
             return {"error": f"falkordb unreachable: {e}"}
-        return {"results": results}
+
+    def search_code(
+        self,
+        query: str,
+        k: int = 8,
+        service: str | None = None,
+        mode: Literal["hybrid", "vector", "text"] = "hybrid",
+    ) -> dict:
+        """M3 T7, 9-й MCP-инструмент: тонкая обёртка над retrieval.search_code, тот
+        же store_factory/embedder/StoreError-паттерн, что find_entrypoint выше.
+        mode валидируется здесь, ДО store_factory() -- тот же принцип "дешёвая,
+        заведомо проваленная проверка не должна платить за подключение к store", что
+        у expand_neighbors/trace_process direction (см. модульный докстринг,
+        "Ограничения ответов"); retrieval.search_code ПОВТОРНО валидирует mode само
+        (defense in depth для прямых вызывающих retrieval.py в обход GraphQuery)."""
+        if mode not in _VALID_SEARCH_MODES:
+            return {"error": f"invalid search mode: {mode!r}"}
+        k = max(_SEARCH_CODE_K_MIN, min(_SEARCH_CODE_K_MAX, k))
+        try:
+            store = self.store_factory()
+            embedder = None if mode == "text" else self._get_embedder()
+            return retrieval.search_code(store, embedder, query, k=k, service=service, mode=mode)
+        except (StoreError, StoreUnavailable) as e:
+            return {"error": f"falkordb unreachable: {e}"}
 
     def resolve_selector(self, selector: str) -> dict:
         """M3 T2: resolves a "<service>:<METHOD> <path>" / "<service>:<dotted.name>"

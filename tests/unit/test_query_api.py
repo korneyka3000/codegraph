@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from codegraph.embedding.fake import FakeEmbedder
 from codegraph.query.api import GraphQuery
 from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
 
@@ -30,6 +31,11 @@ class FakeStore:
         self.neighbor_calls: list[tuple] = []
         self.fulltext_calls: list[tuple] = []
         self.fulltext_result: list[dict] = []
+        # -- M3 T7: search_code's two new store primitives (see stores/graph.py) --
+        self.text_chunk_calls: list[tuple] = []
+        self.text_chunk_result: list[tuple[dict, float]] = []
+        self.vector_chunk_calls: list[tuple] = []
+        self.vector_chunk_result: list[tuple[dict, float]] = []
 
     def add_node(self, node_id: str, **props) -> None:
         self.nodes[node_id] = {"id": node_id, **props}
@@ -72,6 +78,18 @@ class FakeStore:
             raise self.raise_error
         self.fulltext_calls.append((query, k, kinds))
         return self.fulltext_result
+
+    def search_text_chunks(self, query, k, service=None):
+        if self.raise_error:
+            raise self.raise_error
+        self.text_chunk_calls.append((query, k, service))
+        return self.text_chunk_result
+
+    def search_vector_chunks(self, vec, k, service=None):
+        if self.raise_error:
+            raise self.raise_error
+        self.vector_chunk_calls.append((vec, k, service))
+        return self.vector_chunk_result
 
     def find_by_qualified(self, service, qualified):
         if self.raise_error:
@@ -478,7 +496,8 @@ def test_each_public_method_call_gets_a_freshly_constructed_store():
     q.find_paths("x", "y")
     q.list_processes()
     q.find_entrypoint("x")
-    assert len(calls) == 7  # store_factory вызван по разу на публичный вызов, не кэшируется
+    q.search_code("x")  # M3 T7 -- store_factory-freshness applies to this too
+    assert len(calls) == 8  # store_factory вызван по разу на публичный вызов, не кэшируется
 
 
 # -- M2 T8: trace_process --
@@ -701,7 +720,12 @@ def test_find_entrypoint_delegates_to_search_fulltext_with_clamped_k():
     store.fulltext_result = [{"id": "sym:a:x", "score": 1.5}]
     q = GraphQuery(_factory(store), {})
     result = q.find_entrypoint("create order", k=999)
-    assert result == {"results": [{"id": "sym:a:x", "score": 1.5}]}
+    # v2 (M3 T7): same "results" shape as M2, plus "mode_used" -- no embedder_factory
+    # configured on this GraphQuery, so find_entrypoint degrades to its M2-identical
+    # pure-fulltext behavior here (mode_used="text"), see query.retrieval.find_entrypoint.
+    assert result == {
+        "results": [{"id": "sym:a:x", "score": 1.5}], "mode_used": "text",
+    }
     assert store.fulltext_calls == [("create order", 20, None)]  # clamped to 20
 
 
@@ -724,7 +748,7 @@ def test_find_entrypoint_empty_result_is_not_an_error():
     store.fulltext_result = []
     q = GraphQuery(_factory(store), {})
     result = q.find_entrypoint("gibberish query with no matches")
-    assert result == {"results": []}
+    assert result == {"results": [], "mode_used": "text"}
 
 
 # -- M3 T2: resolve_selector -- graph-side selector resolution (no staging.db needed,
@@ -857,3 +881,195 @@ def test_find_entrypoint_store_unreachable_returns_error_dict():
     q = GraphQuery(_factory(store), {})
     result = q.find_entrypoint("x")
     assert "falkordb unreachable" in result["error"]
+
+
+# -- M3 T7: find_entrypoint v2 is a thin wrapper over retrieval.find_entrypoint --
+# (the RRF-fusion/degradation MATH itself is covered by tests/unit/test_retrieval.py
+# against a minimal fake store; these tests monkeypatch retrieval.find_entrypoint as a
+# spy -- same technique as the existing trace_process/find_paths tests above -- to
+# isolate GraphQuery's OWN concerns: k-clamp, embedder resolution, StoreError boundary).
+
+
+def test_find_entrypoint_delegates_to_retrieval_with_clamped_k_and_kinds(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+    monkeypatch.setattr(
+        api_mod.retrieval, "find_entrypoint",
+        lambda store, embedder, query, k, kinds: calls.append((query, k, kinds))
+        or {"results": [], "mode_used": "text"},
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    result = q.find_entrypoint("create order", k=999, kinds=["Function"])
+    assert calls == [("create order", 20, ["Function"])]  # clamped to 20
+    assert result == {"results": [], "mode_used": "text"}
+
+
+def test_find_entrypoint_clamps_k_minimum_to_1(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+    monkeypatch.setattr(
+        api_mod.retrieval, "find_entrypoint",
+        lambda store, embedder, query, k, kinds: calls.append(k)
+        or {"results": [], "mode_used": "text"},
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    q.find_entrypoint("x", k=0)
+    assert calls == [1]
+
+
+def test_find_entrypoint_passes_resolved_embedder_to_retrieval(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    seen = []
+    monkeypatch.setattr(
+        api_mod.retrieval, "find_entrypoint",
+        lambda store, embedder, query, k, kinds: seen.append(embedder)
+        or {"results": [], "mode_used": "hybrid"},
+    )
+    store = FakeStore()
+    embedder = FakeEmbedder(dim=4)
+    q = GraphQuery(_factory(store), {}, embedder_factory=lambda: embedder)
+    q.find_entrypoint("x")
+    assert seen == [embedder]
+
+
+# -- M3 T7: search_code (9th MCP tool) --
+
+
+def test_search_code_delegates_to_retrieval_with_clamped_k(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+    monkeypatch.setattr(
+        api_mod.retrieval, "search_code",
+        lambda store, embedder, query, k, service, mode: calls.append(
+            (query, k, service, mode)
+        )
+        or {"items": [], "mode_used": mode},
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    result = q.search_code("create order", k=999, service="svc-a", mode="text")
+    assert calls == [("create order", 20, "svc-a", "text")]  # clamped to 20
+    assert result == {"items": [], "mode_used": "text"}
+
+
+def test_search_code_clamps_k_minimum_to_1(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+    monkeypatch.setattr(
+        api_mod.retrieval, "search_code",
+        lambda store, embedder, query, k, service, mode: calls.append(k)
+        or {"items": [], "mode_used": "text"},
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    q.search_code("x", k=0)
+    assert calls == [1]
+
+
+def test_search_code_invalid_mode_returns_error_before_store_factory_call():
+    store = FakeStore()
+    calls: list[FakeStore] = []
+    q = GraphQuery(_factory(store, calls), {})
+    result = q.search_code("x", mode="sideways")
+    assert result == {"error": "invalid search mode: 'sideways'"}
+    assert calls == []  # store_factory must never be called
+
+
+def test_search_code_store_unreachable_returns_error_dict():
+    store = FakeStore()
+    store.raise_error = StoreError("boom")
+    q = GraphQuery(_factory(store), {})
+    result = q.search_code("x")
+    assert "falkordb unreachable" in result["error"]
+
+
+def test_search_code_store_factory_failure_also_caught():
+    def failing_factory():
+        raise StoreUnavailable("down")
+
+    q = GraphQuery(failing_factory, {})
+    result = q.search_code("x")
+    assert "falkordb unreachable" in result["error"]
+
+
+def test_search_code_text_mode_never_constructs_an_embedder(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    factory_calls = []
+
+    def embedder_factory():
+        factory_calls.append(1)
+        return FakeEmbedder(dim=4)
+
+    monkeypatch.setattr(
+        api_mod.retrieval, "search_code",
+        lambda store, embedder, query, k, service, mode: {"items": [], "mode_used": "text"},
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {}, embedder_factory=embedder_factory)
+    q.search_code("x", mode="text")
+    assert factory_calls == []  # mode="text" never needs an embedder at all
+
+
+def test_search_code_non_text_mode_resolves_embedder_via_factory(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    seen = []
+    monkeypatch.setattr(
+        api_mod.retrieval, "search_code",
+        lambda store, embedder, query, k, service, mode: seen.append(embedder)
+        or {"items": [], "mode_used": "hybrid"},
+    )
+    store = FakeStore()
+    embedder = FakeEmbedder(dim=4)
+    q = GraphQuery(_factory(store), {}, embedder_factory=lambda: embedder)
+    q.search_code("x", mode="hybrid")
+    assert seen == [embedder]
+
+
+# -- M3 T7: embedder caching -- deliberately NOT fresh-per-call (see GraphQuery's own
+# class docstring/_get_embedder docstring for why this is a DIFFERENT policy axis from
+# store_factory's fresh-per-call rule, not a violation of it) --
+
+
+def test_get_embedder_caches_after_first_successful_creation():
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return FakeEmbedder(dim=4)
+
+    q = GraphQuery(_factory(FakeStore()), {}, embedder_factory=factory)
+    first = q._get_embedder()
+    second = q._get_embedder()
+    assert first is second
+    assert len(calls) == 1  # constructed once, cached thereafter
+
+
+def test_get_embedder_retries_factory_until_first_success_then_stops():
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return None if len(calls) < 3 else FakeEmbedder(dim=4)
+
+    q = GraphQuery(_factory(FakeStore()), {}, embedder_factory=factory)
+    assert q._get_embedder() is None
+    assert q._get_embedder() is None
+    embedder = q._get_embedder()
+    assert embedder is not None
+    assert len(calls) == 3
+    assert q._get_embedder() is embedder
+    assert len(calls) == 3  # cached now -- no further factory calls
+
+
+def test_get_embedder_returns_none_without_a_factory_configured_at_all():
+    q = GraphQuery(_factory(FakeStore()), {})  # embedder_factory defaults to None
+    assert q._get_embedder() is None

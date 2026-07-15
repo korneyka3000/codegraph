@@ -12,12 +12,33 @@ import re
 from collections.abc import Sequence
 from typing import Any, Literal
 
+import redis.exceptions
 from falkordb import FalkorDB
 
 from codegraph.config.models import FalkorDBConfig
 from codegraph.stores.falkordb import batch, ddl
 from codegraph.stores.falkordb.connection import connect
 from codegraph.stores.graph import Hop
+
+# M3 T7: db.idx.vector.queryNodes over a Chunk.embedding that has NO vector index
+# (degraded graph -- no embedder has ever run this workspace, see ddl.ensure_schema's
+# `dim`-gated CREATE VECTOR INDEX) raises this exact substring -- confirmed live
+# against FalkorDB v4.18.11 (redis.exceptions.ResponseError). Same discipline as
+# ddl.py's `_IGNORABLE_DDL_MARKERS`: a substring match on a real, empirically-captured
+# error message, not a blind catch-and-swallow of every ResponseError (a malformed
+# query or a genuinely different server-side failure must still propagate).
+_NO_VECTOR_INDEX_MARKER = "undefined attribute"
+
+# search_vector_chunks' service filter: `queryNodes(..., $k, ...)` picks its k nearest
+# neighbors BEFORE any `WHERE node.service = $service` runs (k is an argument to the
+# KNN procedure itself, not a Cypher LIMIT applied after filtering -- unlike
+# search_fulltext/search_text_chunks, whose fulltext procedure has no k argument at
+# all and where LIMIT naturally runs after WHERE) -- so filtering can leave FEWER than
+# k rows even when >=k service-matching chunks exist in the graph. Over-fetching this
+# multiple of k from the procedure call, THEN filtering, THEN trimming to k in Python
+# (not a Cypher LIMIT after the WHERE -- trimming client-side keeps this method's own
+# ORDER BY/slice logic in one place) gives real headroom without a second round trip.
+_VECTOR_SERVICE_FILTER_OVERFETCH = 4
 
 # Cypher-паттерн для каждой стороны обхода; node_id всегда идёт параметром ($id),
 # сюда попадают только эти два фиксированных, невыводимых из пользовательского ввода
@@ -223,6 +244,73 @@ class FalkorStore:
         cypher += " RETURN node, score ORDER BY score DESC LIMIT $k"
         res = self._g.query(cypher, params)
         return [{**node.properties, "score": score} for node, score in res.result_set]
+
+    def search_vector_chunks(
+        self, vec: list[float], k: int, service: str | None = None
+    ) -> list[tuple[dict, float]]:
+        """`CALL db.idx.vector.queryNodes('Chunk', 'embedding', $k, vecf32($vec)) YIELD
+        node, score` -- score is cosine DISTANCE (empirically confirmed live: querying
+        with a vector identical to a stored one yields ~0, a near-orthogonal one yields
+        ~1 -- i.e. LOWER is more similar, the opposite convention from search_fulltext's
+        RediSearch relevance score), so results are ordered `ORDER BY score ASC` (nearest
+        first), NOT DESC like search_fulltext.
+
+        `service`, if given, over-fetches `k * _VECTOR_SERVICE_FILTER_OVERFETCH`
+        candidates from the vector procedure itself (see that constant's own docstring
+        for why a plain post-hoc `WHERE` can't just reuse the same `k`), applies
+        `WHERE node.service = $service`, and trims the result back down to `k` in
+        Python (not a second `LIMIT $k` in the Cypher -- keeping the final cap as one
+        plain Python slice here, right where the docstring explaining it lives).
+
+        No vector index on this graph (degraded -- ensure_schema only creates one when
+        `dim` is given, i.e. some embedder has actually run) -> `[]`, never an
+        exception: confirmed live that FalkorDB raises `redis.exceptions.ResponseError`
+        ("...undefined attribute...") querying an absent index, which this method
+        catches by that specific substring (same discipline as ddl.py's
+        `_swallow_ddl_errors`) and turns into an honest empty result -- indistinguishable
+        from "the index exists but nothing matched", which is exactly the right
+        degraded-graph behavior for a caller that just wants "no vector matches", not a
+        crash."""
+        fetch_k = k * _VECTOR_SERVICE_FILTER_OVERFETCH if service else k
+        cypher = (
+            "CALL db.idx.vector.queryNodes('Chunk', 'embedding', $k, vecf32($vec)) "
+            "YIELD node, score"
+        )
+        params: dict[str, Any] = {"k": fetch_k, "vec": vec}
+        if service:
+            cypher += " WHERE node.service = $service"
+            params["service"] = service
+        cypher += " RETURN node, score ORDER BY score ASC"
+        try:
+            res = self._g.query(cypher, params)
+        except redis.exceptions.ResponseError as e:
+            if _NO_VECTOR_INDEX_MARKER not in str(e).lower():
+                raise
+            return []
+        return [(node.properties, score) for node, score in res.result_set][:k]
+
+    def search_text_chunks(
+        self, query: str, k: int, service: str | None = None
+    ) -> list[tuple[dict, float]]:
+        """Mirrors search_fulltext's sanitize-then-short-circuit contract (see
+        _sanitize_fulltext_query) over the Chunk(text, context_header) fulltext index
+        (ddl.ensure_schema) instead of Sym -- `service`, if given, filters `WHERE
+        node.service = $service` same as search_fulltext's `kinds`; the fulltext
+        procedure itself takes no `k` argument, so (unlike search_vector_chunks) a
+        plain `ORDER BY score DESC LIMIT $k` AFTER the WHERE is already correct with no
+        over-fetch needed. Returns `[(chunk_props, score)]` tuples -- see
+        search_vector_chunks's own docstring for why, shared with it."""
+        sanitized = _sanitize_fulltext_query(query)
+        if not sanitized:
+            return []
+        cypher = "CALL db.idx.fulltext.queryNodes('Chunk', $q) YIELD node, score"
+        params: dict[str, Any] = {"q": sanitized, "k": k}
+        if service:
+            cypher += " WHERE node.service = $service"
+            params["service"] = service
+        cypher += " RETURN node, score ORDER BY score DESC LIMIT $k"
+        res = self._g.query(cypher, params)
+        return [(node.properties, score) for node, score in res.result_set]
 
     def graph_exists(self) -> bool:
         """True, если граф-ключ self.graph_name существует (membership в GRAPH.LIST).

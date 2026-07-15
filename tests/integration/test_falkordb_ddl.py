@@ -164,3 +164,132 @@ def test_ensure_schema_creates_chunk_fulltext_index_and_finds_by_context_header(
         assert res.result_set == [["chunk:1"]]
     finally:
         store._g.delete()
+
+
+# -- M3 T7: store.search_vector_chunks / store.search_text_chunks -- the same Cypher
+# shapes as the raw-query tests above, now promoted to proper store methods (retrieval.py's
+# actual read path) -- score ordering (vector ASC=nearest-first / text DESC=most-relevant-
+# first), the service filter's over-fetch, and the no-vector-index -> [] degradation.
+
+VECTOR_METHOD_GRAPH = "__codegraph_t7_vector_method__"
+
+
+def test_search_vector_chunks_orders_nearest_first_by_cosine_distance(falkordb_cfg):
+    store = FalkorStore(falkordb_cfg, VECTOR_METHOD_GRAPH)
+    try:
+        store.ensure_schema(dim=4)
+        store.upsert_nodes(
+            ("Chunk",),
+            [
+                {"id": "near", "props": {"service": "svc-a"}},
+                {"id": "far", "props": {"service": "svc-a"}},
+            ],
+            vector_props=("embedding",),
+        )
+        # upsert_nodes' vector_props path needs the vector INSIDE the row (not props) --
+        # simplest here is a direct MERGE since it's just 2 hand-crafted vectors.
+        store._g.query(
+            "MERGE (c:Chunk {id: 'near'}) SET c.embedding = vecf32($v)",
+            {"v": [0.9, 0.05, 0.05, 0.0]},
+        )
+        store._g.query(
+            "MERGE (c:Chunk {id: 'far'}) SET c.embedding = vecf32($v)",
+            {"v": [0.0, 1.0, 0.0, 0.0]},
+        )
+
+        results = store.search_vector_chunks([1.0, 0.0, 0.0, 0.0], k=2)
+        assert [props["id"] for props, _score in results] == ["near", "far"]
+        # score ASC (nearest first): "near"'s distance must be strictly smaller.
+        assert results[0][1] < results[1][1]
+    finally:
+        store._g.delete()
+
+
+def test_search_vector_chunks_service_filter_overfetches_and_trims_to_k(falkordb_cfg):
+    store = FalkorStore(falkordb_cfg, VECTOR_METHOD_GRAPH)
+    try:
+        store.ensure_schema(dim=4)
+        for cid, svc, vec in (
+            ("a1", "svc-a", [1.0, 0.0, 0.0, 0.0]),
+            ("a2", "svc-a", [0.9, 0.1, 0.0, 0.0]),
+            ("b1", "svc-b", [0.95, 0.05, 0.0, 0.0]),  # closer than a2, but wrong service
+        ):
+            store._g.query(
+                "MERGE (c:Chunk {id: $id}) SET c.service = $svc, c.embedding = vecf32($v)",
+                {"id": cid, "svc": svc, "v": vec},
+            )
+
+        # k=2 with NO filter would naturally include b1 (2nd closest overall) -- the
+        # service filter must still return BOTH real svc-a chunks despite that.
+        results = store.search_vector_chunks([1.0, 0.0, 0.0, 0.0], k=2, service="svc-a")
+        assert {props["id"] for props, _score in results} == {"a1", "a2"}
+        assert len(results) == 2
+    finally:
+        store._g.delete()
+
+
+NO_VECTOR_INDEX_METHOD_GRAPH = "__codegraph_t7_no_vector_method__"
+
+
+def test_search_vector_chunks_returns_empty_list_not_exception_without_an_index(
+    falkordb_cfg,
+):
+    """The degraded-graph contract this task's brief calls for validating live: a
+    graph that has never been embedded (ensure_schema(dim=None), see
+    test_ensure_schema_without_dim_creates_no_vector_index above for proof the RAW
+    Cypher call raises) must make search_vector_chunks behave like an honest
+    zero-result search, not an exception -- callers (retrieval.py) shouldn't need
+    their own try/except around every vector search just to handle "not embedded yet"."""
+    store = FalkorStore(falkordb_cfg, NO_VECTOR_INDEX_METHOD_GRAPH)
+    try:
+        store.ensure_schema(dim=None)
+        assert store.search_vector_chunks([0.1, 0.2, 0.3, 0.4], k=5) == []
+    finally:
+        store._g.delete()
+
+
+TEXT_METHOD_GRAPH = "__codegraph_t7_text_method__"
+
+
+def test_search_text_chunks_orders_by_relevance_desc_and_respects_service_filter(
+    falkordb_cfg,
+):
+    store = FalkorStore(falkordb_cfg, TEXT_METHOD_GRAPH)
+    try:
+        store.ensure_schema()
+        store.upsert_nodes(("Chunk",), [
+            {
+                "id": "chunk:strong", "props": {
+                    "service": "svc-a",
+                    "text": "widget widget widget widget process order",
+                },
+            },
+            {
+                "id": "chunk:weak", "props": {
+                    "service": "svc-a", "text": "widget helper utility",
+                },
+            },
+            {
+                "id": "chunk:other-service", "props": {
+                    "service": "svc-b", "text": "widget widget widget widget widget",
+                },
+            },
+        ])
+
+        results = store.search_text_chunks("widget", k=5)
+        ids = {props["id"] for props, _score in results}
+        assert ids == {"chunk:strong", "chunk:weak", "chunk:other-service"}
+
+        filtered = store.search_text_chunks("widget", k=5, service="svc-a")
+        assert {props["id"] for props, _score in filtered} == {"chunk:strong", "chunk:weak"}
+        # ORDER BY score DESC is real (RediSearch's default scorer normalizes by field
+        # length -- empirically it favors "widget"'s higher TERM DENSITY in the
+        # shorter "chunk:weak" text over "chunk:strong"'s higher raw COUNT, so this
+        # deliberately doesn't hardcode which one wins, only that scores actually
+        # come back sorted descending).
+        assert len(filtered) == 2
+        assert filtered[0][1] >= filtered[1][1]
+
+        assert store.search_text_chunks("@{}~*", k=5) == []  # sanitizes to "" -- no call
+    finally:
+        store._g.delete()

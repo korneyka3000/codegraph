@@ -66,6 +66,29 @@ class GraphStore(Protocol):
         trip. Each result: node properties + "score" (float)."""
         ...
 
+    def search_vector_chunks(
+        self, vec: list[float], k: int, service: str | None = None
+    ) -> list[tuple[dict, float]]:
+        """M3 T7: `db.idx.vector.queryNodes('Chunk', 'embedding', k, vecf32(vec))` --
+        nearest chunks by cosine DISTANCE (lower score = more similar; NOT the same
+        sign convention as search_fulltext's relevance score, see the implementation's
+        own docstring). Returns `[(chunk_props, score), ...]` -- a tuple, deliberately
+        NOT dict-with-"score"-key like search_fulltext (retrieval.py builds RRF
+        rankings straight off these pairs). No vector index on this graph (degraded --
+        no embedder has ever run) -> `[]`, never an exception (confirmed live: FalkorDB
+        raises a ResponseError querying an absent index; the implementation catches
+        that specific case)."""
+        ...
+
+    def search_text_chunks(
+        self, query: str, k: int, service: str | None = None
+    ) -> list[tuple[dict, float]]:
+        """M3 T7: fulltext over Chunk(text, context_header) -- same sanitize/
+        empty-short-circuit contract as search_fulltext, but scoped to Chunk nodes
+        and returning `[(chunk_props, score)]` tuples (see search_vector_chunks for
+        why -- shared with it, not search_fulltext's dict+"score"-key shape)."""
+        ...
+
     def neighbors(
         self,
         node_id: str,

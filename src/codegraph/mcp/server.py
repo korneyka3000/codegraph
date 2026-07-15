@@ -1,8 +1,9 @@
-"""FastMCP сервер: 8 read-only инструментов (M1 v0: graph_stats/get_source/
+"""FastMCP сервер: 9 read-only инструментов (M1 v0: graph_stats/get_source/
 expand_neighbors/who_calls; M2 T8: trace_process/find_paths/list_processes/
-find_entrypoint), тонкая делегация в query.api.GraphQuery -- ни одного Cypher-
-запроса и ни одного обращения к GraphStore.raw() в этом модуле (см. stores/graph.py:
-GraphStore.raw() docstring -- "internal-only", не для MCP).
+find_entrypoint; M3 T7: search_code + find_entrypoint становится гибридным), тонкая
+делегация в query.api.GraphQuery -- ни одного Cypher-запроса и ни одного обращения к
+GraphStore.raw() в этом модуле (см. stores/graph.py: GraphStore.raw() docstring --
+"internal-only", не для MCP).
 
 Локальная переменная -- `gq` (не `query`): find_entrypoint's собственный
 параметр -- ИМЕННО `query: str` (см. mcp/schemas.py FindEntrypointInput /
@@ -28,17 +29,50 @@ structured_content/data -- то есть "структурированная о�
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
 from fastmcp import FastMCP
 
 from codegraph.config.models import WorkspaceConfig
+from codegraph.core.errors import CodegraphError
+from codegraph.embedding.base import Embedder
+from codegraph.embedding.factory import make_embedder
 from codegraph.query.api import GraphQuery
 from codegraph.stores.falkordb.store import FalkorStore
 
+logger = logging.getLogger(__name__)
 
-def build_server(cfg: WorkspaceConfig, graph_name: str) -> FastMCP:
+
+def _default_embedder_factory(cfg: WorkspaceConfig) -> Callable[[], Embedder | None]:
+    """M3 T7 default wiring for `build_server`'s new `embedder_factory` param: lazily
+    build the workspace's configured embedder (`cfg.embedding`) the same
+    catch-CodegraphError-and-degrade way `cli._make_embedder_or_warn` does for
+    `codegraph index`'s S8 stage -- provider package not installed/API key missing
+    degrades search_code/find_entrypoint to text-only (see query.retrieval's own
+    docstring for that degradation path) instead of crashing the whole MCP server.
+    Uses `logger.warning` (stderr), NOT `console.print`/any stdout write -- unlike
+    cli.py's own yellow-warning variant, THIS factory runs inside a live MCP server
+    process, typically talking to its client over stdio (see cli.py's `serve`
+    docstring); writing anything to stdout here would corrupt that protocol stream."""
+
+    def factory() -> Embedder | None:
+        try:
+            return make_embedder(cfg.embedding)
+        except CodegraphError as e:
+            logger.warning("search_code/find_entrypoint vector mode unavailable: %s", e)
+            return None
+
+    return factory
+
+
+def build_server(
+    cfg: WorkspaceConfig,
+    graph_name: str,
+    embedder_factory: Callable[[], Embedder | None] | None = None,
+) -> FastMCP:
     """graph_name -- отдельный параметр (не cfg.graph_name напрямую), т.к. cli.serve
     поддерживает `--graph` override -- та же проводка, что _resolve_graph_name даёт
     index/load/stats (см. cli.py). service_paths строится из cfg.services -- пути уже
@@ -52,11 +86,22 @@ def build_server(cfg: WorkspaceConfig, graph_name: str) -> FastMCP:
     falkordb.Graph -- сервер может жить неделями, переживая произвольное число
     `codegraph index` в других процессах, не рискуя декодировать данные через
     устаревший schema-кэш клиента.
+
+    embedder_factory (M3 T7, опционален): None (единственный способ вызвать эту
+    функцию из cli.py serve -- см. её докстринг, интерфейс НЕ менялся) -> строится
+    дефолтный `_default_embedder_factory(cfg)` внутри. Параметр существует ради
+    тестов (contract-тест подменяет его на `lambda: FakeEmbedder(...)`, санкционировано
+    планом T7 -- не нужно поднимать реальный sentence-transformers/OpenAI/Voyage только
+    чтобы живьём проверить vector-режим search_code) -- ни cli.py, ни любой другой
+    реальный вызывающий код НЕ передаёт этот параметр явно.
     """
     service_paths: dict[str, Path] = {svc.name: svc.path for svc in cfg.services}
     gq = GraphQuery(
         store_factory=lambda: FalkorStore(cfg.storage.falkordb, graph_name),
         service_paths=service_paths,
+        embedder_factory=(
+            embedder_factory if embedder_factory is not None else _default_embedder_factory(cfg)
+        ),
     )
 
     mcp = FastMCP("codegraph")
@@ -138,9 +183,29 @@ def build_server(cfg: WorkspaceConfig, graph_name: str) -> FastMCP:
 
     @mcp.tool
     def find_entrypoint(query: str, kinds: list[str] | None = None, k: int = 5) -> dict:
-        """Fulltext-поиск по Sym(name, qualified_name, docstring) (k клампится к
-        1..20); kinds -- опциональный фильтр по n.kind. Пустой результат (в т.ч.
-        запрос из одних RediSearch-спецсимволов) -- не ошибка, {"results": []}."""
+        """Гибридный (fulltext по Sym + vector по Chunk, RRF-фьюжн) поиск точки входа
+        (k клампится к 1..20); kinds -- опциональный фильтр по n.kind, применяется
+        ПОСЛЕ фьюжна. Нет доступного embedder'а для этого воркспейса (или граф ещё не
+        эмбеден/эмбеден другой моделью) -- молчаливая деградация в чистый fulltext
+        (mode_used="text" в ответе), НЕ ошибка. Пустой результат (в т.ч. запрос из
+        одних RediSearch-спецсимволов) -- тоже не ошибка, {"results": [], ...}."""
         return gq.find_entrypoint(query, kinds=kinds, k=k)
+
+    @mcp.tool
+    def search_code(
+        query: str,
+        k: int = 8,
+        service: str | None = None,
+        mode: Literal["hybrid", "vector", "text"] = "hybrid",
+    ) -> dict:
+        """Поиск по коду (Chunk-узлам) -- text (fulltext по тексту/заголовку чанка),
+        vector (по embedding'у) или hybrid (RRF-фьюжн обоих, по умолчанию); k
+        клампится к 1..20, service -- опциональный фильтр по владеющему сервису.
+        mode="vector" без доступного embedder'а (или при рассинхроне модели с той,
+        которой граф эмбеден) -- {"error": ...}; mode="hybrid" в той же ситуации
+        молчаливо деградирует в text-only (mode_used="text" в ответе). Результат:
+        {"items": [{chunk_id, symbol_id, service, relpath, start_line, end_line,
+        snippet, score}, ...], "mode_used": ...}."""
+        return gq.search_code(query, k=k, service=service, mode=mode)
 
     return mcp

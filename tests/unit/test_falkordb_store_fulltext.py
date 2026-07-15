@@ -44,3 +44,11 @@ def test_search_fulltext_short_circuits_before_touching_store_when_query_sanitiz
     # BEFORE any FalkorDB access, not merely that the (possibly network-dependent)
     # query happened to come back empty.
     assert store._db is None
+
+
+def test_search_text_chunks_short_circuits_before_touching_store_when_query_sanitizes_to_empty():
+    # M3 T7: search_text_chunks reuses the SAME _sanitize_fulltext_query helper/
+    # short-circuit discipline as search_fulltext above, just over Chunk instead of Sym.
+    store = FalkorStore(FalkorDBConfig(), "does-not-matter")
+    assert store.search_text_chunks("@{}~*", k=5) == []
+    assert store._db is None

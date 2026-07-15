@@ -32,6 +32,7 @@ import hashlib
 import pytest
 from fastmcp import Client
 
+from codegraph.chunking.splitter import ChunkRec
 from codegraph.config.models import FalkorDBConfig, ServiceConfig, StorageConfig, WorkspaceConfig
 from codegraph.core.schema import (
     EdgeRec,
@@ -40,6 +41,8 @@ from codegraph.core.schema import (
     make_process_node,
     make_service_node,
 )
+from codegraph.embedding.codec import pack_vector
+from codegraph.embedding.fake import FakeEmbedder
 from codegraph.mcp.schemas import (
     ErrorOutput,
     ExpandNeighborsOutput,
@@ -48,6 +51,7 @@ from codegraph.mcp.schemas import (
     GetSourceOutput,
     GraphStatsOutput,
     ListProcessesOutput,
+    SearchCodeOutput,
     TraceProcessOutput,
     WhoCallsOutput,
 )
@@ -125,7 +129,7 @@ def test_mcp_contract_list_tools_and_live_tool_calls(falkordb_cfg, tmp_path):
 
         async def _run() -> None:
             async with Client(server) as c:
-                # -- список инструментов: ровно 8 имён (M2 T8 расширяет с 4 до 8) --
+                # -- список инструментов: ровно 9 имён (M2 T8: 4 -> 8; M3 T7: +search_code) --
                 tools = await c.list_tools()
                 assert {t.name for t in tools} == {
                     "graph_stats",
@@ -136,6 +140,7 @@ def test_mcp_contract_list_tools_and_live_tool_calls(falkordb_cfg, tmp_path):
                     "find_paths",
                     "list_processes",
                     "find_entrypoint",
+                    "search_code",
                 }
 
                 # -- graph_stats живьём (буквальное требование брифа) --
@@ -370,3 +375,92 @@ def test_mcp_contract_trace_process_live_on_three_segment_mini_graph(falkordb_cf
         asyncio.run(_run())
     finally:
         _cleanup(falkordb_cfg, TRACE_BUILD_NAME, TRACE_GRAPH_NAME)
+
+
+# -- M3 T7: search_code -- text-mode live (no embedder needed at all) + vector-mode
+# live with a FakeEmbedder substituted via build_server's own embedder_factory param
+# (санкционировано планом T7 specifically so this test doesn't need a real
+# sentence-transformers/OpenAI/Voyage install just to exercise vector mode end to end
+# through the actual MCP stdio-shaped Client/tool-call stack -- the mini-graph itself
+# is still built the ordinary T6 way: Staging + hand-crafted ChunkRec + load_graph).
+
+SEARCH_CODE_GRAPH_NAME = "__t7search__"
+SEARCH_CODE_BUILD_NAME = f"{SEARCH_CODE_GRAPH_NAME}__build"
+SEARCH_CODE_SERVICE = "t7searchsvc"
+
+
+def test_mcp_contract_search_code_text_and_vector_mode_live(falkordb_cfg, tmp_path):
+    target_text = "def create_order(): handle the widget order"
+    embedder = FakeEmbedder(dim=8)
+    # Identical-text-to-query trick (same T6 pattern as test_retrieval_live.py): the
+    # query vector reproduces this chunk's own stored vector bit-for-bit, so it MUST
+    # rank first regardless of the (semantically meaningless, see fake.py's own
+    # docstring) content of any other chunk in the graph.
+    target_vec = embedder.embed_query(target_text)
+    other_vec = embedder.embed_query("something else entirely, unrelated")
+
+    chunk_target = ChunkRec(
+        chunk_id="c-target", symbol_id=f"sym:{SEARCH_CODE_SERVICE}:target", ord=0,
+        text=target_text, start_line=1, end_line=1,
+        content_hash=hashlib.sha256(target_text.encode()).hexdigest(),
+    )
+    other_text = "def unrelated(): pass"
+    chunk_other = ChunkRec(
+        chunk_id="c-other", symbol_id=f"sym:{SEARCH_CODE_SERVICE}:other", ord=0,
+        text=other_text, start_line=1, end_line=1,
+        content_hash=hashlib.sha256(other_text.encode()).hexdigest(),
+    )
+
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks(SEARCH_CODE_SERVICE, "mod.py", [chunk_target, chunk_other])
+    st.set_embeddings([
+        ("c-target", pack_vector(target_vec), embedder.model_id, chunk_target.content_hash),
+        ("c-other", pack_vector(other_vec), embedder.model_id, chunk_other.content_hash),
+    ])
+    st.set_meta("embed_model", embedder.model_id)
+    st.set_meta("embed_dim", str(embedder.dim))
+
+    cfg = WorkspaceConfig(
+        graph_name=SEARCH_CODE_GRAPH_NAME,
+        storage=StorageConfig(falkordb=falkordb_cfg),
+        services=[ServiceConfig(name=SEARCH_CODE_SERVICE, path=tmp_path)],
+    )
+
+    try:
+        load_graph(st, lambda name: FalkorStore(falkordb_cfg, name), SEARCH_CODE_GRAPH_NAME)
+
+        server = build_server(
+            cfg, SEARCH_CODE_GRAPH_NAME, embedder_factory=lambda: FakeEmbedder(dim=8)
+        )
+
+        async def _run() -> None:
+            async with Client(server) as c:
+                # -- text-mode: no embedder involved at all --
+                text_res = await c.call_tool(
+                    "search_code", {"query": "widget", "mode": "text"}
+                )
+                assert text_res.is_error is False
+                text_out = SearchCodeOutput(**text_res.data)  # схема валидна
+                assert text_out.mode_used == "text"
+                assert [i.chunk_id for i in text_out.items] == ["c-target"]
+
+                # -- vector-mode: FakeEmbedder substituted via embedder_factory,
+                # top-1 guaranteed by construction (identical query/chunk text) --
+                vector_res = await c.call_tool(
+                    "search_code", {"query": target_text, "mode": "vector"}
+                )
+                assert vector_res.is_error is False
+                vector_out = SearchCodeOutput(**vector_res.data)  # схема валидна
+                assert vector_out.mode_used == "vector"
+                assert vector_out.items[0].chunk_id == "c-target"
+
+                # -- hybrid (default mode): still finds the same chunk, RRF-fused --
+                hybrid_res = await c.call_tool("search_code", {"query": target_text})
+                assert hybrid_res.is_error is False
+                hybrid_out = SearchCodeOutput(**hybrid_res.data)
+                assert hybrid_out.mode_used == "hybrid"
+                assert hybrid_out.items[0].chunk_id == "c-target"
+
+        asyncio.run(_run())
+    finally:
+        _cleanup(falkordb_cfg, SEARCH_CODE_BUILD_NAME, SEARCH_CODE_GRAPH_NAME)

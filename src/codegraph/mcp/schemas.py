@@ -200,4 +200,38 @@ class FindEntrypointInput(BaseModel):
 
 
 class FindEntrypointOutput(BaseModel):
+    """v2 (M3 T7): те же поля, что M2 ("results" -- node properties + "score"), плюс
+    "mode_used" -- обратная совместимость по полям (см. query.retrieval.find_entrypoint
+    докстринг): "hybrid" (Sym-fulltext + chunk-vector RRF-фьюжн) или "text" (нет
+    usable embedder'а на этот вызов -- молчаливая деградация, НЕ ошибка, ровно
+    M2-поведение)."""
+
     results: list[dict]  # каждый -- node properties + "score" (см. store.search_fulltext)
+    mode_used: Literal["hybrid", "text"]
+
+
+# -- M3 T7: search_code (9-й инструмент) --
+
+
+class SearchCodeInput(BaseModel):
+    query: str
+    k: int = 8  # клампится в GraphQuery к [1,20]
+    service: str | None = None
+    mode: Literal["hybrid", "vector", "text"] = "hybrid"
+
+
+class SearchCodeItem(BaseModel):
+    chunk_id: str | None = None
+    symbol_id: str | None = None
+    service: str | None = None
+    relpath: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    snippet: str  # chunk text, truncated to <=600 chars (see query.retrieval._snippet)
+    score: float  # ВСЕГДА fused RRF-score, даже для mode="text"/"vector" (единая,
+    # всегда-desc-лучше шкала независимо от режима -- см. query.retrieval.search_code)
+
+
+class SearchCodeOutput(BaseModel):
+    items: list[SearchCodeItem]
+    mode_used: Literal["hybrid", "vector", "text"]
