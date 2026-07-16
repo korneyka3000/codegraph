@@ -193,6 +193,38 @@ def test_chunk_props_never_includes_embedding_or_embedded_hash():
     assert "embedded_hash" not in props
 
 
+# -- M3 T7 review fix: qualified_name denormalized onto the Chunk node at load time
+# (the owning symbol's qualified_name, joined via row.symbol_id -- see _chunk_props'
+# own docstring for why load-time denormalization beat a per-search get_nodes
+# backfill) --
+
+
+def test_chunk_props_joins_qualified_name_from_map():
+    props = _chunk_props(_row(symbol_id="sym:a:f"), {"sym:a:f": "app.mod.f"})
+    assert props["qualified_name"] == "app.mod.f"
+
+
+def test_chunk_props_omits_qualified_name_when_symbol_not_in_map():
+    # Defensive edge case: a chunk whose symbol_id has no staged node -- the property
+    # is simply absent (same _omit_none convention), never a None value in the graph.
+    props = _chunk_props(_row(symbol_id="sym:a:ghost"), {"sym:a:f": "app.mod.f"})
+    assert "qualified_name" not in props
+
+
+def test_chunk_props_omits_qualified_name_without_a_map_at_all():
+    # Direct callers passing no map (pre-T7 signature) keep the exact pre-T7 shape.
+    assert "qualified_name" not in _chunk_props(_row())
+
+
+def test_chunk_node_batches_passes_qualified_names_through(tmp_path):
+    st = _staged_chunk_with_embedding(tmp_path, [1.0, 2.0, 3.0])
+    with_vector, without_vector = _chunk_node_batches(
+        st, dim=3, qualified_names={"c": "app.mod.c"}  # symbol_id "c", see helper
+    )
+    assert without_vector == []
+    assert with_vector[0]["props"]["qualified_name"] == "app.mod.c"
+
+
 # -- M3 T6 code-review fix: _chunk_node_batches routes a dimension-mismatched
 # embedding to the without-vector batch instead of vector_props, rather than letting
 # batch.upsert_nodes' own bisection silently drop that one row later with no context

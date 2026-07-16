@@ -51,13 +51,22 @@ def test_search_code_output_requires_mode_used():
 def test_search_code_output_accepts_well_formed_item():
     out = SearchCodeOutput(
         items=[{
-            "chunk_id": "c1", "symbol_id": "sym:a:x", "service": "svc",
+            "chunk_id": "c1", "symbol_id": "sym:a:x",
+            "qualified_name": "app.mod.x", "service": "svc",
             "relpath": "mod.py", "start_line": 1, "end_line": 2,
             "snippet": "def f(): pass", "score": 0.5,
         }],
         mode_used="hybrid",
     )
     assert out.items[0].chunk_id == "c1"
+    assert out.items[0].qualified_name == "app.mod.x"
+
+
+def test_search_code_item_qualified_name_optional_defaults_none():
+    # Pre-T7-loaded graphs / symbol-less chunks legitimately lack the property --
+    # the schema must accept its absence, defaulting to None.
+    out = SearchCodeOutput(items=[{"snippet": "x", "score": 0.1}], mode_used="text")
+    assert out.items[0].qualified_name is None
 
 
 def test_find_entrypoint_output_requires_mode_used():

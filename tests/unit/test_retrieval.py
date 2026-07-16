@@ -6,6 +6,8 @@ tests/integration/test_retrieval_live.py и test_mcp_contract.py, marker falkord
 
 from __future__ import annotations
 
+import pytest
+
 from codegraph.embedding.fake import FakeEmbedder
 from codegraph.query import retrieval
 
@@ -97,9 +99,16 @@ def test_rrf_document_in_both_lists_beats_rank0_of_a_single_list():
     # ~= 0.01639. b must win despite never being rank0 anywhere -- the textbook RRF
     # "present everywhere beats first-place-once" result (brief's own "документ в
     # обоих списках выигрывает" sanity, replicated as pure math here too).
-    result = retrieval.rrf([["a", "b"], ["b", "c"]])
+    # (Reviewer minor fix: rankings were [["a","b"],["b","c"]], which didn't match
+    # this comment's math -- there b was rank0 in list2 and c rank1; the corrected
+    # data below is the scenario the comment/title always described.)
+    result = retrieval.rrf([["a", "b"], ["c", "b"]])
     assert result[0][0] == "b"
     assert result[0][1] > result[1][1]
+    # And the exact worked numbers hold: b = 2/62, a = c = 1/61 (tie, id-ordered).
+    scores = dict(result)
+    assert scores["b"] == pytest.approx(2 / 62)
+    assert scores["a"] == scores["c"] == pytest.approx(1 / 61)
 
 
 def test_rrf_tie_break_by_id_ascending_for_equal_scores():
@@ -171,9 +180,27 @@ def test_search_code_item_shape_has_exactly_the_contract_fields():
     store.text_chunks = [(_chunk("c1"), 1.0)]
     result = retrieval.search_code(store, None, "q", mode="text")
     assert set(result["items"][0]) == {
-        "chunk_id", "symbol_id", "service", "relpath",
+        "chunk_id", "symbol_id", "qualified_name", "service", "relpath",
         "start_line", "end_line", "snippet", "score",
     }
+
+
+def test_search_code_item_carries_qualified_name_from_chunk_props():
+    # qualified_name is denormalized onto the Chunk node at load time
+    # (pipeline/load._chunk_props) -- retrieval just reads the property through.
+    store = _FakeStore()
+    store.text_chunks = [(_chunk("c1", qualified_name="app.orders.create_order"), 1.0)]
+    result = retrieval.search_code(store, None, "q", mode="text")
+    assert result["items"][0]["qualified_name"] == "app.orders.create_order"
+
+
+def test_search_code_item_qualified_name_none_when_chunk_lacks_the_property():
+    # Pre-T7-loaded graph / symbol absent from staged nodes: property missing on the
+    # Chunk node -> honest None in the item, not a KeyError.
+    store = _FakeStore()
+    store.text_chunks = [(_chunk("c1"), 1.0)]  # _chunk() sets no qualified_name
+    result = retrieval.search_code(store, None, "q", mode="text")
+    assert result["items"][0]["qualified_name"] is None
 
 
 def test_search_code_invalid_mode_returns_error_dict():

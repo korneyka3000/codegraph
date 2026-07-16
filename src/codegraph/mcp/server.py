@@ -204,8 +204,8 @@ def build_server(
         mode="vector" без доступного embedder'а (или при рассинхроне модели с той,
         которой граф эмбеден) -- {"error": ...}; mode="hybrid" в той же ситуации
         молчаливо деградирует в text-only (mode_used="text" в ответе). Результат:
-        {"items": [{chunk_id, symbol_id, service, relpath, start_line, end_line,
-        snippet, score}, ...], "mode_used": ...}."""
+        {"items": [{chunk_id, symbol_id, qualified_name, service, relpath,
+        start_line, end_line, snippet, score}, ...], "mode_used": ...}."""
         return gq.search_code(query, k=k, service=service, mode=mode)
 
     return mcp

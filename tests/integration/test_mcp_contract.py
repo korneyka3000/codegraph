@@ -410,8 +410,18 @@ def test_mcp_contract_search_code_text_and_vector_mode_live(falkordb_cfg, tmp_pa
         text=other_text, start_line=1, end_line=1,
         content_hash=hashlib.sha256(other_text.encode()).hexdigest(),
     )
+    # The target chunk's owning symbol IS staged (a real Sym node) -- load_graph joins
+    # its qualified_name onto the Chunk node (pipeline/load._chunk_props, T7 review
+    # fix), and the item assertion below pins that full staging -> load -> MCP round
+    # trip. c-other's symbol is deliberately NOT staged -- its item must carry an
+    # honest qualified_name=None (the defensive symbol-less edge case), not blow up.
+    target_sym = NodeRec(
+        id=chunk_target.symbol_id, kind="Function", service=SEARCH_CODE_SERVICE,
+        name="create_order", qualified_name="app.orders.create_order",
+    )
 
     st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([target_sym])
     st.upsert_chunks(SEARCH_CODE_SERVICE, "mod.py", [chunk_target, chunk_other])
     st.set_embeddings([
         ("c-target", pack_vector(target_vec), embedder.model_id, chunk_target.content_hash),
@@ -443,6 +453,9 @@ def test_mcp_contract_search_code_text_and_vector_mode_live(falkordb_cfg, tmp_pa
                 text_out = SearchCodeOutput(**text_res.data)  # схема валидна
                 assert text_out.mode_used == "text"
                 assert [i.chunk_id for i in text_out.items] == ["c-target"]
+                # qualified_name denormalized onto the Chunk at load (T7 review fix):
+                # the staged Sym node's own qualified_name, straight through MCP.
+                assert text_out.items[0].qualified_name == "app.orders.create_order"
 
                 # -- vector-mode: FakeEmbedder substituted via embedder_factory,
                 # top-1 guaranteed by construction (identical query/chunk text) --
@@ -453,6 +466,12 @@ def test_mcp_contract_search_code_text_and_vector_mode_live(falkordb_cfg, tmp_pa
                 vector_out = SearchCodeOutput(**vector_res.data)  # схема валидна
                 assert vector_out.mode_used == "vector"
                 assert vector_out.items[0].chunk_id == "c-target"
+                assert vector_out.items[0].qualified_name == "app.orders.create_order"
+                # c-other's symbol was never staged -- honest None, not an error
+                # (both embedded chunks are always within the default k=8, so the
+                # item is guaranteed present).
+                other_item = next(i for i in vector_out.items if i.chunk_id == "c-other")
+                assert other_item.qualified_name is None
 
                 # -- hybrid (default mode): still finds the same chunk, RRF-fused --
                 hybrid_res = await c.call_tool("search_code", {"query": target_text})

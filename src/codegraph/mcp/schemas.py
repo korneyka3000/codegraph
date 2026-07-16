@@ -223,6 +223,10 @@ class SearchCodeInput(BaseModel):
 class SearchCodeItem(BaseModel):
     chunk_id: str | None = None
     symbol_id: str | None = None
+    qualified_name: str | None = None  # владеющего символа -- денормализовано на
+    # Chunk-узел при load (pipeline/load._chunk_props, M3 T7 review fix); None, если
+    # символ чанка отсутствовал в staged nodes (защитный edge case) или граф загружен
+    # pre-T7 load'ом, ещё не материализовавшим это поле
     service: str | None = None
     relpath: str | None = None
     start_line: int | None = None

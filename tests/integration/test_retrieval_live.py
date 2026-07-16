@@ -123,16 +123,25 @@ TEXT_MODE_GRAPH = "__t7_retrieval_text_mode__"
 
 
 def test_search_code_text_mode_finds_matching_chunk_no_embedder_needed(falkordb_cfg, tmp_path):
+    match_sym = NodeRec(
+        id="sym:svc:a", kind="Function", service="svc", name="create_order",
+        qualified_name="app.orders.create_order",
+    )
     chunks = [
         _chunk("c-match", "sym:svc:a", "def create_order(): handle the widget order"),
         _chunk("c-nomatch", "sym:svc:b", "def totally_different(): pass"),
     ]
     try:
-        store = _build_chunk_graph(falkordb_cfg, TEXT_MODE_GRAPH, chunks, tmp_path)
+        store = _build_chunk_graph(
+            falkordb_cfg, TEXT_MODE_GRAPH, chunks, tmp_path, symbols=[match_sym]
+        )
         result = retrieval.search_code(store, None, "widget", k=5, mode="text")
         assert result["mode_used"] == "text"
         assert [i["chunk_id"] for i in result["items"]] == ["c-match"]
         assert "widget" in result["items"][0]["snippet"]
+        # qualified_name denormalized onto the Chunk node at load (T7 review fix) --
+        # the staged symbol's own qualified_name, read straight off the live graph.
+        assert result["items"][0]["qualified_name"] == "app.orders.create_order"
     finally:
         _cleanup(falkordb_cfg, f"{TEXT_MODE_GRAPH}__build", TEXT_MODE_GRAPH)
 

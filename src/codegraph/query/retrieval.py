@@ -103,6 +103,13 @@ def _chunk_item(props: dict, score: float) -> dict:
     return {
         "chunk_id": props.get("id"),
         "symbol_id": props.get("symbol_id"),
+        # Денормализовано на Chunk-узел при load (pipeline/load.py _chunk_props:
+        # symbol_id -> qualified_name join живёт ТАМ, не здесь -- search_code горячий
+        # путь, per-call get_nodes-backfill был бы лишним round trip'ом на каждый
+        # запрос; см. _chunk_props' докстринг про выбор). None -- символ чанка не был
+        # в staged nodes (защитный edge case) либо граф загружен pre-T7 load'ом,
+        # ещё не материализовавшим это поле.
+        "qualified_name": props.get("qualified_name"),
         "service": props.get("service"),
         "relpath": props.get("relpath"),
         "start_line": props.get("start_line"),
