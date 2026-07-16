@@ -50,11 +50,11 @@ def test_init_defaults_to_cwd(tmp_path, monkeypatch):
     assert (tmp_path / "codegraph.yaml").exists()
 
 
-def test_stub_commands_exit_2():
-    # stats/load left this list in M1b Task 6, serve left it in M1b Task 7, trace left
-    # it in M2 Task 8 -- all four are real commands now (see tests/unit/test_cli_m1b.py,
-    # tests/unit/test_cli_trace.py); eval stays the last M2 stub.
-    for cmd, milestone in [("eval", "M2")]:
-        result = runner.invoke(app, [cmd])
-        assert result.exit_code == 2, cmd
-        assert milestone in result.output
+# test_stub_commands_exit_2 (M2-era: asserted `codegraph eval` alone exited 2 with
+# "planned for M2" -- stats/load left this same list in M1b Task 6, serve left it in
+# M1b Task 7, trace left it in M2 Task 8) removed in M3 Task 8 -- `eval` is now a real
+# command GROUP (`codegraph eval retrieval ...`, `_stub`'s only remaining caller,
+# itself removed), not a flat stub; `codegraph eval` alone now prints group help and
+# exits 0 (`no_args_is_help=True`, same convention as the top-level `app`), not 2. Real
+# coverage: tests/unit/test_cli_eval.py (monkeypatched, this file's sibling) and
+# tests/eval/test_m3_gate.py (real scip+falkordb+emb gate).

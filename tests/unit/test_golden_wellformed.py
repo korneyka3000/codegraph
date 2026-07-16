@@ -34,6 +34,20 @@ def test_golden_edges_wellformed():
             assert isinstance(e["mechanism"], str) and e["mechanism"]
 
 
+def test_golden_questions_wellformed():
+    data = yaml.safe_load((FIXTURES / "golden" / "questions.yaml").read_text())
+    assert data["version"] == 1
+    assert len(data["questions"]) == 5
+    known_services = {"orders-api", "kyc-worker", "document-management"}
+    for q in data["questions"]:
+        assert isinstance(q["question"], str) and q["question"]
+        assert q["k"] == 3
+        assert q["accept"], q  # non-empty OR-set
+        for a in q["accept"]:
+            assert a["service"] in known_services, a
+            assert isinstance(a["symbol"], str) and a["symbol"]
+
+
 def test_golden_traces_reference_channels_from_edges():
     edges = yaml.safe_load((FIXTURES / "golden" / "edges.yaml").read_text())
     traces = yaml.safe_load((FIXTURES / "golden" / "traces.yaml").read_text())

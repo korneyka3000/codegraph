@@ -6,6 +6,7 @@ import warnings
 from pathlib import Path
 
 import typer
+import yaml
 from authlib.deprecate import AuthlibDeprecationWarning
 from rich.console import Console
 from rich.markup import escape
@@ -17,6 +18,7 @@ from codegraph.config.models import WorkspaceConfig
 from codegraph.core.errors import CodegraphError
 from codegraph.doctor import run_env_checks, run_store_probes
 from codegraph.embedding.factory import make_embedder
+from codegraph.evalx.retrieval_eval import load_questions, run_questions
 from codegraph.linking.workspace import link_workspace
 from codegraph.pipeline.analyze import analyze_service
 from codegraph.pipeline.chunk_embed import run as run_chunk_embed
@@ -290,11 +292,6 @@ def init(target: Path | None = typer.Argument(None)) -> None:  # noqa: B008 -- t
     console.print(f"created {dest}")
 
 
-def _stub(milestone: str) -> None:
-    console.print(f"[yellow]planned for {milestone}[/]")
-    raise typer.Exit(2)
-
-
 @app.command()
 def stats(
     target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
@@ -523,10 +520,103 @@ def serve(
     build_server(cfg, graph_name).run()
 
 
-@app.command()
-def eval() -> None:
-    """Оценка качества графа/retrieval (M2)."""
-    _stub("M2")
+_DEFAULT_QUESTIONS = Path(__file__).parent.parent.parent / "fixtures" / "golden" / "questions.yaml"
+
+# `eval` is a command GROUP (Typer sub-app), not a flat command -- `codegraph eval
+# retrieval [target] [--graph] [--k] [--questions PATH]` (M3 T8's own contract).
+# `no_args_is_help=True` mirrors the top-level `app`'s own callback comment: bare
+# `codegraph eval` prints help instead of erroring.
+eval_app = typer.Typer(no_args_is_help=True, add_completion=False)
+app.add_typer(eval_app, name="eval")
+
+
+@eval_app.command("retrieval")
+def eval_retrieval(
+    target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
+    graph: str | None = typer.Option(None, "--graph"),
+    k: int | None = typer.Option(
+        None, "--k", help="override every question's own k (default: each question's own)"
+    ),
+    questions_path: Path = typer.Option(  # noqa: B008 -- typer marker call, idiomatic
+        _DEFAULT_QUESTIONS, "--questions",
+        help=(
+            "golden questions YAML ({question, accept: [{service, symbol}], k} rows, "
+            "see fixtures/golden/questions.yaml). Defaults to codegraph's OWN bundled "
+            "fixture golden file -- there is no auto-discovered '<workspace>/"
+            "questions.yaml' convention (a real workspace's golden questions are "
+            "necessarily hand-authored against ITS OWN symbols; pass --questions "
+            "explicitly to point at one)."
+        ),
+    ),
+) -> None:
+    """Прогон golden-вопросов (hit@k) через search_code(mode="hybrid") на УЖЕ
+    существующем графе (нужен предварительный `codegraph index`) -- rich-таблица
+    question/hit/rank/top-1. Отчёт, не гейт: exit 0 при ЛЮБОМ исходе hit/miss --
+    жёсткий гейт для CI живёт в tests/eval/test_m3_gate.py, не здесь. Инфраструктурные
+    ошибки (store недоступен, граф не найден, questions-файл не читается) остаются
+    exit 1, как и у остальных команд (stats/load/trace)."""
+    target_path = target if target is not None else Path.cwd()
+    cfg = _load(target_path)
+    graph_name = _resolve_graph_name(cfg, graph)
+
+    try:
+        questions = load_questions(questions_path)
+    except (OSError, yaml.YAMLError) as e:
+        console.print(
+            f"[red]failed to read questions file {questions_path}:[/] {escape(str(e))}"
+        )
+        raise typer.Exit(1) from e
+    if k is not None:
+        questions = [{**q, "k": k} for q in questions]
+
+    store = FalkorStore(cfg.storage.falkordb, graph_name)
+    if not _store_guard(store.graph_exists):
+        console.print(
+            f"[red]graph {graph_name!r} not found — run 'codegraph index' first[/]"
+        )
+        raise typer.Exit(1)
+
+    # Same catch-CodegraphError-and-degrade contract as _make_embedder_or_warn/
+    # mcp.server._default_embedder_factory -- provider package not installed/API key
+    # missing degrades search_code to text-only (mode_used="text" per question) rather
+    # than failing this command; worded for THIS command's own context rather than
+    # reusing _make_embedder_or_warn's "S8:"-prefixed message (there is no S8 here).
+    try:
+        embedder = make_embedder(cfg.embedding)
+    except CodegraphError as e:
+        console.print(
+            f"[yellow]retrieval eval: vector mode unavailable ({escape(str(e))}), "
+            "degrading to text-only[/]"
+        )
+        embedder = None
+
+    gq = GraphQuery(
+        store_factory=lambda: FalkorStore(cfg.storage.falkordb, graph_name),
+        service_paths={svc.name: svc.path for svc in cfg.services},
+        embedder_factory=lambda: embedder,
+    )
+    results = run_questions(lambda q, kk: gq.search_code(q, k=kk, mode="hybrid"), questions)
+
+    table = Table(title=f"retrieval eval · graph={graph_name}")
+    table.add_column("question")
+    table.add_column("hit")
+    table.add_column("rank")
+    table.add_column("top-1")
+    hits = 0
+    for r in results:
+        hits += 1 if r["hit"] else 0
+        top1 = r["top"][0] if r["top"] else None
+        top1_label = (
+            "(no results)" if top1 is None else (top1["qualified_name"] or top1["symbol_id"] or "?")
+        )
+        table.add_row(
+            escape(r["question"]),
+            "[green]HIT[/]" if r["hit"] else "[red]MISS[/]",
+            str(r["rank"]) if r["rank"] is not None else "-",
+            escape(top1_label),
+        )
+    console.print(table)
+    console.print(f"hit@k: {hits}/{len(results)}")
 
 
 def main() -> None:
