@@ -209,7 +209,7 @@ def index(
 ) -> None:
     """Построить граф workspace: scan → resolve → extract → join → chunk+embed → load →
     report (`--dry-run` — только план пайплайна, без записи; `--no-embed` — пропустить
-    S8 chunk+embed целиком)."""
+    только embedding-шаг S8 -- чанки и headers всё равно строятся и грузятся)."""
     # Path.cwd() читается здесь, а не в default параметра: default-выражения
     # typer вычисляются один раз при импорте модуля, а не при каждом вызове
     # (см. комментарий в doctor).
@@ -278,6 +278,22 @@ def index(
     report = build_report(per_service, load_stats, link_report, chunk_report)
     write_report(report, codegraph_dir / "report.json")
     print_report(report, console)
+    # Paid-provider notice (M3 final review): a local embedder is a one-time cost
+    # (the model runs on this machine), but openai/voyage bill per API call -- and M3
+    # has NO persistent embedding cache across `codegraph index` runs (content_hash
+    # caching only survives WITHIN one staging.db across repeated calls in the SAME
+    # session, see chunks_missing_embedding's own docstring; M4 scope is a cache that
+    # survives a full re-index). Surfaced here, not inside print_report itself, so
+    # print_report (also called from `load`-adjacent report plumbing/tests) stays
+    # embedding-provider-agnostic -- this is CLI-command-level context (cfg.embedding),
+    # not part of the plain chunk_stats dict every other consumer of build_report sees.
+    if chunk_report["embedded"] > 0 and cfg.embedding.provider != "local":
+        console.print(
+            f"[yellow]{chunk_report['embedded']} chunk(s) embedded via "
+            f"{cfg.embedding.provider} API this run; re-running 'codegraph index' "
+            "will re-embed all of them again -- there is no persistent embedding "
+            "cache across runs until M4[/]"
+        )
 
 
 @app.command()

@@ -150,6 +150,35 @@ def test_rerun_without_changes_embeds_zero_and_reuses_all(tmp_path):
 
 
 # ======================================================================================
+# -- MINOR-5 (M3 final review): a file removed from disk between S1-S6 scan and S8 --
+# ======================================================================================
+
+
+def test_missing_file_between_scan_and_chunk_embed_is_skipped_not_fatal(tmp_path, caplog):
+    """A file staged by analyze_service can be gone by the time chunk_embed.run reads
+    it off disk (race: git checkout/rebase mid-index, a concurrent build step, etc.) --
+    `.read_bytes()` raising OSError must warn-and-skip that one file, the same way an
+    on-disk content change that shifts def spans already does (see
+    `_symbol_ids_for_file`'s own docstring), not crash the whole `codegraph index` run
+    and lose every other service's already-completed work."""
+    svc_a = _write_service(tmp_path, "a", {"m.py": SRC_TWO_FUNCS})
+    svc_b = _write_service(tmp_path, "b", {"n.py": SRC_ONE_FUNC})
+    cfg = _cfg(svc_a, svc_b)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+
+    (svc_a.path / "m.py").unlink()  # gone by the time chunk_embed.run reads it
+
+    with caplog.at_level("WARNING"):
+        report = chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))
+
+    assert report["chunks_total"] == 1  # only svc_b's chunk -- svc_a's file was skipped
+    staged_services = {row.service for row in staging.iter_chunks()}
+    assert staged_services == {"b"}
+    assert any("m.py" in rec.message for rec in caplog.records)
+
+
+# ======================================================================================
 # -- T3 carry: hash-aware re-embed (only the changed chunk, not the whole file/service)
 # ======================================================================================
 

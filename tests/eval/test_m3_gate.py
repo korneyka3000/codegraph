@@ -1,7 +1,8 @@
 """M3 gate: the REAL pipeline (analyze_service x3, runner=None -> real scip-python;
 link_workspace; S8 chunk_embed with the REAL LocalEmbedder jina-embeddings-v2-base-
-code, not FakeEmbedder) -> load into a live FalkorDB -> all 5 golden questions
-(fixtures/golden/questions.yaml) hit@3 via GraphQuery.search_code(mode="hybrid") --
+code, not FakeEmbedder) -> load into a live FalkorDB -> all 6 golden questions
+(fixtures/golden/questions.yaml -- 5 Russian NL + 1 fulltext-coverage question, see
+that file's own header) hit@3 via GraphQuery.search_code(mode="hybrid") --
 the M3 milestone retrieval gate. Mirrors M2's tests/eval/test_m2_gate.py conventions
 (module docstring, marker set, `shutil.which("npx")` skip, tmp_path staging,
 print-then-assert diagnostics collecting every finding into one `problems` list
@@ -61,7 +62,7 @@ FIXTURES = Path(__file__).parents[2] / "fixtures"
 GOLDEN_QUESTIONS = FIXTURES / "golden" / "questions.yaml"
 GRAPH_NAME = "__m3_gate__"
 HIT_K = 3
-EXPECTED_QUESTION_COUNT = 5
+EXPECTED_QUESTION_COUNT = 6
 
 # -- vector-mode contract probe (item c above): a query guaranteed to land at least
 # one orders-api chunk in the top-5 nearest neighbours regardless of semantic
@@ -118,6 +119,11 @@ def test_m3_gate(tmp_path, falkordb_cfg):
         f"expected {EXPECTED_QUESTION_COUNT} golden questions in {GOLDEN_QUESTIONS}, "
         f"got {len(questions)}"
     )
+    assert all(q["k"] == HIT_K for q in questions), (
+        f"every golden question must use this gate's own HIT_K={HIT_K} (every "
+        f"diagnostic message below prints 'hit@{HIT_K}' verbatim, regardless of a "
+        f"question's own k) -- got {[q['k'] for q in questions]}"
+    )
 
     problems: list[str] = []
     staging = Staging(staging_path)
@@ -169,7 +175,7 @@ def test_m3_gate(tmp_path, falkordb_cfg):
                     f"on a freshly loaded graph (T7 load-time join not wired?): {none_qualified}"
                 )
 
-        # -- (main gate) 5 golden questions, hit@3, via hybrid search --
+        # -- (main gate) 6 golden questions, hit@3, via hybrid search --
         results = run_questions(lambda q, k: gq.search_code(q, k=k, mode="hybrid"), questions)
         by_question = {q["question"]: q for q in questions}
         hits = 0

@@ -46,6 +46,16 @@ class ChunkRow:
     embedded_hash: str | None
 
 
+# Column list for every `SELECT ... FROM chunks` that feeds a `ChunkRow(*row)` --
+# `chunks_for_service`/`chunks_missing_embedding`/`iter_chunks` below all read the
+# exact same 13 columns, in `ChunkRow`'s own field order (positional unpacking
+# depends on that order matching exactly) -- one constant instead of three
+# hand-copied literals that would silently drift apart on a future column change.
+_CHUNK_COLUMNS = (
+    "chunk_id, symbol_id, service, relpath, ord, text, start_line, end_line, "
+    "content_hash, context_header, embedding, embed_model, embedded_hash"
+)
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS files(
@@ -435,7 +445,28 @@ class Staging:
     def update_edge_props(self, src: str, dst: str, type: str, merge: dict) -> bool:  # noqa: A002
         """Json-merge поверх существующих props ребра (src,dst,type) -- shallow
         `{**old, **merge}`, merge побеждает при коллизии ключей. No-op (возвращает
-        False), если такого ребра нет; True при успешном обновлении."""
+        False), если такого ребра нет; True при успешном обновлении.
+
+        type=="NEXT_SEGMENT" -- InvariantError, не молчаливая порча данных: этот метод
+        ключуется по (src,dst,type), a NE via_channel, в отличие от РЕАЛЬНОГО PK рёбер
+        (src,dst,type,via_channel -- M3 T1, см. core/schema.py SCHEMA_VERSION история
+        "2 -> 3"). Начиная с parallel-channel фикса linking/segments.py.derive, у
+        NEXT_SEGMENT легитимно бывает НЕСКОЛЬКО строк с одинаковым (src,dst,type),
+        различающихся только via_channel -- SELECT ниже без ORDER BY взял бы props
+        ПРОИЗВОЛЬНОЙ из них, а последующий UPDATE (тот же WHERE, без via_channel)
+        переписал бы props ОБЕИХ строк идентичным (одним) результатом слияния --
+        тихая порча данных, не просто "обновили не ту строку". Единственный реальный
+        вызыватель (linking/workspace.py, temporal-start пометка) всегда передаёт
+        type="CALLS", так что guard ничего ему не стоит."""
+        if type == "NEXT_SEGMENT":
+            raise InvariantError(
+                "update_edge_props does not support type='NEXT_SEGMENT': this method's "
+                "(src,dst,type) key does not distinguish via_channel, but NEXT_SEGMENT's "
+                "real primary key is (src,dst,type,via_channel) and can legitimately hold "
+                "more than one row per (src,dst) pair (see core/schema.py SCHEMA_VERSION "
+                "history '2 -> 3') -- updating by (src,dst,type) alone would silently "
+                "overwrite every matching row's props with one arbitrary merge result"
+            )
         row = self._db.execute(
             "SELECT props FROM edges WHERE src=? AND dst=? AND type=?",
             (src, dst, type),
@@ -539,9 +570,8 @@ class Staging:
 
     def chunks_for_service(self, service: str) -> list[ChunkRow]:
         cur = self._db.execute(
-            "SELECT chunk_id, symbol_id, service, relpath, ord, text, start_line, "
-            "end_line, content_hash, context_header, embedding, embed_model, "
-            "embedded_hash FROM chunks WHERE service=? ORDER BY relpath, symbol_id, ord",
+            f"SELECT {_CHUNK_COLUMNS} FROM chunks WHERE service=? "  # noqa: S608
+            "ORDER BY relpath, symbol_id, ord",
             (service,),
         )
         return [ChunkRow(*row) for row in cur.fetchall()]
@@ -583,10 +613,8 @@ class Staging:
         loudly (`sqlite3.IntegrityError`) at INSERT/UPDATE time, not silently produce
         an unreachable "missing embedding" row here."""
         cur = self._db.execute(
-            "SELECT chunk_id, symbol_id, service, relpath, ord, text, start_line, "
-            "end_line, content_hash, context_header, embedding, embed_model, "
-            "embedded_hash FROM chunks WHERE embedding IS NULL OR embed_model != ? "
-            "OR embedded_hash != content_hash ORDER BY chunk_id",
+            f"SELECT {_CHUNK_COLUMNS} FROM chunks WHERE embedding IS NULL "  # noqa: S608
+            "OR embed_model != ? OR embedded_hash != content_hash ORDER BY chunk_id",
             (model_id,),
         )
         return [ChunkRow(*row) for row in cur.fetchall()]
@@ -701,9 +729,8 @@ class Staging:
     def iter_chunks(self) -> Iterator[ChunkRow]:
         """For load (T6): every staged chunk, across all services."""
         cur = self._db.execute(
-            "SELECT chunk_id, symbol_id, service, relpath, ord, text, start_line, "
-            "end_line, content_hash, context_header, embedding, embed_model, "
-            "embedded_hash FROM chunks ORDER BY service, relpath, symbol_id, ord")
+            f"SELECT {_CHUNK_COLUMNS} FROM chunks "  # noqa: S608
+            "ORDER BY service, relpath, symbol_id, ord")
         for row in cur:
             yield ChunkRow(*row)
 

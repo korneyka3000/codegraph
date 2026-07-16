@@ -64,12 +64,17 @@ def upsert_nodes(
     FalkorDB's vector index needs the property written via `vecf32(...)` (its own
     encoded vector type), not a plain list literal -- a plain `SET n += {embedding:
     [...]}"` would store an ordinary array property that `db.idx.vector.queryNodes`
-    can't use. Every row passed here MUST carry a real (non-null) value for each
-    `vector_props` name -- `vecf32(NULL)` is a hard FalkorDB error, so a caller with
-    some rows lacking an embedding (e.g. chunks that were never embedded) must route
+    can't use. Every row passed here SHOULD carry a real (non-null) value for each
+    `vector_props` name -- not because `vecf32(NULL)` errors (live-verified against
+    FalkorDB v4.18.11, it doesn't: it silently never sets the property, same as
+    omitting that `SET` clause entirely), but because a row with no usable value for
+    a `vector_props` name shouldn't be in this call's `rows` at all -- a caller with
+    some rows lacking an embedding (e.g. chunks that were never embedded) routes
     those through a SEPARATE `upsert_nodes` call with `vector_props=()` instead (see
-    `pipeline/load.py`'s own two-batch split). Default `()` -- every pre-M3-T6 call
-    site's Cypher shape is unchanged (no extra `SET` clause at all).
+    `pipeline/load.py`'s own two-batch split, kept for row-shape clarity: "no
+    embedding" rows carry no `"embedding"` key at all rather than an explicit null).
+    Default `()` -- every pre-M3-T6 call site's Cypher shape is unchanged (no extra
+    `SET` clause at all).
     """
     _validate_labels(labels)
     _validate_prop_names(vector_props, "vector_props")

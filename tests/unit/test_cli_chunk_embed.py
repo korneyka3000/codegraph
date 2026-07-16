@@ -19,9 +19,17 @@ from codegraph.core.errors import CodegraphError
 runner = CliRunner()
 
 
-def _write_workspace(tmp_path: Path, n_services: int = 1, graph_name: str = "wsgraph") -> Path:
+def _write_workspace(
+    tmp_path: Path,
+    n_services: int = 1,
+    graph_name: str = "wsgraph",
+    embedding_provider: str | None = None,
+) -> Path:
     root = tmp_path / "ws"
-    lines = ["version: 1", f"graph_name: {graph_name}", "services:"]
+    lines = ["version: 1", f"graph_name: {graph_name}"]
+    if embedding_provider is not None:
+        lines += ["embedding:", f"  provider: {embedding_provider}"]
+    lines.append("services:")
     for i in range(n_services):
         (root / f"svc{i}").mkdir(parents=True)
         lines.append(f"  - name: svc{i}")
@@ -234,3 +242,54 @@ def test_index_dry_run_does_not_call_chunk_embed(tmp_path, monkeypatch):
 
     result = runner.invoke(app, ["index", str(root), "--dry-run"])
     assert result.exit_code == 0, result.output
+
+
+# ======================================================================================
+# -- MINOR-9 (M3 final review): paid-provider warning when embedded>0 and provider!=local
+# ======================================================================================
+
+
+def test_index_warns_about_paid_provider_when_chunks_were_embedded(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, graph_name="wsgraph", embedding_provider="openai")
+
+    def chunk_embed_spy(cfg, staging, embedder):
+        return {"chunks_total": 5, "embedded": 5, "reused": 0, "skipped_no_embedder": 0}
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr("codegraph.cli.run_chunk_embed", chunk_embed_spy)
+    monkeypatch.setattr("codegraph.cli.make_embedder", lambda cfg: _FakeEmbedder())
+
+    result = runner.invoke(app, ["index", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "5 chunk(s) embedded via openai API" in result.output
+    assert "re-embed" in result.output.lower()
+
+
+def test_index_no_paid_provider_warning_for_local_provider(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, graph_name="wsgraph")  # default provider: local
+
+    def chunk_embed_spy(cfg, staging, embedder):
+        return {"chunks_total": 5, "embedded": 5, "reused": 0, "skipped_no_embedder": 0}
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr("codegraph.cli.run_chunk_embed", chunk_embed_spy)
+    monkeypatch.setattr("codegraph.cli.make_embedder", lambda cfg: _FakeEmbedder())
+
+    result = runner.invoke(app, ["index", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "embedded via" not in result.output
+
+
+def test_index_no_paid_provider_warning_when_nothing_embedded(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path, graph_name="wsgraph", embedding_provider="voyage")
+
+    def chunk_embed_spy(cfg, staging, embedder):
+        return {"chunks_total": 5, "embedded": 0, "reused": 5, "skipped_no_embedder": 0}
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr("codegraph.cli.run_chunk_embed", chunk_embed_spy)
+    monkeypatch.setattr("codegraph.cli.make_embedder", lambda cfg: _FakeEmbedder())
+
+    result = runner.invoke(app, ["index", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "embedded via" not in result.output

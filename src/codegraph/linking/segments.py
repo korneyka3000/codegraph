@@ -34,12 +34,18 @@ EVENT channel, never the topic -- X has no direct producer edge into the topic a
 in that pairing, so via_channel_id must be the event to stay "reconstructable": the
 invariant that via_channel_id always names a channel X has a real boundary edge to).
 
-If two DIFFERENT discovery pairs happen to derive the exact same (X, Y) NEXT_SEGMENT
-(e.g. Y both consumes an event directly AND consumes its containing topic, and X
-produces that event -- an edge case no current fixture hits), Staging's (src,dst,type)
-primary key can only keep one row; this module resolves that deterministically (stable
-sort order below) rather than attempting to merge multiple via_channel_id values into
-one edge, which the schema has no room for.
+Two DIFFERENT discovery pairs can derive the SAME (X, Y) NEXT_SEGMENT via DIFFERENT
+channels (e.g. X reaches Y both via a direct HTTP call AND via a Kafka event X also
+produces, or Y consumes an event directly AND consumes its containing topic) -- this is
+the normal, intended parallel-channel case, not an edge case to collapse: `derived`
+below is keyed on the full (x_id, y_id, via_channel_id) triple, and staging's own
+(src, dst, type, via_channel) primary key (core/schema.py's SCHEMA_VERSION "2 -> 3"
+history) plus the FalkorDB-side key_props MERGE key (pipeline/load.py's
+_KEY_PROPS_BY_TYPE) both exist specifically so every such edge survives staging and
+load intact, instead of one via_channel_id silently overwriting another. Only a true
+duplicate -- the SAME (x_id, y_id, via_channel_id) triple discovered twice (e.g. both
+pairing rules independently reach identical endpoints via the identical channel) --
+collapses to one row, which is correct: it is the same edge, not two.
 """
 
 from __future__ import annotations
@@ -83,12 +89,19 @@ def derive(staging: Staging) -> dict:
     for lst in (*producers.values(), *consumers.values()):
         lst.sort(key=lambda p: p[0])
 
-    derived: dict[tuple[str, str], EdgeRec] = {}
+    derived: dict[tuple[str, str, str], EdgeRec] = {}
 
     def emit(x_id: str, x_edge: EdgeRec, y_id: str, y_edge: EdgeRec, via_channel_id: str) -> None:
         if x_id == y_id:
             return
-        derived[(x_id, y_id)] = _next_segment_edge(x_id, x_edge, y_id, y_edge, via_channel_id)
+        # Keyed on the FULL (x_id, y_id, via_channel_id) triple -- NOT just (x_id, y_id)
+        # -- so two parallel channels between the same (X, Y) pair both survive (see
+        # module docstring). A bare (x_id, y_id) key would let a second channel's edge
+        # silently overwrite the first here, before staging.upsert_edges is ever
+        # called -- staging's own widened PK can't save data this loop never emits.
+        derived[(x_id, y_id, via_channel_id)] = _next_segment_edge(
+            x_id, x_edge, y_id, y_edge, via_channel_id
+        )
 
     # 1. exact-channel pairing.
     for channel_id in sorted(producers):

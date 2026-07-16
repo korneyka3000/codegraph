@@ -1,9 +1,11 @@
 # Golden retrieval questions for the M3 gate (tests/eval/test_m3_gate.py) and for
 # `codegraph eval retrieval` (src/codegraph/cli.py) -- 5 natural-language questions
-# from the M3 plan (docs/superpowers/plans/2026-07-15-m3-retrieval.md, Task 8), run
-# through GraphQuery.search_code(mode="hybrid") (fulltext + REAL jina-embeddings-v2-
-# base-code, RRF-fused) against the fixtures/workspace.yaml graph; hit@k = ANY item
-# in the top `k` whose (service, qualified_name) is in that question's `accept` set.
+# from the M3 plan (docs/superpowers/plans/2026-07-15-m3-retrieval.md, Task 8), plus
+# ONE added question 6 (M3 final whole-milestone review, fulltext-coverage fix -- see
+# "QUESTION 6" section below), run through GraphQuery.search_code(mode="hybrid")
+# (fulltext + REAL jina-embeddings-v2-base-code, RRF-fused) against the
+# fixtures/workspace.yaml graph; hit@k = ANY item in the top `k` whose
+# (service, qualified_name) is in that question's `accept` set.
 #
 # Format: {question, accept: [{service, symbol}], k}. `accept` is an OR-set --
 # hit if ANY entry matches ANY top-k item (see evalx/retrieval_eval.run_questions).
@@ -53,10 +55,44 @@
 # rephrase -- questions 1-4 all hit@3 on the FIRST (plan-original) wording once
 # their accept lists reflected the real chunk granularity (correction 1).
 #
+# FULLTEXT-COVERAGE DISCLOSURE (M3 final whole-milestone review carry-item): questions
+# 1-5 are all Russian natural-language questions over an English-identifier codebase.
+# Live-verified (mode="text", fulltext only, no vector): EVERY ONE of questions 1-5
+# returns ZERO fulltext hits -- RediSearch's `db.idx.fulltext.queryNodes` runs an
+# implicit-AND over the query's tokens (see stores/falkordb/store.py's
+# `_sanitize_fulltext_query`), and none of a Russian question's Cyrillic tokens ever
+# literally appears in this corpus's (English-identifier) chunk text/context_header,
+# so every token fails to match and the implicit AND yields nothing. In other words:
+# `mode="hybrid"` on questions 1-5 is, IN PRACTICE, vector-only -- the fulltext leg of
+# RRF fusion contributes zero candidates for any of them, and every "hit" recorded
+# below for 1-5 comes entirely from jina-embeddings-v2-base-code's cross-lingual
+# semantic match. That's a real gap in this gate's OWN coverage: a hybrid retrieval
+# gate with 5/5 questions silently exercising only one of its two legs never actually
+# proves the fulltext leg (or its RRF fusion with vector) works at all.
+#
+# QUESTION 6 (M3 final whole-milestone review, fulltext-coverage fix): added
+# specifically to close the gap above -- an English, identifier-style query (the
+# literal Kafka topic name `documents.indexed` + the word "producer"), chosen and
+# verified live, the same anti-curve-fit discipline as questions 1-5:
+#   - `store.search_text_chunks("documents.indexed producer", k=5)` (fulltext ALONE,
+#     zero vector/embedder involvement) returns exactly ONE hit, unambiguous:
+#     `app.events.producer.emit_document_indexed`'s own chunk (RediSearch score 4.8 --
+#     both query tokens literally appear in that chunk's context_header/text, no other
+#     chunk in the 34-chunk corpus matches either token). This is the load-bearing
+#     proof: fulltext genuinely, independently finds the right answer for this
+#     question, not just "rides along" with a vector hit that would land there anyway.
+#   - `mode="text"`, `mode="vector"`, AND `mode="hybrid"` (`GraphQuery.search_code`)
+#     were each run live and all three land `emit_document_indexed` at rank 0 -- the
+#     fulltext leg is not merely present, it independently solves this question on its
+#     own, same as the vector leg does for questions 1-5.
+# No rephrase needed -- unlike question 5, the FIRST wording tried already hit@3
+# (in fact hit@1) in every mode.
+#
 # REAL GATE RESULTS (jina-embeddings-v2-base-code, dim=768, k=3, mode_used=hybrid
-# for all 5 -- see m3-task-8-report.md for the full per-question top-3 dump):
+# for all 6 -- see m3-task-8-report.md for questions 1-5's full per-question top-3
+# dump, and .superpowers/sdd/m3-final-fix-report.md for question 6's):
 #   1. hit=True rank=1   2. hit=True rank=2   3. hit=True rank=0
-#   4. hit=True rank=2   5. hit=True rank=0
+#   4. hit=True rank=2   5. hit=True rank=0   6. hit=True rank=0
 # Questions 2 and 4 hit at rank 2 (the very last position within k=3) -- a real,
 # occasionally-close-to-the-edge result on real cross-lingual semantic search
 # against a tiny (34-chunk) fixture corpus, left as-is (not curve-fit) since the
@@ -82,6 +118,10 @@ questions:
       - {service: kyc-worker, symbol: app.clients.document_management_client.DocumentManagementClient}
     k: 3
   - question: "где публикуется kafka-событие documents.indexed"
+    accept:
+      - {service: document-management, symbol: app.events.producer.emit_document_indexed}
+    k: 3
+  - question: "documents.indexed producer"
     accept:
       - {service: document-management, symbol: app.events.producer.emit_document_indexed}
     k: 3

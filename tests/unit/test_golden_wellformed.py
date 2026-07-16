@@ -37,7 +37,7 @@ def test_golden_edges_wellformed():
 def test_golden_questions_wellformed():
     data = yaml.safe_load((FIXTURES / "golden" / "questions.yaml").read_text())
     assert data["version"] == 1
-    assert len(data["questions"]) == 5
+    assert len(data["questions"]) == 6
     known_services = {"orders-api", "kyc-worker", "document-management"}
     for q in data["questions"]:
         assert isinstance(q["question"], str) and q["question"]

@@ -13,9 +13,14 @@ COLLECTION (before `-m` marker filtering ever runs), so a plain default `pytest`
 run would report this module as one "skipped" item instead of a clean marker
 "deselected", even though `local.py` itself is always safely importable (it only
 imports `sentence_transformers` lazily, inside `LocalEmbedder.__init__`). A
-`skipif` marker, by contrast, is only ever evaluated for items that survive `-m`
-selection -- so `-m 'not emb'` (the default) deselects this module's tests without
-ever touching `find_spec`, and an explicit `pytest -m emb` without the extra
+`skipif` marker, by contrast, is only ever ACTED ON for items that survive `-m`
+selection -- `find_spec` itself still runs at collection time either way (the
+module-level `pytestmark` list is plain Python, evaluated on import, before `-m`
+filtering can apply to anything), but under `-m 'not emb'` (the default) the `emb`
+mark deselects this module's tests before that skip reason is ever consulted, so a
+plain default run reports a clean "deselected" count with no `sentence_transformers`
+IMPORT ever attempted (`find_spec` alone checks importability without importing,
+unlike `importorskip`) -- and an explicit `pytest -m emb` without the extra
 installed still skips cleanly with a clear reason instead of erroring.
 """
 

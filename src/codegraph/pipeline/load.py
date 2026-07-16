@@ -58,17 +58,22 @@ directly from that separation, both deliberate (M3 scope, per the T6 brief):
   - Chunk nodes are written via TWO separate `upsert_nodes` calls (`_chunk_node_
     batches`, below) -- one for rows that HAVE a real embedding (`vector_props=
     ("embedding",)`, the `vecf32(r.embedding)` path) and one for rows that don't
-    (embedder was skipped this run, or a chunk simply hasn't been embedded yet).
-    `vecf32(NULL)` is a hard FalkorDB error, so a chunk lacking an embedding MUST NOT
-    have an "embedding" key on its row at all when it goes through `upsert_nodes` --
-    routing it through the vector_props path regardless (with a null placeholder,
-    say) would blow up the whole batch. Splitting into two calls (rather than one
-    call with a conditional per-row Cypher `CASE`) keeps `batch.upsert_nodes` itself
-    completely unaware of "some rows have this prop, some don't" -- documented here,
-    the load-bearing tradeoff being "two possible upsert_nodes calls (only one, if
-    every chunk in this graph either does or doesn't have an embedding, which is the
-    common case)" against "one call with a more complex, chunk-row-dependent Cypher
-    shape".
+    (embedder was skipped this run, or a chunk simply hasn't been embedded yet). NOT
+    because `vecf32(NULL)` errors -- live-verified against FalkorDB v4.18.11, it
+    doesn't: `SET n.<p> = vecf32(NULL)` raises nothing and simply never sets the
+    property (`<p>` is absent from the node afterwards, same as if that SET clause
+    had never run -- see `stores/falkordb/store.py`'s `search_vector_chunks` for the
+    same "missing index/data degrades to an empty/no-op result, not an exception"
+    FalkorDB behavior elsewhere in this codebase). The real reason for the split is
+    row SHAPE, not error avoidance: a row either carries a genuinely usable embedding
+    (a real `list[float]` at `row["embedding"]`) or it has no `"embedding"` key at
+    all -- keeping "key absent" and "key present but NULL" from ever meaning the same
+    thing here -- and keeps `batch.upsert_nodes` itself completely unaware of "some
+    rows have this prop, some don't". The other half of the reason: a row without a
+    usable embedding also needs `embed_model` stripped from its regular props (see
+    `_chunk_node_batches` below -- a chunk that carries no embedding must not claim
+    one was computed for it either), which is naturally done in the same per-row
+    branch that decides which of the two calls a row belongs to.
 
 Meta.embed_model/dim are read from `staging.get_meta("embed_model"/"embed_dim")` --
 written by `pipeline.chunk_embed.run` the last time an embedder was actually used (see
@@ -249,8 +254,10 @@ def _chunk_node_batches(
     ("embedding",)` treatment) and chunks WITHOUT one (embedder skipped this run, not
     yet embedded for some other reason, or -- see below -- a dimension mismatch) --
     see module docstring for why this split into two upsert_nodes calls, rather than
-    one, is the load-bearing design choice here (`vecf32(NULL)` is a hard FalkorDB
-    error).
+    one, is the design choice here: NOT `vecf32(NULL)` error avoidance (it doesn't
+    error, see module docstring), but keeping row shape unambiguous (key absent vs.
+    key present-but-NULL) and giving "no usable embedding" rows one place to also
+    drop `embed_model` from their props.
 
     `dim` is the SAME dimension `ensure_schema` just sized the vector index to (from
     `_embed_meta`), and it gates embedded rows in BOTH directions:

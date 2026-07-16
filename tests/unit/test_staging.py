@@ -570,6 +570,20 @@ def test_update_edge_props_returns_false_when_edge_missing(tmp_path):
     assert ok is False
 
 
+def test_update_edge_props_rejects_next_segment_type(tmp_path):
+    """update_edge_props's (src, dst, type) key doesn't distinguish via_channel --
+    unlike upsert_edges, whose real PK is (src, dst, type, via_channel) (M3 T1, see
+    core/schema.py's SCHEMA_VERSION "2 -> 3" history). A NEXT_SEGMENT pair can
+    legitimately have two rows sharing (src, dst, type) since the parallel-channel
+    derive() fix (linking/segments.py) -- calling update_edge_props on that type would
+    silently overwrite BOTH rows' props from whichever one SELECT happened to fetch
+    first. The only real caller (linking/workspace.py's temporal-start marking) only
+    ever passes type="CALLS", so this guard costs it nothing."""
+    st = Staging(tmp_path / "s.db")
+    with pytest.raises(InvariantError):
+        st.update_edge_props("sym:a:x", "sym:b:y", "NEXT_SEGMENT", {"k": "v"})
+
+
 # -- M3 T3: chunks (chunking.splitter.ChunkRec staged for T4/T6) --
 
 

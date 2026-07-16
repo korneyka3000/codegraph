@@ -333,8 +333,10 @@ def test_load_graph_writes_chunk_nodes_with_vecf32_embedding_and_meta_node(
         assert chunk1_props["embed_model"] == "test-model"
 
         # -- a chunk with NO embedding still loads -- no "embedding" property key at
-        # all (never a null one; see pipeline/load.py's own module docstring for why
-        # vecf32(NULL) would be a hard error if it were sent) --
+        # all (never a null one: `vecf32(NULL)` doesn't error, live-verified, it just
+        # silently never sets the property -- see pipeline/load.py's own module
+        # docstring for why the two-call split is kept anyway, for row-shape clarity
+        # and the embed_model-stripping it lines up with, not error avoidance) --
         chunk3_props = final_store.get_nodes([CHUNK_3_NOT_EMBEDDED.chunk_id])[0]
         assert "embedding" not in chunk3_props
         assert "embed_model" not in chunk3_props

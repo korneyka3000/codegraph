@@ -31,7 +31,9 @@ caller, not in chunking/splitter.py or chunking/augment.py themselves):
 `run(cfg, staging, embedder)`, per service in `cfg.services`:
   1. Read every staged file's bytes off disk (`ServiceConfig.path / relpath`, relpaths
      from `staging.files_for_service` -- the SAME set `analyze_service` already scanned
-     and staged earlier in this same `codegraph index` run).
+     and staged earlier in this same `codegraph index` run). A file gone by the time
+     THIS read runs (removed/renamed since analyze -- OSError) is warned about and
+     skipped, not fatal -- see the loop below.
   2. `build_file_facts` (tree-sitter) -- the same parse `analyze_service` itself ran;
      re-run here rather than cached, since `chunk_embed` has no access to
      `analyze_service`'s ephemeral in-memory `FileFacts` (only their DERIVED staged
@@ -153,7 +155,22 @@ def run(cfg: WorkspaceConfig, staging: Staging, embedder: Embedder | None) -> di
     for svc in cfg.services:
         relpaths = [rp for rp, _ in staging.files_for_service(svc.name)]
         for rp in relpaths:
-            source = (svc.path / rp).read_bytes()
+            try:
+                source = (svc.path / rp).read_bytes()
+            except OSError as e:
+                # Same race class as the span-shift skip just below (staged-vs-disk
+                # drift within one `codegraph index` invocation), just the more
+                # extreme case: the file isn't merely edited, it's GONE (removed/
+                # renamed since `analyze_service` scanned it earlier in this same
+                # run). One missing file must not crash the whole invocation and
+                # discard every other file/service's already-completed work.
+                logger.warning(
+                    "%s/%s: could not read file off disk (removed since analyze ran "
+                    "earlier in this same index invocation?) -- skipping chunking "
+                    "for this file: %s",
+                    svc.name, rp, e,
+                )
+                continue
             facts = build_file_facts(rp, source)
             resolved = _symbol_ids_for_file(nodes_by_file.get((svc.name, rp), []), facts)
             if resolved is None:

@@ -218,3 +218,33 @@ def test_no_producer_consumer_edges_derives_nothing(tmp_path):
 def test_empty_staging_derives_nothing(tmp_path):
     st = Staging(tmp_path / "s.db")
     assert segments.derive(st) == {"next_segments": 0}
+
+
+# -- parallel channels between the same (X, Y) pair (M3 final review fix) --
+
+
+def test_parallel_channels_between_same_pair_both_derived(tmp_path):
+    """X reaches Y via TWO different channels (a Kafka event AND a direct HTTP call --
+    e.g. PRODUCES->event plus CALLS_HTTP->route) -- both NEXT_SEGMENT edges must
+    survive derive(), not just whichever one happened to be written last into the
+    in-memory dedup dict. Reproduces the reviewer's repro: staging's own (src, dst,
+    type, via_channel) primary key (core/schema.py's SCHEMA_VERSION "2 -> 3" history)
+    and the FalkorDB-side key_props MERGE key (pipeline/load.py's _KEY_PROPS_BY_TYPE)
+    were BOTH already widened to carry two such edges -- derive() itself was the one
+    place still collapsing them via a bare (x_id, y_id) dict key."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_edges([
+        _edge("sym:a:x", "chan:event_type:E", "PRODUCES"),
+        _edge("sym:a:x", "chan:http:b:GET /y", "CALLS_HTTP"),
+        _edge("sym:b:y", "chan:event_type:E", "CONSUMES"),
+        _edge("chan:http:b:GET /y", "sym:b:y", "HANDLES"),
+    ])
+
+    stats = segments.derive(st)
+
+    ns = [e for e in st.iter_edges() if e.type == "NEXT_SEGMENT"]
+    assert stats == {"next_segments": 2}
+    assert len(ns) == 2
+    assert all((e.src, e.dst) == ("sym:a:x", "sym:b:y") for e in ns)
+    via_channels = {e.props["via_channel_id"] for e in ns}
+    assert via_channels == {"chan:event_type:E", "chan:http:b:GET /y"}
