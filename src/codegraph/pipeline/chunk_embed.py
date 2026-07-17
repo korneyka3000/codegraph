@@ -153,6 +153,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 from codegraph.chunking import augment
 from codegraph.chunking.splitter import chunk_file
@@ -166,6 +167,14 @@ from codegraph.stores.staging import ChunkRow, Staging
 logger = logging.getLogger(__name__)
 
 _EMBED_BATCH_SIZE = 64
+# M4 T8: cap on concurrently in-flight embed_batch calls, only ever used for an
+# embedder that opts in via `concurrency_safe=True` (openai/voyage -- see
+# embedding/base.py's own Protocol docstring). 4 is a fixed constant, not
+# os.cpu_count()-derived like the analyze.py parse fan-out -- these are I/O-bound
+# remote HTTP calls, not CPU-bound work, so the relevant limit is "how many
+# concurrent requests is polite/effective against the provider's own API", not local
+# core count.
+_MAX_CONCURRENT_EMBED_BATCHES = 4
 
 
 def _symbol_ids_for_file(
@@ -209,6 +218,40 @@ def _symbol_ids_for_file(
     return symbol_ids, module_id
 
 
+def _augmented_texts(batch: list[ChunkRow]) -> list[str]:
+    return [augment.augment_text(row.context_header or "", row.text) for row in batch]
+
+
+def _embed_batches(
+    embedder: Embedder, batches: list[list[ChunkRow]]
+) -> list[list[list[float]]]:
+    """Runs one `embedder.embed_batch` call per entry of `batches`, returning results
+    in the SAME order as `batches` -- always, regardless of which call actually
+    finishes first. Sequential (today's pre-M4-T8 behavior, byte-identical) unless the
+    embedder opts in via `concurrency_safe=True` (see embedding/base.py's own Protocol
+    docstring) AND there's more than one batch to overlap -- a single batch has
+    nothing to overlap WITH, so the thread-pool path is skipped even for a
+    concurrency-safe embedder rather than paying pool-startup overhead for zero
+    possible benefit.
+
+    When it DOES run concurrently: `ThreadPoolExecutor.map` is documented to yield
+    its results in call order, not completion order (`concurrent.futures`'s own
+    contract -- `list(...)` blocks on each future in THAT order before moving to the
+    next) -- so a slow early batch can never let a fast later one jump ahead in the
+    returned list. This is what keeps `_embed_missing`'s own `set_embeddings`/
+    `embedding_cache_put` write order deterministic (batch-index order) even when the
+    batches themselves complete out of order -- a library guarantee, not a race that
+    happens to resolve the right way most of the time."""
+    if getattr(embedder, "concurrency_safe", False) and len(batches) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(_MAX_CONCURRENT_EMBED_BATCHES, len(batches))
+        ) as ex:
+            return list(
+                ex.map(lambda batch: embedder.embed_batch(_augmented_texts(batch)), batches)
+            )
+    return [embedder.embed_batch(_augmented_texts(batch)) for batch in batches]
+
+
 def _embed_missing(staging: Staging, embedder: Embedder) -> tuple[int, int]:
     """Embeds every chunk `Staging.chunks_missing_embedding` currently flags
     (workspace-wide -- see module docstring), first partitioned against the
@@ -236,6 +279,14 @@ def _embed_missing(staging: Staging, embedder: Embedder) -> tuple[int, int]:
     front, then cache misses are walked in that SAME relative order for batching, so
     which rows land in which `embed_batch` call is fully deterministic for a given
     staging state.
+
+    M4 T8: the cache-miss batches themselves may now run concurrently (see
+    `_embed_batches`) instead of always one-at-a-time, for a `concurrency_safe=True`
+    embedder (openai/voyage) -- purely an internal scheduling change, invisible from
+    this function's own contract: `_embed_batches` always returns vectors in the SAME
+    order `batches` was built in, so the write loop right below (`set_embeddings`/
+    `embedding_cache_put`, one pair of calls per batch, in batch order) behaves
+    identically whether those vectors arrived sequentially or concurrently.
 
     Returns `(embedded_fresh, embedded_from_cache)` -- `run`'s own report counters
     (see its docstring)."""
@@ -268,10 +319,17 @@ def _embed_missing(staging: Staging, embedder: Embedder) -> tuple[int, int]:
     if cache_hits:
         staging.set_embeddings(cache_hits)
 
-    for i in range(0, len(cache_misses), _EMBED_BATCH_SIZE):
-        batch = cache_misses[i : i + _EMBED_BATCH_SIZE]
-        texts = [augment.augment_text(row.context_header or "", row.text) for row in batch]
-        vectors = embedder.embed_batch(texts)
+    batches = [
+        cache_misses[i : i + _EMBED_BATCH_SIZE]
+        for i in range(0, len(cache_misses), _EMBED_BATCH_SIZE)
+    ]
+    # M4 T8: `_embed_batches` runs these concurrently (<=4 at a time) ONLY for a
+    # `concurrency_safe=True` embedder (openai/voyage); local/fake fall straight
+    # through to the same sequential, one-`embed_batch`-call-at-a-time behavior this
+    # loop always had. Either way, `_embed_batches` returns vectors in `batches`'
+    # OWN order, so the write loop below -- and its determinism -- is completely
+    # unaware of whether the embed calls that fed it ran sequentially or concurrently.
+    for batch, vectors in zip(batches, _embed_batches(embedder, batches), strict=True):
         packed = [pack_vector(vec) for vec in vectors]
         staging.set_embeddings([
             (row.chunk_id, blob, embedder.model_id, row.input_hash)

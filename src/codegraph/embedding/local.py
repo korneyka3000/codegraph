@@ -97,6 +97,14 @@ class LocalEmbedder:
             raise CodegraphError(_LOAD_HINT.format(model=model, error=e)) from e
 
         self.model_id = model
+        # M4 T8: local, CPU/GPU-bound compute (not a network call) -- concurrent
+        # Python threads would mostly just serialize on the GIL around whatever isn't
+        # already vectorized C/CUDA inside sentence-transformers, with no reliable
+        # wall-clock win, and this specific model's trust_remote_code=True custom
+        # forward pass has no documented thread-safety guarantee either -- stays on
+        # chunk_embed's default sequential path (see embedding/base.py's own Protocol
+        # docstring for the full rationale, including openai/voyage's opposite case).
+        self.concurrency_safe = False
 
     def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:

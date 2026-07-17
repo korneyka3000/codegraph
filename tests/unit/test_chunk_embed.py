@@ -18,10 +18,12 @@ lower-level tests in test_staging.py/test_augment.py):
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from codegraph.chunking import augment
 from codegraph.config.models import ServiceConfig, WorkspaceConfig
+from codegraph.embedding.codec import pack_vector, unpack_vector
 from codegraph.embedding.fake import FakeEmbedder
 from codegraph.pipeline import chunk_embed
 from codegraph.pipeline.analyze import analyze_service
@@ -76,6 +78,43 @@ class _RecordingEmbedder:
 
     def embed_batch(self, texts):
         self.batch_sizes.append(len(texts))
+        return self._inner.embed_batch(texts)
+
+    def embed_query(self, text):
+        return self._inner.embed_query(text)
+
+
+class _ConcurrentSlowEmbedder:
+    """Wraps FakeEmbedder, adding `concurrency_safe = True` (opts into chunk_embed's
+    concurrent-batch path, M4 T8 -- see embedding/base.py's Protocol docstring) and an
+    artificial 50ms sleep on every `embed_batch` call -- proves two things at once in
+    `test_concurrent_embed_batches_give_wall_clock_win_and_deterministic_write_order`
+    below:
+
+      - a real wall-clock win: naive sequential batching would burn >=4*50ms=200ms in
+        sleeps alone for 4 batches; running them concurrently (<=4 workers) should
+        finish in roughly one delay's worth of wall time, not four.
+      - deterministic `set_embeddings` write order regardless of which batch's sleep
+        happens to elapse first: with a UNIFORM delay across every batch, thread
+        completion order is not a controlled variable here at all -- what pins
+        determinism is `ThreadPoolExecutor.map`'s own documented guarantee that its
+        returned iterator yields results in CALL order, not completion order, so
+        `_embed_missing`'s write loop (which walks that same order) is unaffected by
+        scheduling regardless of delay pattern.
+    """
+
+    _DELAY_SECONDS = 0.05
+
+    def __init__(self):
+        self._inner = FakeEmbedder(dim=8)
+        self.model_id = self._inner.model_id
+        self.dim = self._inner.dim
+        self.concurrency_safe = True
+        self.batch_sizes: list[int] = []
+
+    def embed_batch(self, texts):
+        time.sleep(self._DELAY_SECONDS)
+        self.batch_sizes.append(len(texts))  # list.append -- GIL-atomic, no lock needed
         return self._inner.embed_batch(texts)
 
     def embed_query(self, text):
@@ -425,6 +464,74 @@ def test_embed_batches_capped_at_64(tmp_path):
     assert report["embedded_fresh"] == 130  # first run, nothing cached yet
     assert report["embedded_from_cache"] == 0
     assert spy.batch_sizes == [64, 64, 2]
+
+
+# ======================================================================================
+# -- M4 T8: concurrent embed batches for `concurrency_safe=True` embedders (openai/
+# voyage in production; `_ConcurrentSlowEmbedder` here stands in for one) -- wall-clock
+# win AND deterministic `set_embeddings` write order, both proven in one test per the
+# task-8 brief (generous margins to avoid flake: 4 batches * 50ms -> sequential-
+# equivalent floor 200ms, concurrent asserted <130ms).
+# ======================================================================================
+
+
+def test_concurrent_embed_batches_give_wall_clock_win_and_deterministic_write_order(
+    tmp_path, monkeypatch
+):
+    """256 tiny functions -> exactly 4 batches of 64 (_EMBED_BATCH_SIZE), each delayed
+    50ms by `_ConcurrentSlowEmbedder`. A naive sequential implementation would take
+    >=200ms just in sleeps; running up to 4 batches concurrently should land close to
+    one delay's worth of wall time. `Staging.set_embeddings` is spied on to prove the
+    concatenation of every chunk_id it's ever called with, IN CALL ORDER, is already
+    sorted -- i.e. writes land in ascending chunk_id order (matching
+    `chunks_missing_embedding`'s own `ORDER BY chunk_id`, the same order the batches
+    were carved out of `missing` in), never scrambled by scheduling."""
+    svc = _write_service(tmp_path, "a", {"m.py": _many_funcs_src(256)})
+    cfg = _cfg(svc)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+
+    embedder = _ConcurrentSlowEmbedder()
+
+    written_chunk_ids: list[list[str]] = []
+    original_set_embeddings = Staging.set_embeddings
+
+    def spy_set_embeddings(self, rows):
+        written_chunk_ids.append([row[0] for row in rows])
+        return original_set_embeddings(self, rows)
+
+    monkeypatch.setattr(Staging, "set_embeddings", spy_set_embeddings)
+
+    t0 = time.perf_counter()
+    report = chunk_embed.run(cfg, staging, embedder)
+    elapsed = time.perf_counter() - t0
+
+    assert report["chunks_total"] == 256
+    assert report["embedded_fresh"] == 256
+    assert report["embedded_from_cache"] == 0
+    assert embedder.batch_sizes == [64, 64, 64, 64]  # 4 full batches, as designed
+
+    # -- wall-clock win: sequential-equivalent floor is 4*50ms=200ms; concurrent(<=4)
+    # comes in comfortably under that, generous margin against flake on a loaded CI box.
+    assert elapsed < 0.13, f"expected a concurrent wall-clock win, took {elapsed:.3f}s"
+
+    # -- deterministic write order --
+    flat = [cid for call in written_chunk_ids for cid in call]
+    assert len(flat) == 256
+    assert flat == sorted(flat)
+
+    # -- no cross-batch mix-up: every stored vector matches what a bare (undelayed,
+    # unwrapped) FakeEmbedder produces for that exact chunk's own augmented text --
+    # zip-alignment errors under concurrency would show up here as a mismatched vector
+    # attached to the wrong chunk_id. Both sides go through the same lossy pack_vector/
+    # unpack_vector float32 round-trip (`row.embedding` already has; the freshly
+    # computed `expected` doesn't until packed here) -- comparing raw float64 vs a
+    # float32-round-tripped value would spuriously differ at ~1e-9, unrelated to
+    # whether the vector is actually the RIGHT one.
+    reference = FakeEmbedder(dim=8)
+    for row in staging.iter_chunks():
+        expected = reference.embed_query(augment.augment_text(row.context_header or "", row.text))
+        assert unpack_vector(row.embedding) == unpack_vector(pack_vector(expected))
 
 
 # ======================================================================================

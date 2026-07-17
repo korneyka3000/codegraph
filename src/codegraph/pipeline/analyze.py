@@ -159,6 +159,48 @@ def _apply_role_props_patch(
     )
 
 
+def _build_facts_by_file(relpaths: list[str], files: dict[str, bytes]) -> dict[str, FileFacts]:
+    """`build_file_facts(relpath, source_bytes)` (parsing/facts.py) over every file in
+    `relpaths`, collected into one `{relpath: FileFacts}` dict -- extracted so
+    `_analyze_full` (relpaths == every scanned file) and `_analyze_incremental`
+    (relpaths == the stale subset only, M4 T5) share ONE copy of this loop instead of
+    two independently-maintained dict comprehensions that could drift apart.
+
+    M4 T8: measured, not assumed, whether fanning this out across a
+    `ThreadPoolExecutor` (tree-sitter's own C parse releases the GIL, so it's
+    THEORETICALLY parallelizable) is worth doing -- verdict: NO, reverted to the plain
+    sequential comprehension below. `build_file_facts` spends most of its wall time in
+    a recursive, pure-Python AST walk building `DefFact`/`CallFact`/`ImportFact`/
+    `AssignFact` objects (dataclass construction, string decode, list/dict work) --
+    that part does NOT release the GIL, so threads mostly serialize on it anyway,
+    while still paying real `ThreadPoolExecutor` overhead (thread startup, GIL
+    handoff/contention, executor bookkeeping) on top. Measured (scratch
+    `perf_counter` harness, `codegraph.parsing.facts.build_file_facts` +
+    `codegraph.pipeline.scan.scan_service`, 3 repetitions, median -- see task-8's own
+    report for the full table): on the 3 fixture services (29 files, ~6.7KB total,
+    summed) sequential beat threaded by 53-87% across three independent runs --
+    genuinely small per-file work, where thread-pool overhead alone dominates. Per the
+    brief, that result alone is ambiguous-enough-to-check-further ("noise-level"
+    reads as "possibly just too small a corpus", not obviously a clean win OR loss),
+    so this repo's own `src/` tree (78 files, ~650KB -- deliberately bigger than the
+    fixtures, to see whether a larger, more realistic corpus flips the verdict) was
+    ALSO measured: -4.9%, +2.2%, +1.6% win across three independent runs -- a wash,
+    nowhere near the required >=15% threshold either direction. Kept as a plain
+    sequential dict comprehension -- the shared-helper extraction (this function
+    existing at all, replacing two independently-inlined loops) is the part of this
+    task that stands regardless of the parallelism verdict.
+
+    `relpaths` is used as-is for both the loop order AND (via `dict(...)` insertion
+    order) the returned dict's own iteration order -- both callers already pass a
+    SORTED list (`scan_service` sorts its rows; `_analyze_incremental` passes
+    `sorted(stale)`), and `extractors.calls.build_calls` iterates `facts_by_file.
+    items()` directly (its per-(src,dst)-pair "first call site wins" evidence
+    aggregation) -- so preserving `relpaths`' own order here, rather than e.g.
+    completion order under a hypothetical parallel implementation, is load-bearing
+    for deterministic evidence attribution, not just a cosmetic nicety."""
+    return {rp: build_file_facts(rp, files[rp]) for rp in relpaths}
+
+
 def _extract_join_and_stage(
     svc: ServiceConfig,
     staging: Staging,
@@ -348,7 +390,7 @@ def _analyze_full(
     # 4. facts по отсортированным relpath (bytes из files выше). Вычислены здесь, ДО resolve
     # (шаг 2), потому что деградированный fallback (шаг 3) тоже нуждается в facts_by_file —
     # строим единожды и переиспользуем в шаге 3 (если degraded) и шаге 5 (всегда).
-    facts_by_file = {rp: build_file_facts(rp, files[rp]) for rp in relpaths}
+    facts_by_file = _build_facts_by_file(relpaths, files)
 
     # 2. resolve: реальный SCIP через runner, иначе деградация
     degraded = False
@@ -477,7 +519,7 @@ def _analyze_incremental(
     # 8. S5+S6 over stale only -- facts built ONLY for stale (the entire point).
     stale_sorted = sorted(stale)
     files = {rp: (svc.path / rp).read_bytes() for rp in stale_sorted}
-    facts_by_file = {rp: build_file_facts(rp, files[rp]) for rp in stale_sorted}
+    facts_by_file = _build_facts_by_file(stale_sorted, files)
 
     ej = _extract_join_and_stage(
         svc, staging, stale_sorted, files, facts_by_file, active_idioms, idioms,

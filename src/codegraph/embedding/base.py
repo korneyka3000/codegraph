@@ -20,6 +20,24 @@ consumer -- NOT wired up here, see this package's `__init__.py`):
 - `embed_query`: single-text path, used to embed a search query at retrieval time.
   For most providers this is just `embed_batch([text])[0]`; Voyage's asymmetric
   `input_type` support is the one exception (see `voyage.py`'s module docstring).
+- `concurrency_safe` (M4 T8): True means `pipeline.chunk_embed._embed_missing` may
+  fire up to 4 `embed_batch` calls concurrently (`ThreadPoolExecutor`, see that
+  module's own docstring) for this embedder instead of its default one-batch-at-a-time
+  loop. Set True in `openai_emb.py`/`voyage.py` -- both are remote HTTP API calls,
+  where overlapping the network round-trip of several batches is a genuine wall-clock
+  win, and whose underlying HTTP clients are safe to drive from multiple threads at
+  once. Left False in `local.py` (a local, CPU/GPU-bound `sentence-transformers`
+  model -- concurrent Python-thread calls would mostly just serialize on the GIL
+  around whatever isn't already vectorized C/CUDA, with no reliable win, and a
+  model that ISN'T internally thread-safe would be a correctness hazard, not just a
+  missed optimization) and absent on `fake.py` (falls back to this attribute's own
+  `False` default below via `getattr`, same effective behavior as an explicit False
+  -- `FakeEmbedder` is a test double, never a real concurrency-worthy I/O call).
+  Structural/duck-typed callers (every real implementation in this package) don't
+  inherit this class, so this in-Protocol default is documentation for type-checking
+  purposes only -- `_embed_missing` reads it via `getattr(embedder, "concurrency_safe",
+  False)`, not attribute access, so an implementation that never sets it at all (e.g.
+  `fake.py`) is exactly as safe as one that sets it to False explicitly.
 
 Every implementation in this package returns unit-normalized (L2 norm 1) vectors, so
 cosine similarity reduces to a plain dot product at the retrieval layer.
@@ -34,6 +52,7 @@ from typing import Protocol
 class Embedder(Protocol):
     model_id: str
     dim: int
+    concurrency_safe: bool = False
 
     def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
         """One unit-normalized vector per input text, same order. `[]` in -> `[]` out."""

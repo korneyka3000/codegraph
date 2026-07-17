@@ -208,6 +208,29 @@ def test_local_embedder_model_construction_failure_wraps_as_codegraph_error(monk
         LocalEmbedder("jinaai/jina-embeddings-v2-base-code")
 
 
+def test_local_embedder_sets_concurrency_safe_false(monkeypatch):
+    """M4 T8: local embedding is CPU/GPU-bound compute, not a remote API call --
+    chunk_embed's concurrent-batch path is opt-in (`concurrency_safe=True`), and
+    `LocalEmbedder` never opts in (see embedding/base.py's own Protocol docstring for
+    the full rationale, and openai_emb.py/voyage.py's opposite case below)."""
+    from codegraph.embedding.local import LocalEmbedder
+
+    fake_module = types.ModuleType("sentence_transformers")
+
+    class _WorkingSentenceTransformer:
+        def __init__(self, model, trust_remote_code=False):
+            pass
+
+        def get_embedding_dimension(self):
+            return 5
+
+    fake_module.SentenceTransformer = _WorkingSentenceTransformer
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+
+    emb = LocalEmbedder("some-model")
+    assert emb.concurrency_safe is False
+
+
 def test_local_embedder_dim_probe_failure_also_wraps_as_codegraph_error(monkeypatch):
     """Sweep-review follow-up to the fix above: the DIMENSION PROBE right after
     construction (get_embedding_dimension()/get_sentence_embedding_dimension()) is the
@@ -340,6 +363,17 @@ def test_openai_embedder_embed_batch_empty_list(monkeypatch):
     assert emb.embed_batch([]) == []
 
 
+def test_openai_embedder_sets_concurrency_safe_true(monkeypatch):
+    """M4 T8: a remote HTTP API call -- safe (and worth it) to fire concurrently from
+    `chunk_embed._embed_missing`, unlike local/fake (see embedding/base.py's own
+    Protocol docstring)."""
+    from codegraph.embedding.openai_emb import OpenAIEmbedder
+
+    _install_fake_openai(monkeypatch)
+    emb = OpenAIEmbedder(model="text-embedding-3-small")
+    assert emb.concurrency_safe is True
+
+
 # ---------------------------------------------------------------------------
 # VoyageEmbedder -- full behavioral coverage against a fake `voyageai` module
 # ---------------------------------------------------------------------------
@@ -411,3 +445,14 @@ def test_voyage_embedder_embed_batch_empty_list(monkeypatch):
     _install_fake_voyageai(monkeypatch)
     emb = VoyageEmbedder(model="voyage-code-3")
     assert emb.embed_batch([]) == []
+
+
+def test_voyage_embedder_sets_concurrency_safe_true(monkeypatch):
+    """M4 T8: a remote HTTP API call -- safe (and worth it) to fire concurrently from
+    `chunk_embed._embed_missing`, unlike local/fake (see embedding/base.py's own
+    Protocol docstring)."""
+    from codegraph.embedding.voyage import VoyageEmbedder
+
+    _install_fake_voyageai(monkeypatch)
+    emb = VoyageEmbedder(model="voyage-code-3")
+    assert emb.concurrency_safe is True

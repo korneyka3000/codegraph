@@ -61,6 +61,11 @@ class OpenAIEmbedder:
         self._client = OpenAI(api_key=api_key)
         self.model_id = model
         self._dim = KNOWN_DIMS.get(model)  # None -> probed lazily, see `dim` below
+        # M4 T8: a remote HTTP API call -- `openai.OpenAI`'s underlying HTTP client is
+        # safe to drive from multiple threads at once, so `chunk_embed._embed_missing`
+        # may overlap up to 4 embed_batch calls for a real wall-clock win (see
+        # embedding/base.py's own Protocol docstring for the full rationale).
+        self.concurrency_safe = True
 
     @property
     def dim(self) -> int:
