@@ -551,7 +551,15 @@ def serve(
     build_server(cfg, graph_name).run()
 
 
-_DEFAULT_QUESTIONS = Path(__file__).parent.parent.parent / "fixtures" / "golden" / "questions.yaml"
+# M4 T2 (wheel-safe packaging, same treatment as TEMPLATE above): the default
+# --questions file ships INSIDE the package (src/codegraph/data/questions.yaml) --
+# the old Path(__file__).parent.parent.parent / "fixtures" / ... construction reached
+# outside the package and raised FileNotFoundError from a real wheel install.
+# fixtures/golden/questions.yaml stays put as the LIVE golden set (the M3 gate in
+# tests/eval/test_m3_gate.py reads it directly, and it stays hand-editable there);
+# the packaged file is the byte-identical copy `eval retrieval` ships as its default
+# (drift-guarded in tests/unit/test_cli_eval.py).
+_DEFAULT_QUESTIONS = importlib.resources.files("codegraph") / "data" / "questions.yaml"
 
 # `eval` is a command GROUP (Typer sub-app), not a flat command -- `codegraph eval
 # retrieval [target] [--graph] [--k] [--questions PATH]` (M3 T8's own contract).
@@ -572,8 +580,9 @@ def eval_retrieval(
         _DEFAULT_QUESTIONS, "--questions",
         help=(
             "golden questions YAML ({question, accept: [{service, symbol}], k} rows, "
-            "see fixtures/golden/questions.yaml). Defaults to codegraph's OWN bundled "
-            "fixture golden file -- there is no auto-discovered '<workspace>/"
+            "see fixtures/golden/questions.yaml). Defaults to codegraph's OWN golden "
+            "questions, bundled inside the package (data/questions.yaml -- works from "
+            "a wheel install too) -- there is no auto-discovered '<workspace>/"
             "questions.yaml' convention (a real workspace's golden questions are "
             "necessarily hand-authored against ITS OWN symbols; pass --questions "
             "explicitly to point at one)."

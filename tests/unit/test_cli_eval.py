@@ -16,13 +16,16 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+import codegraph
 from codegraph.cli import _DEFAULT_QUESTIONS, app
 from codegraph.core.errors import CodegraphError
+from codegraph.evalx.retrieval_eval import load_questions
 from codegraph.stores.falkordb.connection import StoreUnavailable
 
 runner = CliRunner()
 
-FIXTURES_WS = Path(__file__).parents[2] / "fixtures" / "workspace.yaml"
+REPO_ROOT = Path(__file__).parents[2]
+FIXTURES_WS = REPO_ROOT / "fixtures" / "workspace.yaml"
 
 _QUESTIONS = [
     {"question": "q1", "k": 3, "accept": [{"service": "svc", "symbol": "app.a"}]},
@@ -113,6 +116,43 @@ def test_eval_retrieval_explicit_questions_flag_overrides_default(monkeypatch, t
 
     assert result.exit_code == 0, result.output
     assert seen == [custom]
+
+
+# -- M4 T2: _DEFAULT_QUESTIONS must be wheel-safe, exactly like cli.TEMPLATE (same
+# repo-root-escaping Path(__file__).parent.parent.parent shape, same FileNotFoundError
+# from a real wheel install where no repo checkout sits beside site-packages/).
+# fixtures/golden/questions.yaml stays put as the LIVE golden set (tests/eval/
+# test_m3_gate.py, test_golden_wellformed.py read it directly) -- what moves into
+# package data is the COPY the CLI ships as `eval retrieval`'s default.
+
+
+def test_default_questions_lives_inside_the_package_not_via_repo_root_escape():
+    package_root = str(Path(codegraph.__file__).parent)
+    assert str(_DEFAULT_QUESTIONS).startswith(package_root)
+
+
+def test_default_questions_resources_read_works_and_rows_are_golden_shaped():
+    """The shipped default must actually load through the same load_questions()
+    path `eval retrieval` uses, and parse into non-empty golden-shaped rows --
+    proves the resources read end-to-end, not just that the file exists. (Note:
+    this test also passed against the OLD fixtures-path default -- the RED driver
+    for the move is the structural test above plus the drift guard below.)"""
+    questions = load_questions(_DEFAULT_QUESTIONS)
+    assert len(questions) > 0
+    for q in questions:
+        assert {"question", "accept", "k"} <= q.keys()
+
+
+def test_packaged_default_questions_byte_identical_to_live_golden_set():
+    """Drift guard, same pattern as codegraph.example.yaml's: the packaged default
+    (src/codegraph/data/questions.yaml, what a wheel-installed `eval retrieval`
+    reads) must never silently diverge from the live golden set
+    (fixtures/golden/questions.yaml, what the M3 gate runs) -- today they are the
+    same questions by design (cli.py's --questions help says the default IS the
+    bundled golden file). Only catches divergence; doesn't enforce which to edit."""
+    packaged = REPO_ROOT / "src" / "codegraph" / "data" / "questions.yaml"
+    golden = REPO_ROOT / "fixtures" / "golden" / "questions.yaml"
+    assert packaged.read_bytes() == golden.read_bytes()
 
 
 # ======================================================================================
