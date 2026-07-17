@@ -172,6 +172,66 @@ def test_incremental_matches_full_reanalyze_across_a_mutation_sequence(tmp_path)
 
 
 @pytest.mark.skipif(shutil.which("npx") is None, reason="npx not available")
+def test_incremental_deleting_a_referenced_file_invalidates_the_importer(tmp_path):
+    """Reviewer-escalated deletion scenario (M4 T5 review follow-up, suite-protected
+    from their adversarial probe): the mutation-sequence test above deletes
+    app/main.py, which nothing else imports -- this one deletes
+    app/events/producer.py, which app/routes/documents.py (left byte-identical)
+    imports AND calls. The importer must land in the stale set via ref_dirty ALONE
+    (its own bytes never move, so delta.changed can't be how it got there), and no
+    dangling IMPORTS/CALLS edge into the deleted file's symbols may survive."""
+    svc_dir = _copy_service(tmp_path)
+    svc = ServiceConfig(name="document-management", path=svc_dir)
+    cache_dir = tmp_path / "cache"
+    st = Staging(tmp_path / "incremental.db")
+
+    baseline = analyze_service(svc, st, cache_dir)
+    assert baseline["degraded"] is False, baseline["reason"]
+
+    # Sanity: the baseline really stages the cross-file edges whose cleanup this
+    # test is about -- otherwise the "zero dangling" asserts below would pass
+    # vacuously. `app.events.producer` (backtick-quoted module descriptor) pins the
+    # exact deleted module, not a loose substring.
+    assert any(
+        e.type == "IMPORTS" and e.evidence_file == "app/routes/documents.py"
+        and "`app.events.producer`" in e.dst
+        for e in st.iter_edges()
+    )
+    assert any(
+        e.type == "CALLS" and "emit_document_indexed" in e.dst
+        and e.evidence_file == "app/routes/documents.py"
+        for e in st.iter_edges()
+    )
+
+    routes_before = (svc_dir / "app" / "routes" / "documents.py").read_bytes()
+    (svc_dir / "app" / "events" / "producer.py").unlink()
+
+    delta = _current_delta(st, svc)
+    assert delta.deleted == ("app/events/producer.py",)
+    assert delta.changed == ()  # the importer's bytes are untouched
+
+    report = analyze_service(svc, st, cache_dir, incremental=True, prior_delta=delta)
+    assert report["mode"] == "incremental"
+    # The deleted file itself is `dead`, not stale -- stale_files counts the
+    # ref-dirty importer(s). routes/documents.py can only have gotten there via
+    # ref_dirty: delta.changed above is empty and its bytes are byte-identical.
+    assert report["stale_files"] >= 1
+    assert (svc_dir / "app" / "routes" / "documents.py").read_bytes() == routes_before
+
+    # The deleted file's own layer is gone...
+    assert not any(n.relpath == "app/events/producer.py" for n in st.iter_nodes())
+    assert not any(e.evidence_file == "app/events/producer.py" for e in st.iter_edges())
+    # ...and the IMPORTER's stale edges into it were invalidated too: zero dangling
+    # IMPORTS/CALLS pointing at the deleted file's module or symbols.
+    assert not any("`app.events.producer`" in e.dst for e in st.iter_edges())
+    assert not any(
+        e.type == "CALLS" and "emit_document_indexed" in e.dst for e in st.iter_edges()
+    )
+
+    assert _dump(st, svc.name) == _full_reanalyze_dump(svc, cache_dir, tmp_path, "del-ref")
+
+
+@pytest.mark.skipif(shutil.which("npx") is None, reason="npx not available")
 def test_incremental_skip_after_full_analyze_with_no_changes(tmp_path):
     """A same-tree re-run (prior_delta.empty, fingerprint_ok default True) does
     ZERO staging writes and reports mode="skipped" with the CURRENT staged counts

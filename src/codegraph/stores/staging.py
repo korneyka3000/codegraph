@@ -82,6 +82,21 @@ _CHUNK_COLUMNS = (
 # workspace's worth of cache-miss candidates.
 _CACHE_LOOKUP_BATCH = 400
 
+# (report key, table) pairs behind `counts()` (workspace-wide) and
+# `counts_for_service()` (per-service, M4 T5) -- one constant instead of two
+# hand-copied literals that would silently drift apart on a future table addition
+# (the exact same reasoning as `_CHUNK_COLUMNS` above). The key is the REPORT-dict
+# name (matching analyze_service's own report fields: defs/refs, not
+# scip_defs/scip_refs); the value is the actual table name.
+_COUNT_TABLES = (
+    ("files", "files"),
+    ("defs", "scip_defs"),
+    ("refs", "scip_refs"),
+    ("nodes", "nodes"),
+    ("edges", "edges"),
+    ("chunks", "chunks"),
+)
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS files(
@@ -957,14 +972,7 @@ class Staging:
 
     def counts(self) -> dict:
         out = {}
-        for key, table in (
-            ("files", "files"),
-            ("defs", "scip_defs"),
-            ("refs", "scip_refs"),
-            ("nodes", "nodes"),
-            ("edges", "edges"),
-            ("chunks", "chunks"),
-        ):
+        for key, table in _COUNT_TABLES:
             out[key] = self._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
         return out
 
@@ -975,19 +983,12 @@ class Staging:
         (prior_delta.empty and the config fingerprint still matches), it does ZERO
         staging writes and reports whatever this service's CURRENT staged counts
         already are, instead of the per-run extraction/join counts every other mode
-        reports. Same 6 keys as counts() (files/defs/refs/nodes/edges/chunks);
+        reports. Same 6 keys as counts() (shared `_COUNT_TABLES` constant);
         `edges` has no `service` column of its own (only `origin_service`, see
         upsert_edges/begin_service) -- scoped by that instead, same key
         begin_service itself deletes by."""
         out = {}
-        for key, table in (
-            ("files", "files"),
-            ("defs", "scip_defs"),
-            ("refs", "scip_refs"),
-            ("nodes", "nodes"),
-            ("edges", "edges"),
-            ("chunks", "chunks"),
-        ):
+        for key, table in _COUNT_TABLES:
             col = "origin_service" if table == "edges" else "service"
             out[key] = self._db.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE {col}=?", (service,)  # noqa: S608
