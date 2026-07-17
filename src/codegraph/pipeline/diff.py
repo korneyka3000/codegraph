@@ -46,7 +46,15 @@ JSON-safe nested dicts/lists for the idiom DSL's own nested models (ValueSpec,
 ChannelSpec, ...) -- no separate canonicalization needed there beyond the outer
 `json.dumps(..., sort_keys=True)`, which sorts every dict's keys (including nested
 ones) but never reorders list elements, which is exactly why `exclude`/`active` need
-their own explicit `sorted()` first.
+their own explicit `sorted()` first. The idiom lists themselves (producers/
+consumers/http_clients) are deliberately NOT sorted, unlike those two siblings:
+their order is semantically load-bearing -- extractors walk idioms in list order and
+each call site is claimed by at most the FIRST idiom whose scope matches (see
+kafka_ext.py/http_client_ext.py; config.loader.effective_idioms puts service idioms
+before builtins to exploit exactly this shadowing) -- so reordering idioms IS a
+behavioral config change and MUST flip the fingerprint; "fixing" the apparent
+inconsistency by sorting them would let two semantically different configs hash
+identically.
 
 Neither function writes anything: `config_fingerprint`'s result is persisted by the
 CALLER via `staging.set_meta(f"svc_fingerprint:{name}", fp)` -- T5 (read it back to
