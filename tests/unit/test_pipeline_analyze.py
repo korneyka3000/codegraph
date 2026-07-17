@@ -652,3 +652,44 @@ def test_analyze_incremental_stale_files_reflects_changed_file_on_disk(tmp_path)
     )
     assert other_after == other_before  # untouched: not in the stale set
     assert main_after.content_hash != main_before.content_hash  # re-extracted
+
+
+def test_analyze_incremental_report_exposes_stale_relpaths_for_cli_changed_files(tmp_path):
+    """T7 (CLI --incremental) needs the ACTUAL stale relpath set, not just its count,
+    to scope S8 chunk_embed's own changed_files parameter -- stale_relpaths is exactly
+    the `stale` set computed internally (changed | added | ref_dirty, sorted), a
+    sibling of the pre-existing stale_files COUNT, never present outside mode=
+    "incremental" (skipped/full reports have no stale set to report at all)."""
+    svc_root = tmp_path / "svc"
+    (svc_root / "app").mkdir(parents=True)
+    (svc_root / "app" / "__init__.py").write_text("")
+    (svc_root / "app" / "main.py").write_text("def f():\n    pass\n")
+    (svc_root / "app" / "other.py").write_text("def g():\n    pass\n")
+    svc = ServiceConfig(name="svc", path=svc_root)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    (svc_root / "app" / "main.py").write_text("def f():\n    return 1\n")
+
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True,
+    )
+    assert report["mode"] == "incremental"
+    assert report["stale_relpaths"] == ("app/main.py",)
+    assert len(report["stale_relpaths"]) == report["stale_files"]
+
+
+def test_analyze_full_and_skipped_reports_have_no_stale_relpaths_key(tmp_path):
+    svc = ServiceConfig(name="document-management", path=FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    full_report = analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+    assert "stale_relpaths" not in full_report
+
+    empty_delta = ServiceDelta(added=(), changed=(), deleted=(), unchanged=("app/main.py",))
+    skip_report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FailIfCalledRunner(),
+        incremental=True, prior_delta=empty_delta, fingerprint_ok=True,
+    )
+    assert skip_report["mode"] == "skipped"
+    assert "stale_relpaths" not in skip_report

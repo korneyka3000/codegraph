@@ -23,8 +23,10 @@ from codegraph.evalx.retrieval_eval import load_questions, run_questions
 from codegraph.linking.workspace import link_workspace
 from codegraph.pipeline.analyze import analyze_service
 from codegraph.pipeline.chunk_embed import run as run_chunk_embed
+from codegraph.pipeline.diff import config_fingerprint, service_delta
 from codegraph.pipeline.load import load_graph
 from codegraph.pipeline.report import build_report, print_report, write_report
+from codegraph.pipeline.scan import scan_service
 from codegraph.pipeline.stages import STAGES
 from codegraph.query.api import GraphQuery
 from codegraph.stores.falkordb.connection import StoreError, StoreUnavailable
@@ -209,16 +211,144 @@ def _make_embedder_or_warn(cfg: WorkspaceConfig):
         return None
 
 
+def _svc_fingerprint_key(name: str) -> str:
+    return f"svc_fingerprint:{name}"
+
+
+def _analyze_services(
+    cfg: WorkspaceConfig,
+    staging: Staging,
+    cache_dir: Path,
+    active_idioms: frozenset[str],
+    incremental: bool,
+) -> tuple[list[dict], dict[str, set[str]]]:
+    """S1-S6 per-service orchestration for `index()`, M4 T7. `analyze_service` is
+    called by its bare imported name (never `codegraph.pipeline.analyze.
+    analyze_service`) for the same reason this whole module always does that -- see
+    the module-level comment above the `mcp.server` import: tests/unit/test_cli_m1b.py
+    and friends monkeypatch exactly `codegraph.cli.analyze_service`.
+
+    `incremental=False` (`--incremental` absent, the default): every OTHER concern
+    (per-service call shape/count/order, exceptions) is byte-identical to pre-M4 --
+    `analyze_service` is called with the SAME two kwargs as always, nothing more. The
+    ONE additive side effect (Global Constraint, M4 plan) is that the JUST-computed
+    config fingerprint is written to staging AFTER each call, so a LATER
+    `--incremental` run has a real baseline instead of unconditionally treating every
+    service as "first run". `changed_files` is always `{}` in this mode -- callers
+    that care (only `index()`, gated on its own `incremental` flag) must pass `None`
+    to `run_chunk_embed` themselves rather than trust this return value, since `{}`
+    (a non-None, merely EMPTY dict) means something completely different to
+    `run_chunk_embed` than `None` does (every service's WHOLE chunk loop skipped, vs.
+    every service chunked in full -- see that function's own module docstring).
+
+    `incremental=True`, per service:
+      1. cheap `scan_service` (BEFORE analyze -- "скан+дифф до analyze" per the plan)
+         + `service_delta` against `staging.files_for_service`'s PRIOR snapshot (still
+         whatever the PREVIOUS run staged -- this call hasn't touched it yet).
+      2. `fp_ok = (stored fingerprint == config_fingerprint(svc, idioms,
+         active_idioms))`, ALWAYS computed fresh here -- never left at
+         `analyze_service`'s own permissive `fingerprint_ok=True` default (binding
+         carry-item from the T5 review: a caller that forgets this lets skip mode
+         fire on a genuinely changed config). A never-before-seen service has no
+         stored fingerprint at all (`get_meta` -> None), which simply compares
+         unequal to any real fingerprint -- "first run" needs no separate branch.
+      3. NOT fp_ok -> full, bypassing analyze_service's OWN incremental dispatch
+         entirely (`incremental=False`, the plan's "fingerprint mismatch (или
+         отсутствует) -> full" case) -- `report["reason"]` is only ever populated by
+         analyze_service for a SCIP degradation, so this function fills it in itself
+         ("first run" / "fingerprint mismatch"), but ONLY when analyze_service left
+         it None: a config-stale service that ALSO degrades this same run keeps its
+         real (more actionable) degraded reason untouched.
+         fp_ok -> `incremental=True, prior_delta=delta, fingerprint_ok=True` straight
+         through; analyze_service's own skip/incremental dispatch (T5) takes it from
+         there (including the case where ITS OWN scip attempt degrades mid-flight and
+         falls back to `mode="full"` on its own -- indistinguishable here from case 3
+         above by the time this function reads `report["mode"]` back, and correctly
+         handled identically either way, see point 5).
+      4. Fingerprint written back UNLESS `report["mode"] == "skipped"` -- a skip
+         means the stored fingerprint already matches (fp_ok was True and nothing
+         changed) by construction, so re-writing it would be a no-op; skipped purely
+         to keep the skip path's "ZERO staging writes" contract honest end to end,
+         not for correctness.
+      5. `changed_files[svc.name]`, keyed off `report["mode"]` (regardless of which
+         branch above produced it): "skipped" -> key absent entirely (not an empty
+         set -- see `run_chunk_embed`'s own module docstring: an ABSENT key skips its
+         per-file loop outright, correct since nothing needs re-chunking). "full" ->
+         EVERY relpath this run's own pre-scan just saw for this service --
+         `analyze_service`'s full path (`begin_service`) unconditionally wipes this
+         service's ENTIRE `chunks` table, so every file genuinely needs re-chunking,
+         not just whichever ones happened to change on disk. "incremental" -> the
+         report's own `stale_relpaths` (already exactly `changed | added | ref_dirty`,
+         see pipeline/analyze.py) -- deliberately NOT unioned with anything else here,
+         since it is already a complete stale set on its own.
+    """
+    per_service: list[dict] = []
+    changed_files: dict[str, set[str]] = {}
+
+    for svc in cfg.services:
+        idioms = effective_idioms(cfg, svc)
+
+        if not incremental:
+            report = analyze_service(
+                svc, staging, cache_dir, active_idioms=active_idioms, idioms=idioms,
+            )
+            fp = config_fingerprint(svc, idioms, active_idioms)
+            staging.set_meta(_svc_fingerprint_key(svc.name), fp)
+            per_service.append(report)
+            continue
+
+        scanned, _ = scan_service(svc.path, svc.exclude)
+        staged = dict(staging.files_for_service(svc.name))
+        delta = service_delta(staged, scanned)
+        all_relpaths = {rp for rp, _, _ in scanned}
+
+        fp = config_fingerprint(svc, idioms, active_idioms)
+        stored_fp = staging.get_meta(_svc_fingerprint_key(svc.name))
+        fp_ok = stored_fp == fp
+
+        if fp_ok:
+            report = analyze_service(
+                svc, staging, cache_dir, active_idioms=active_idioms, idioms=idioms,
+                incremental=True, prior_delta=delta, fingerprint_ok=True,
+            )
+        else:
+            report = analyze_service(
+                svc, staging, cache_dir, active_idioms=active_idioms, idioms=idioms,
+                incremental=False, fingerprint_ok=False,
+            )
+            if report.get("reason") is None:
+                report = {
+                    **report,
+                    "reason": "first run" if stored_fp is None else "fingerprint mismatch",
+                }
+
+        mode = report.get("mode")
+        if mode != "skipped":
+            staging.set_meta(_svc_fingerprint_key(svc.name), fp)
+        if mode == "incremental":
+            changed_files[svc.name] = set(report["stale_relpaths"])
+        elif mode == "full":
+            changed_files[svc.name] = all_relpaths
+        # "skipped": absent from changed_files entirely (see docstring point 5).
+
+        per_service.append(report)
+
+    return per_service, changed_files
+
+
 @app.command()
 def index(
     target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
     dry_run: bool = typer.Option(False, "--dry-run"),
     graph: str | None = typer.Option(None, "--graph"),
     no_embed: bool = typer.Option(False, "--no-embed"),
+    incremental: bool = typer.Option(False, "--incremental"),
 ) -> None:
     """Построить граф workspace: scan → resolve → extract → join → chunk+embed → load →
     report (`--dry-run` — только план пайплайна, без записи; `--no-embed` — пропустить
-    только embedding-шаг S8 -- чанки и headers всё равно строятся и грузятся)."""
+    только embedding-шаг S8 -- чанки и headers всё равно строятся и грузятся;
+    `--incremental` -- per-service skip/incremental/full решение по config-fingerprint
+    и scan-diff вместо безусловного полного пере-анализа, см. `_analyze_services`)."""
     # Path.cwd() читается здесь, а не в default параметра: default-выражения
     # typer вычисляются один раз при импорте модуля, а не при каждом вызове
     # (см. комментарий в doctor).
@@ -261,13 +391,9 @@ def index(
     # load_workspace (resolve_builtins), незнакомое имя сюда не доедет.
     active_idioms = frozenset(cfg.builtin_idioms)
     with Staging(codegraph_dir / "staging.db") as staging:
-        per_service = [
-            analyze_service(
-                svc, staging, codegraph_dir / "scip",
-                active_idioms=active_idioms, idioms=effective_idioms(cfg, svc),
-            )
-            for svc in cfg.services
-        ]
+        per_service, changed_files = _analyze_services(
+            cfg, staging, codegraph_dir / "scip", active_idioms, incremental,
+        )
         # M2 T7: link_workspace ПОСЛЕ цикла analyze (нужны staged каналы/claims ВСЕХ
         # сервисов) и ДО load_graph (S9 должен снапшотить staging уже вместе с
         # derived-слоем — NEXT_SEGMENT/CALLS_HTTP/PART_OF_PROCESS). staging-only --
@@ -279,7 +405,21 @@ def index(
         # тихий (без предупреждения) пропуск; иначе — ленивая, деградирующая сборка
         # эмбеддера (см. _make_embedder_or_warn).
         embedder = None if no_embed else _make_embedder_or_warn(cfg)
-        chunk_report = run_chunk_embed(cfg, staging, embedder)
+        # M4 T7: `changed_files` only ever passed (as a 4th positional arg) when
+        # `--incremental` is set -- the non-incremental call below keeps the EXACT
+        # pre-M4 3-positional-arg shape, not a 4th arg whose VALUE happens to be None:
+        # `run_chunk_embed`'s own default (omitted entirely) and an explicit `None`
+        # are behaviorally identical to IT, but every pre-M4 test/caller's fake
+        # narrowly accepts only 3 positional params -- passing a 4th (even None)
+        # unconditionally would TypeError every one of them. `_analyze_services`
+        # itself returns `{}` (not None) for the non-incremental case regardless, and
+        # `{}` is NOT interchangeable with `None` to `run_chunk_embed` either way (an
+        # empty dict skips EVERY service's chunk loop; `None` chunks every service in
+        # full, the actual pre-M4 behavior this command must stay byte-identical to).
+        chunk_report = (
+            run_chunk_embed(cfg, staging, embedder, changed_files)
+            if incremental else run_chunk_embed(cfg, staging, embedder)
+        )
         load_stats = _store_guard(lambda: load_graph(
             staging, lambda name: FalkorStore(cfg.storage.falkordb, name), graph_name
         ))

@@ -330,3 +330,87 @@ def test_print_report_no_chunking_line_when_absent():
     print_report(report, console)
     text = console.export_text()
     assert "chunking" not in text.lower()
+
+
+# -- M4 T7: print_report per-service mode/reason/stale_files (additive) --
+
+
+def test_print_report_mode_column_defaults_to_full_for_pre_m4_dicts():
+    """SERVICE_OK/SERVICE_DEGRADED (this file's own module-level fixtures) predate
+    M4 T7 and carry no "mode" key at all -- must not KeyError, must print "full"
+    (today's only possible pre-M4 mode), same `.get(key, default)` defensive
+    convention as every other M3/M4 additive report field this module already reads
+    (T1 precedent: embedded_fresh/embedded_from_cache default to 0)."""
+    report = build_report([SERVICE_OK, SERVICE_DEGRADED], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise
+    text = console.export_text()
+    assert "full" in text.lower()
+
+
+def test_print_report_mode_column_shows_incremental_with_stale_count():
+    service_incremental = {**SERVICE_OK, "mode": "incremental", "stale_files": 3}
+    report = build_report([service_incremental], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "incremental" in text.lower()
+    assert "3" in text
+
+
+def test_print_report_mode_column_shows_skipped():
+    service_skipped = {**SERVICE_OK, "mode": "skipped"}
+    report = build_report([service_skipped], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "skipped" in text.lower()
+
+
+def test_print_report_shows_fallback_reason_line_for_non_degraded_full_mode():
+    service_fallback = {
+        **SERVICE_OK, "mode": "full", "reason": "fingerprint mismatch", "degraded": False,
+    }
+    report = build_report([service_fallback], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "fingerprint mismatch" in text
+    assert "incremental fallback" in text.lower()
+
+
+def test_print_report_fallback_reason_line_absent_when_every_service_is_full_with_no_reason():
+    report = build_report([SERVICE_OK], LOAD_STATS)  # mode absent -> "full", reason=None
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "incremental fallback" not in text.lower()
+
+
+def test_print_report_fallback_reason_line_excludes_degraded_services():
+    """A degraded service's reason already surfaces via the pre-existing yellow
+    "degraded services" block -- the new fallback-reason line must not duplicate it,
+    even though degraded reports also carry mode="full" with a non-None reason."""
+    service_degraded_full = {
+        **SERVICE_DEGRADED, "mode": "full", "reason": "scip-python timeout",
+    }
+    report = build_report([service_degraded_full], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "scip-python timeout" in text  # still shown once, via the degraded block
+    assert "incremental fallback" not in text.lower()
+
+
+def test_print_report_fallback_reason_with_markup_renders_literally():
+    # Same live-verified class of bug as the degraded-reason escape test above: an
+    # unescaped "["-bearing fallback reason must render literally, not crash or be
+    # silently swallowed as a style tag.
+    service_fallback = {
+        **SERVICE_OK, "mode": "full", "reason": "[/bad]markup[bold]", "degraded": False,
+    }
+    report = build_report([service_fallback], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise MarkupError
+    text = console.export_text()
+    assert "[/bad]markup[bold]" in text

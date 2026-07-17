@@ -501,6 +501,15 @@ def _analyze_incremental(
         "from_cache": from_cache,
         "mode": "incremental",
         "stale_files": len(stale),
+        # T7 (CLI --incremental): the CALLER needs the actual stale relpath SET, not
+        # just its count, to scope S8's chunk_embed(..., changed_files=...) -- this is
+        # exactly `changed | added | ref_dirty` (== `stale`, see step 6 above), already
+        # sorted (reuses `stale_sorted` from step 8, no recomputation). Deliberately
+        # excludes `dead` (deleted files no longer exist to chunk -- T7's own contract
+        # note: "NOT deleted"). Absent from BOTH the full and skipped report shapes
+        # (there is no "stale set" concept in either -- see
+        # test_analyze_full_and_skipped_reports_have_no_stale_relpaths_key).
+        "stale_relpaths": tuple(stale_sorted),
     }
 
 

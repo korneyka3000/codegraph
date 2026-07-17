@@ -74,6 +74,84 @@ def test_edge_replace_on_pk(tmp_path):
     assert len(edges) == 1 and edges[0].props["callsite_count"] == 3
 
 
+# -- M4 T7: cross-origin_service PK collision -- discovered live by the incremental-
+# equivalence gate (tests/eval/test_incremental_gate.py). Two DIFFERENT services can
+# legitimately assert the IDENTICAL (src,dst,type,via_channel) edge -- e.g. a kafka
+# producer's and a consumer's independently-derived CONTAINS topic->event edge (both
+# extractors/kafka_ext.py's own producer and consumer branches derive the same
+# chan:kafka_topic:X -> chan:event_type:Y pair from their OWN service's idiom config).
+# Plain last-write-wins (the pre-this-task `INSERT OR REPLACE`) made the "winner"
+# depend purely on `cfg.services` iteration order -- stable under a FULL reindex
+# (every service reprocessed, every run, same order) but NOT under `--incremental`
+# (a skipped sibling's earlier-written row can be silently overwritten by a DIFFERENT,
+# reprocessed service's fresh write, or vice versa -- whichever happens to run this
+# time), breaking the milestone's own dump-equivalence invariant. Fix: a write to a
+# PK already OWNED by a DIFFERENT, non-null origin_service is a no-op (the existing
+# assertion survives untouched) -- stable regardless of which subset of services
+# actually runs in a given `codegraph index` pass, since whichever service is FIRST
+# in `cfg.services` order to ever claim a given shared PK keeps it for good (as long
+# as it keeps asserting it).
+
+
+def test_upsert_edges_cross_origin_service_pk_collision_preserves_first_writer(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    e_a = EdgeRec("chan:kafka_topic:t", "chan:event_type:e", "CONTAINS", "static", 1.0,
+                  "kafka", evidence_file="a.py", evidence_line=1)
+    st.upsert_edges([e_a], origin_service="svc-a")
+
+    e_b = EdgeRec("chan:kafka_topic:t", "chan:event_type:e", "CONTAINS", "static", 1.0,
+                  "kafka", evidence_file="b.py", evidence_line=2)
+    st.upsert_edges([e_b], origin_service="svc-b")
+
+    edges = list(st.iter_edges())
+    assert len(edges) == 1
+    assert edges[0].evidence_file == "a.py"  # first writer's assertion survives untouched
+    row = st._db.execute(  # noqa: SLF001 -- origin_service isn't surfaced by iter_edges()
+        "SELECT origin_service FROM edges WHERE src=? AND dst=? AND type=?",
+        (e_a.src, e_a.dst, e_a.type),
+    ).fetchone()
+    assert row[0] == "svc-a"
+
+
+def test_upsert_edges_same_origin_service_re_upsert_still_replaces(tmp_path):
+    """The new cross-origin guard must never block a service from refreshing its OWN
+    row (e.g. a re-run after that file's content changed) -- full REPLACE semantics
+    still apply whenever the incoming write's origin_service matches the row's
+    current owner."""
+    st = Staging(tmp_path / "s.db")
+    e1 = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "CALLS", "static", 1.0,
+                 "calls", evidence_file="a.py", evidence_line=1)
+    st.upsert_edges([e1], origin_service="svc-a")
+
+    e2 = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "CALLS", "heuristic", 0.6,
+                 "calls", evidence_file="a.py", evidence_line=5)
+    st.upsert_edges([e2], origin_service="svc-a")
+
+    edges = list(st.iter_edges())
+    assert len(edges) == 1
+    assert edges[0].resolution == "heuristic"
+    assert edges[0].confidence == 0.6
+    assert edges[0].evidence_line == 5
+
+
+def test_upsert_edges_null_origin_row_can_be_claimed_by_a_real_origin(tmp_path):
+    """A row with no origin_service yet (S7/linking-derived, e.g. PART_OF_PROCESS)
+    can still be refreshed at the identical PK -- the new guard only ever blocks a
+    REAL, DIFFERENT origin_service, never an absent (null) one."""
+    st = Staging(tmp_path / "s.db")
+    e1 = EdgeRec("proc:p", "sym:a:`m`/f().", "PART_OF_PROCESS", "derived", 1.0,
+                 "linking", evidence_file="a.py")
+    st.upsert_edges([e1])  # origin_service=None (default)
+
+    e2 = EdgeRec("proc:p", "sym:a:`m`/f().", "PART_OF_PROCESS", "derived", 1.0,
+                 "linking", evidence_file="a.py", evidence_line=9)
+    st.upsert_edges([e2], origin_service="svc-a")
+
+    edges = list(st.iter_edges())
+    assert len(edges) == 1
+    assert edges[0].evidence_line == 9
+
+
 def test_module_set(tmp_path):
     st = Staging(tmp_path / "s.db")
     st.begin_service("a")

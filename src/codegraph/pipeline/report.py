@@ -94,26 +94,43 @@ _SERVICE_COLUMNS = (
 )
 
 
+def _mode_cell(s: dict) -> str:
+    """M4 T7: per-service mode column text -- `.get("mode", "full")` (T1 precedent:
+    every pre-M4 per-service dict, e.g. this file's own pre-M4 test fixtures, has no
+    "mode" key at all, and "full" is the only mode that ever existed before this
+    task). "incremental" additionally shows its `stale_files` COUNT (a plain int,
+    never foreign text -- no escape() needed here, unlike `reason` below)."""
+    mode = s.get("mode", "full")
+    stale = s.get("stale_files")
+    if mode == "incremental" and stale is not None:
+        return f"{mode} ({stale} stale)"
+    return mode
+
+
 def print_report(report: dict, console: Console) -> None:
     """rich-печать: таблица по сервисам (+ TOTAL-строка = "итого"), сводка load,
     веха здоровья (% unresolved calls, dropped edges), жёлтый блок degraded-сервисов
-    если есть хоть один."""
+    если есть хоть один, циан-строка причин fallback-to-full (M4 T7) если есть хоть
+    одна."""
     svc_table = Table(title="services")
     for _, header in _SERVICE_COLUMNS:
         svc_table.add_column(header)
     svc_table.add_column("degraded")
+    svc_table.add_column("mode")
 
     for s in report["services"]:
         row = [str(s.get(key, 0)) for key, _ in _SERVICE_COLUMNS]
         degraded = bool(s.get("degraded"))
         row.append("[yellow]yes[/]" if degraded else "no")
+        row.append(_mode_cell(s))
         svc_table.add_row(*row)
 
     totals = report["totals"]
     total_row = ["[bold]TOTAL[/]"] + [
         f"[bold]{totals.get(key, 0)}[/]" for key, _ in _SERVICE_COLUMNS[1:]
     ]
-    total_row.append("")
+    total_row.append("")  # degraded
+    total_row.append("")  # mode
     svc_table.add_row(*total_row)
     console.print(svc_table)
 
@@ -153,6 +170,26 @@ def print_report(report: dict, console: Console) -> None:
         # ниже, иначе "[...]"-подстрока либо валит Console.print MarkupError, либо
         # молча съедается как (невалидный) style-тег (live-verified).
         console.print(f"[yellow]degraded services: {escape(detail)}[/]")
+
+    # M4 T7 (additive): services --incremental forced back to a full re-analyze for a
+    # NON-degraded reason (fingerprint mismatch / first run -- see cli.py's own
+    # orchestration) -- excludes degraded=True services on purpose, even though a
+    # degraded service also always carries mode="full" with a non-None reason: that
+    # reason already has its own dedicated yellow block immediately above, and this
+    # line would otherwise duplicate it verbatim for every degraded service.
+    fallback_services = [
+        s for s in report["services"]
+        if s.get("mode") == "full" and s.get("reason") and not s.get("degraded")
+    ]
+    if fallback_services:
+        fallback_detail = ", ".join(
+            f"{s.get('service')} ({s['reason']})" for s in fallback_services
+        )
+        # Same live-verified markup hazard as the degraded-services block above --
+        # `reason` here is CLI-authored ("first run"/"fingerprint mismatch") today,
+        # but nothing prevents it from carrying a degraded-style reason string on a
+        # future path, so it gets the identical escape() treatment defensively.
+        console.print(f"[cyan]incremental fallback to full: {escape(fallback_detail)}[/]")
 
     # M2 T7 (additive): "linking" key only present when build_report was given
     # link_stats -- absent for every pre-T7 report shape, so .get() + a truthy guard

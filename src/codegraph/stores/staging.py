@@ -504,7 +504,38 @@ class Staging:
         а origin_service -- явный факт "кто это записал", который для chan:-src рёбер
         (HANDLES, kafka CONTAINS) настоящий сервис-эмиттер ВСЕГДА имеет, даже когда
         endpoint сам по себе этого не выражает. `begin_service` теперь чистит
-        edges.origin_service, а не производный ss (см. её докстринг)."""
+        edges.origin_service, а не производный ss (см. её докстринг).
+
+        M4 T7 (discovered live by the incremental-equivalence gate,
+        tests/eval/test_incremental_gate.py): TWO DIFFERENT services can legitimately
+        assert the IDENTICAL (src,dst,type,via_channel) edge -- e.g. kafka_ext's
+        producer branch (this service SENDS to topic X, event Y) and its consumer
+        branch (a DIFFERENT service's dispatch_dict registers a handler for topic X,
+        event Y) each independently derive the SAME `CONTAINS chan:kafka_topic:X ->
+        chan:event_type:Y` edge from their own service's idiom config. Plain
+        last-write-wins (a bare `INSERT OR REPLACE`, this method's pre-M4-T7 body)
+        made the "winner" depend purely on `cfg.services` iteration order -- stable
+        under a FULL reindex (every service reprocessed every run, same order) but
+        NOT under `--incremental` (a SKIPPED sibling's earlier-written row could be
+        silently overwritten by a DIFFERENT, reprocessed service's fresh write, or
+        vice versa, depending purely on which subset of services happens to run this
+        time) -- breaking the milestone's own dump-equivalence invariant (live-
+        reproduced: `--incremental` after an unrelated one-line edit disagreed with a
+        full reindex of the identical tree on exactly this edge's evidence_file/
+        origin_service). Fixed below via `INSERT ... ON CONFLICT ... DO UPDATE ...
+        WHERE`: a write to a PK already owned by a DIFFERENT, non-null
+        origin_service is a no-op (SQLite's own documented UPSERT behavior when a DO
+        UPDATE's WHERE clause is false -- the existing row is left untouched, no
+        error) -- so whichever service is FIRST in `cfg.services` order to ever claim
+        a given shared PK keeps it for good (as long as it keeps asserting it),
+        REGARDLESS of which subset of services actually runs in a later pass. A
+        service refreshing its OWN previously-written row (origin_service matches)
+        still gets full REPLACE semantics -- the guard only ever blocks a genuinely
+        DIFFERENT owner, never self-overwrite; a row with no owner yet
+        (origin_service IS NULL, e.g. S7/linking-derived) can still be claimed by
+        anyone, matching the pre-fix behavior for that case exactly (see
+        tests/unit/test_staging.py's three dedicated tests for these three
+        branches)."""
         prepared = []
         for e in rows:
             ss, ds = _id_service(e.src), _id_service(e.dst)
@@ -533,7 +564,15 @@ class Staging:
                              e.extractor, e.evidence_file, e.evidence_line,
                              json.dumps(e.props), origin_service))
         self._db.executemany(
-            "INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?)", prepared
+            "INSERT INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(src, dst, type, via_channel) DO UPDATE SET "
+            "resolution=excluded.resolution, confidence=excluded.confidence, "
+            "extractor=excluded.extractor, evidence_file=excluded.evidence_file, "
+            "evidence_line=excluded.evidence_line, props=excluded.props, "
+            "origin_service=excluded.origin_service "
+            "WHERE edges.origin_service IS excluded.origin_service "
+            "OR edges.origin_service IS NULL",
+            prepared,
         )
         self._db.commit()
 
