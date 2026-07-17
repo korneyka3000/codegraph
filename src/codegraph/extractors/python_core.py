@@ -84,7 +84,19 @@ def extract(ctx: FileContext) -> ExtractionResult:
         edges.append(EdgeRec(
             src=src, dst=dst, type=edge_type,
             resolution=_RESOLUTION, confidence=_CONFIDENCE, extractor=_EXTRACTOR,
-            evidence_file=ctx.relpath if line is not None else None,
+            # evidence_file = ctx.relpath UNCONDITIONALLY (M4 T5 fix): before this,
+            # evidence_file was tied to `line is not None`, which conflated two
+            # unrelated concerns -- CONTAINS edges (no natural line, `line` always
+            # None here) ended up with evidence_file=None while IMPORTS (always
+            # passes imp.start_line) got ctx.relpath. Staging.delete_file_layer
+            # (incremental re-analyze, M4 T5) deletes S5-emitted edges by
+            # `origin_service=? AND evidence_file IN (stale-relpaths)` -- with
+            # evidence_file=None, a stale file's OLD CONTAINS edge (e.g. parent ->
+            # a since-renamed/removed def's old node id) could never be matched for
+            # deletion and would survive re-analyze forever, dangling. evidence_line
+            # keeps its own, separate meaning (still None for CONTAINS, still a real
+            # line for IMPORTS) -- only evidence_file needed decoupling from it.
+            evidence_file=ctx.relpath,
             evidence_line=line,
         ))
 

@@ -46,6 +46,66 @@ def-index -> node-id карта, что уже строилась для fastapi
 на уровне модуля; ни один текущий фикстурный файл этого не требует, но kafka_ext
 контрактно это поддерживает). cli.py передаёт `idioms=effective_idioms(cfg, svc)` —
 ПЕР-сервисно (в отличие от `active_idioms`, который один на весь workspace).
+
+M4 T5: incremental analyze_service (`incremental=True`) -- three modes reported via
+report["mode"]: "full" (today's behavior, still the default -- every pre-existing
+caller stays byte-identical), "skipped" (prior_delta.empty AND fingerprint_ok -- ZERO
+staging writes, report reads whatever this service's CURRENT per-service counts
+already are), "incremental" (re-extract+re-join only the STALE subset of files). The
+full path is one piece of code (`_analyze_full`), reachable two ways: incremental=False
+(the ordinary call), or as the incremental branch's own fallback when scip-python fails
+mid-attempt (ScipRunError -- see below) -- so "byte-identical to today" is not just a
+goal for the direct call, it falls out of literally sharing the function.
+
+Correctness argument (binding -- keep it true): CALLS/IMPORTS/domain-claims of file X
+are a function of ONLY (X's content, X's refs, service-wide defs). scip-python is not
+file-incremental, so S3 always re-runs over the WHOLE service (the ScipRunner's own
+tree_hash-keyed cache absorbs the "nothing changed" case for free -- see
+`resolvers/scip/runner.py`) and S4 rewrites ALL defs/refs every time (cheap). Only the
+expensive stages -- S5 (tree-sitter parse+extract) and S6 (join) -- run over `stale =
+changed | added | ref_dirty`, where `ref_dirty` is the set of files whose
+`refs_hash_by_file` hash changed across THIS run's S4 rewrite even though their OWN
+bytes never moved: pyright/scip-python itself propagates a symbol rename in file A into
+every file B that references it (B's occurrence at that import/call site now resolves
+to a different symbol, or to none), so B lands in ref_dirty and gets re-extracted/
+re-joined even though `service_delta` (which only ever compares file content hashes)
+would never flag it on its own.
+
+Incremental step order (load-bearing, not cosmetic):
+  1. Snapshot `old_files = dict(staging.files_for_service(svc.name))` and
+     `old_refs = staging.refs_hash_by_file(svc.name)` -- BEFORE anything wipes them.
+  2. `staging.clear_scip_layer(svc.name)` (files/scip_defs/scip_refs only -- nodes/
+     edges/claims of non-stale files must survive this call untouched).
+  3. Fresh `scan_service` -> `add_files` -> `service_delta(old_files, scanned)`.
+  4. S3 (`runner.run`) + S4 (`read_scip_into_staging`), full, over the FRESH scan --
+     same calls the full path itself makes. ScipRunError here means an immediate,
+     total abandonment of the incremental attempt: delegate to `_analyze_full` (which
+     re-scans, re-resolves -- hitting the SAME ScipRunError again -- and degrades
+     exactly as it always has, tagged mode="full"). There is no sound "degraded
+     incremental" middle ground: the heuristic fallback resolver gives no stable
+     refs-diff to compute ref_dirty from.
+  5. `new_refs = staging.refs_hash_by_file(svc.name)`; `ref_dirty` = the
+     unchanged-content relpaths whose old vs new refs hash differ.
+  6. `stale = changed | added | ref_dirty`; `dead = deleted`.
+  7. `staging.delete_file_layer(svc.name, stale | dead, drop_calls_evidence=stale |
+     dead)` -- BEFORE S5: S5's own per-file `add_claims` calls (temporal_start_mark/
+     http_call) must not collide with a stale claim row from the file's PREVIOUS
+     analysis.
+  8. S5+S6 (`_extract_join_and_stage`, the exact function the full path also calls)
+     over `stale` only -- `def_symbol_lookup`/`ref_symbol_lookup`/
+     `local_defs_for_file` all query the FRESH, service-wide (not stale-scoped)
+     staging tables step 4 just wrote, so a stale file referencing a def in a
+     NON-stale file still resolves correctly. The Service node is always
+     re-emitted (id stable, INSERT OR REPLACE is a no-op when nothing changed).
+
+`delete_file_layer`'s edge deletion is keyed by (origin_service, evidence_file), which
+depends on EVERY S5-emitted edge actually carrying its emitting file as evidence_file.
+python_core.py's CONTAINS edges did not before this task (only IMPORTS did -- the old
+`add_edge` helper tied evidence_file to whether a line number was passed at all,
+conflating two unrelated concerns) -- fixed as part of this same task (see
+`extractors/python_core.py`'s own `add_edge` comment): without that fix, a stale
+CONTAINS edge pointing at a since-renamed/removed node would survive incremental
+re-analyze forever, since nothing would ever match it for deletion.
 """
 
 from __future__ import annotations
@@ -64,12 +124,13 @@ from codegraph.extractors.kafka_ext import extract_kafka
 from codegraph.extractors.python_core import extract as extract_python_core
 from codegraph.extractors.temporal_ext import extract_temporal
 from codegraph.parsing.consts import ConstTable
-from codegraph.parsing.facts import build_file_facts
+from codegraph.parsing.facts import FileFacts, build_file_facts
 from codegraph.resolvers import fallback
 from codegraph.resolvers.scip.reader import read_scip_into_staging
 from codegraph.resolvers.scip.runner import ScipRunError, ScipRunner
 from codegraph.stores.staging import Staging
 
+from .diff import ServiceDelta, service_delta
 from .scan import scan_service
 
 
@@ -98,53 +159,33 @@ def _apply_role_props_patch(
     )
 
 
-def analyze_service(
+def _extract_join_and_stage(
     svc: ServiceConfig,
     staging: Staging,
-    cache_dir: Path,
-    runner: ScipRunner | None = None,
-    active_idioms: frozenset[str] = frozenset(),
-    idioms: ServiceIdioms | None = None,
+    relpaths: list[str],
+    files: dict[str, bytes],
+    facts_by_file: dict[str, FileFacts],
+    active_idioms: frozenset[str],
+    idioms: ServiceIdioms | None,
+    degraded: bool,
 ) -> dict:
-    runner = runner if runner is not None else ScipRunner()
+    """S5 (python_core + domain extractors) + S6 (build_calls), shared verbatim by
+    the full path (`relpaths` == every scanned file) and the incremental path
+    (`relpaths` == the stale subset only, M4 T5) -- extracted so the two paths can
+    never drift apart on this large, delicate chunk of wiring. Always stages a fresh
+    Service node (id stable, INSERT OR REPLACE is a no-op) regardless of whether
+    `relpaths` is empty. `def_symbol_lookup`/`ref_symbol_lookup`/`local_defs_for_file`
+    below are built from `staging.module_set`/`def_symbol_at`/`ref_symbol_at`/
+    `local_def_symbols` -- service-wide queries, not scoped to `relpaths` -- so
+    cross-file resolution (a stale file referencing a def in a file NOT in
+    `relpaths`) works correctly as long as the caller already rewrote defs/refs for
+    the whole service (S4) before calling this.
 
-    # 1. begin_service; scan -> add_files
-    staging.begin_service(svc.name)
-    rows, tree_hash = scan_service(svc.path, svc.exclude)
-    staging.add_files(svc.name, rows)
-    relpaths = [rp for rp, _, _ in rows]  # scan_service гарантирует сортировку
-
-    files = {rp: (svc.path / rp).read_bytes() for rp in relpaths}
-    # 4. facts по отсортированным relpath (bytes из files выше). Вычислены здесь, ДО resolve
-    # (шаг 2), потому что деградированный fallback (шаг 3) тоже нуждается в facts_by_file —
-    # строим единожды и переиспользуем в шаге 3 (если degraded) и шаге 5 (всегда).
-    facts_by_file = {rp: build_file_facts(rp, files[rp]) for rp in relpaths}
-
-    # 2. resolve: реальный SCIP через runner, иначе деградация
-    degraded = False
-    reason: str | None = None
-    from_cache = False
-    defs_count = refs_count = malformed_ranges = 0
-    try:
-        result = runner.run(svc.name, svc.path, _venv_for(svc), cache_dir, tree_hash)
-        from_cache = result.from_cache
-        reader_stats = read_scip_into_staging(result.scip_path, svc.name, svc.path, staging)
-        defs_count = reader_stats.defs
-        refs_count = reader_stats.refs
-        malformed_ranges = reader_stats.malformed_ranges
-    except ScipRunError as e:
-        degraded = True
-        reason = str(e)
-
-    # 3. degraded -> эвристический fallback (файлы уже прочитаны выше)
-    if degraded:
-        def_rows, ref_rows = fallback.resolve_service(svc.name, files, facts_by_file)
-        staging.add_defs(svc.name, def_rows)
-        staging.add_refs(svc.name, ref_rows)
-        defs_count, refs_count = len(def_rows), len(ref_rows)
-
-    # 5. extract: python_core на каждый файл + Service-узел (carry-фикс «Service-узлы»)
-    # + доменные экстракторы (fastapi и т.д.) за активной builtin-идиомой.
+    Returns {"nodes": int, "edges": int, "imports_external": int, "join_stats":
+    JoinStats} -- everything the caller's own report dict still needs to assemble
+    (service/files/defs/refs/malformed_ranges/degraded/reason/from_cache/mode/
+    stale_files are all OUTSIDE this function's concern -- it only ever runs S5/S6
+    and reports what THAT did)."""
     module_set = staging.module_set(svc.name)
     def_symbol_lookup = partial(staging.def_symbol_at, svc.name)
     ref_symbol_lookup = partial(staging.ref_symbol_at, svc.name)
@@ -252,15 +293,18 @@ def analyze_service(
     staging.upsert_nodes(nodes)
     # origin_service=svc.name (M2 final review fix): tags this WHOLE batch (python_core
     # + fastapi/kafka/temporal domain edges) as emitted by THIS service's own S5 run, so
-    # a later begin_service(svc.name) can find and delete it on re-index -- regardless
-    # of whether an individual edge's OWN src happens to be chan:-prefixed (HANDLES,
+    # a later begin_service(svc.name) (full path) or delete_file_layer(svc.name, ...)
+    # (incremental path, M4 T5) can find and delete it on re-index -- regardless of
+    # whether an individual edge's OWN src happens to be chan:-prefixed (HANDLES,
     # kafka CONTAINS), which carries no derivable service of its own (see
     # Staging.upsert_edges/begin_service docstrings for the bug this closes).
     staging.upsert_edges(edges, origin_service=svc.name)
 
     # 6. join: CALLS (static/1.0 либо heuristic/0.6 при деградации); local_defs_for_file
     # хоистится за пределы build_calls, чтобы не бить SQL на каждый local-символ-callsite —
-    # per-relpath набор считается максимум один раз за вызов analyze_service.
+    # per-relpath набор считается максимум один раз за вызов _extract_join_and_stage (т.е.
+    # максимум один раз за вызов analyze_service — full и incremental вызывают её ровно
+    # один раз каждый).
     @cache
     def local_defs_for_file(relpath: str) -> set[str]:
         return staging.local_def_symbols(svc.name, relpath)
@@ -272,21 +316,228 @@ def analyze_service(
         resolution=resolution, confidence=confidence,
     )
 
+    return {
+        "nodes": len(nodes),
+        "edges": len(edges),
+        "imports_external": imports_external,
+        "join_stats": join_stats,
+    }
+
+
+def _analyze_full(
+    svc: ServiceConfig,
+    staging: Staging,
+    cache_dir: Path,
+    runner: ScipRunner,
+    active_idioms: frozenset[str],
+    idioms: ServiceIdioms | None,
+) -> dict:
+    """The pre-M4-T5 analyze_service body, unchanged: begin_service -> scan ->
+    add_files -> facts for ALL files -> resolve (real SCIP or degraded fallback) ->
+    S5/S6 over ALL files. Called directly for `incremental=False` (today's default,
+    every existing caller) AND as the incremental branch's own fallback when
+    scip-python fails mid-attempt -- both routes report mode="full" (added by the
+    caller, `analyze_service`), the ONLY new key relative to before M4 T5."""
+    # 1. begin_service; scan -> add_files
+    staging.begin_service(svc.name)
+    rows, tree_hash = scan_service(svc.path, svc.exclude)
+    staging.add_files(svc.name, rows)
+    relpaths = [rp for rp, _, _ in rows]  # scan_service гарантирует сортировку
+
+    files = {rp: (svc.path / rp).read_bytes() for rp in relpaths}
+    # 4. facts по отсортированным relpath (bytes из files выше). Вычислены здесь, ДО resolve
+    # (шаг 2), потому что деградированный fallback (шаг 3) тоже нуждается в facts_by_file —
+    # строим единожды и переиспользуем в шаге 3 (если degraded) и шаге 5 (всегда).
+    facts_by_file = {rp: build_file_facts(rp, files[rp]) for rp in relpaths}
+
+    # 2. resolve: реальный SCIP через runner, иначе деградация
+    degraded = False
+    reason: str | None = None
+    from_cache = False
+    defs_count = refs_count = malformed_ranges = 0
+    try:
+        result = runner.run(svc.name, svc.path, _venv_for(svc), cache_dir, tree_hash)
+        from_cache = result.from_cache
+        reader_stats = read_scip_into_staging(result.scip_path, svc.name, svc.path, staging)
+        defs_count = reader_stats.defs
+        refs_count = reader_stats.refs
+        malformed_ranges = reader_stats.malformed_ranges
+    except ScipRunError as e:
+        degraded = True
+        reason = str(e)
+
+    # 3. degraded -> эвристический fallback (файлы уже прочитаны выше)
+    if degraded:
+        def_rows, ref_rows = fallback.resolve_service(svc.name, files, facts_by_file)
+        staging.add_defs(svc.name, def_rows)
+        staging.add_refs(svc.name, ref_rows)
+        defs_count, refs_count = len(def_rows), len(ref_rows)
+
+    # 5+6: extract (python_core + domain extractors) + join (CALLS), shared with the
+    # incremental path -- see _extract_join_and_stage's own docstring.
+    ej = _extract_join_and_stage(
+        svc, staging, relpaths, files, facts_by_file, active_idioms, idioms, degraded,
+    )
+
     # 7. отчёт ("service" -- первым ключом: report.build_report ожидает его в каждом
-    # per_service-элементе, и его источник -- сам analyze_service, не вызывающая сторона)
+    # per_service-элементе, и его источник -- сам _analyze_full, не вызывающая сторона)
     return {
         "service": svc.name,
         "files": len(relpaths),
         "defs": defs_count,
         "refs": refs_count,
         "malformed_ranges": malformed_ranges,
-        "nodes": len(nodes),
-        "edges": len(edges),
-        "imports_external": imports_external,
-        "calls_joined": join_stats.calls_joined,
-        "calls_unresolved": join_stats.calls_unresolved,
-        "calls_external": join_stats.calls_external,
+        "nodes": ej["nodes"],
+        "edges": ej["edges"],
+        "imports_external": ej["imports_external"],
+        "calls_joined": ej["join_stats"].calls_joined,
+        "calls_unresolved": ej["join_stats"].calls_unresolved,
+        "calls_external": ej["join_stats"].calls_external,
         "degraded": degraded,
         "reason": reason,
         "from_cache": from_cache,
     }
+
+
+def _skip_report(svc: ServiceConfig, staging: Staging) -> dict:
+    """mode="skipped": prior_delta.empty AND the config fingerprint still matches --
+    nothing to do. Does ZERO staging writes; every count comes straight from
+    `counts_for_service` (SQL COUNT scoped to this service, per the brief), i.e.
+    whatever this service's staged state already was BEFORE this call, from
+    whichever earlier full/incremental run produced it."""
+    c = staging.counts_for_service(svc.name)
+    return {
+        "service": svc.name,
+        "files": c["files"],
+        "defs": c["defs"],
+        "refs": c["refs"],
+        "malformed_ranges": 0,
+        "nodes": c["nodes"],
+        "edges": c["edges"],
+        "imports_external": 0,
+        "calls_joined": 0,
+        "calls_unresolved": 0,
+        "calls_external": 0,
+        "degraded": False,
+        "reason": None,
+        "from_cache": False,
+        "mode": "skipped",
+    }
+
+
+def _analyze_incremental(
+    svc: ServiceConfig,
+    staging: Staging,
+    cache_dir: Path,
+    runner: ScipRunner,
+    active_idioms: frozenset[str],
+    idioms: ServiceIdioms | None,
+) -> dict:
+    """The real incremental algorithm -- see this module's own docstring for the
+    full step-by-step correctness argument and ordering rationale. Reached only when
+    the skip precondition (prior_delta.empty and fingerprint_ok) did NOT hold."""
+    # 1. snapshot BEFORE clear_scip_layer wipes files/scip_refs.
+    old_files = dict(staging.files_for_service(svc.name))
+    old_refs = staging.refs_hash_by_file(svc.name)
+
+    # 2-3. make room, then re-scan+add_files fresh (same source of truth the full
+    # path always re-scans from) and diff against the just-snapshotted OLD state.
+    staging.clear_scip_layer(svc.name)
+    rows, tree_hash = scan_service(svc.path, svc.exclude)
+    staging.add_files(svc.name, rows)
+    delta = service_delta(old_files, rows)
+
+    # 4. S3+S4, full, over the fresh scan -- same calls _analyze_full itself makes.
+    try:
+        result = runner.run(svc.name, svc.path, _venv_for(svc), cache_dir, tree_hash)
+        from_cache = result.from_cache
+        reader_stats = read_scip_into_staging(result.scip_path, svc.name, svc.path, staging)
+        defs_count = reader_stats.defs
+        refs_count = reader_stats.refs
+        malformed_ranges = reader_stats.malformed_ranges
+    except ScipRunError:
+        # No sound "degraded incremental" middle ground -- the heuristic fallback
+        # resolver gives no stable refs-diff to compute ref_dirty from. Abandon this
+        # attempt entirely and delegate to the ordinary full path, which will hit the
+        # SAME ScipRunError again and degrade exactly as it always has.
+        return {**_analyze_full(svc, staging, cache_dir, runner, active_idioms, idioms),
+                "mode": "full"}
+
+    # 5-6. ref_dirty over unchanged-content files only (added/changed are already
+    # unconditionally stale); stale/dead.
+    new_refs = staging.refs_hash_by_file(svc.name)
+    ref_dirty = {rp for rp in delta.unchanged if old_refs.get(rp) != new_refs.get(rp)}
+    stale = set(delta.changed) | set(delta.added) | ref_dirty
+    dead = set(delta.deleted)
+
+    # 7. narrow deletion -- BEFORE S5 (its own per-file add_claims calls must not
+    # collide with a stale claim row left over from this same file's last analysis).
+    staging.delete_file_layer(svc.name, stale | dead, drop_calls_evidence=stale | dead)
+
+    # 8. S5+S6 over stale only -- facts built ONLY for stale (the entire point).
+    stale_sorted = sorted(stale)
+    files = {rp: (svc.path / rp).read_bytes() for rp in stale_sorted}
+    facts_by_file = {rp: build_file_facts(rp, files[rp]) for rp in stale_sorted}
+
+    ej = _extract_join_and_stage(
+        svc, staging, stale_sorted, files, facts_by_file, active_idioms, idioms,
+        degraded=False,
+    )
+
+    return {
+        "service": svc.name,
+        "files": len(rows),
+        "defs": defs_count,
+        "refs": refs_count,
+        "malformed_ranges": malformed_ranges,
+        "nodes": ej["nodes"],
+        "edges": ej["edges"],
+        "imports_external": ej["imports_external"],
+        "calls_joined": ej["join_stats"].calls_joined,
+        "calls_unresolved": ej["join_stats"].calls_unresolved,
+        "calls_external": ej["join_stats"].calls_external,
+        "degraded": False,
+        "reason": None,
+        "from_cache": from_cache,
+        "mode": "incremental",
+        "stale_files": len(stale),
+    }
+
+
+def analyze_service(
+    svc: ServiceConfig,
+    staging: Staging,
+    cache_dir: Path,
+    runner: ScipRunner | None = None,
+    active_idioms: frozenset[str] = frozenset(),
+    idioms: ServiceIdioms | None = None,
+    incremental: bool = False,
+    prior_delta: ServiceDelta | None = None,
+    fingerprint_ok: bool = True,
+) -> dict:
+    """Dispatches to one of three modes (report["mode"]): "full" (incremental=False,
+    the default -- every pre-existing caller is unaffected), "skipped" (incremental
+    branch's own precondition: `prior_delta.empty and fingerprint_ok`), or
+    "incremental" (otherwise, once incremental=True). See this module's own
+    docstring for the full incremental design and correctness argument.
+
+    `prior_delta`/`fingerprint_ok` are consulted ONLY for the skip decision --
+    analyze_service does not own fingerprint persistence (T7 does: it reads/writes
+    the stored fingerprint and computes the current one via
+    `pipeline.diff.config_fingerprint`, then passes the boolean comparison result in
+    as `fingerprint_ok`). The incremental branch itself, once entered, computes its
+    OWN fresh delta internally (`service_delta` against a `files_for_service`
+    snapshot taken before any wipe) rather than trusting `prior_delta` for the
+    actual stale-set math -- by the time this call runs, `prior_delta` may already
+    be stale itself (computed by the caller from an earlier scan). `prior_delta`
+    absent (None) simply means skip can never be evaluated, not an error."""
+    runner = runner if runner is not None else ScipRunner()
+
+    if not incremental:
+        return {**_analyze_full(svc, staging, cache_dir, runner, active_idioms, idioms),
+                "mode": "full"}
+
+    if prior_delta is not None and prior_delta.empty and fingerprint_ok:
+        return _skip_report(svc, staging)
+
+    return _analyze_incremental(svc, staging, cache_dir, runner, active_idioms, idioms)

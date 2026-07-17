@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections import defaultdict
@@ -334,6 +335,88 @@ class Staging:
         cur = self._db
         cur.execute("DELETE FROM nodes WHERE kind='BusinessProcess'")
         cur.execute("DELETE FROM edges WHERE extractor='linking'")
+        self._db.commit()
+
+    # -- M4 T5: incremental per-service layer clearing. Narrower siblings of
+    # begin_service -- that method still owns the FULL-reanalyze wipe (files/
+    # scip_defs/scip_refs/chunks/nodes/edges/claims, everything, unconditionally);
+    # these two exist so an incremental analyze_service can wipe ONLY what it is
+    # about to recompute, leaving every other relpath's staged data untouched. See
+    # pipeline/analyze.py's module docstring for the exact step order these two
+    # slot into (clear_scip_layer first, to make room for a fresh S3/S4 pass;
+    # delete_file_layer only once the stale set is actually known, from the fresh
+    # refs).
+
+    def clear_scip_layer(self, service: str) -> None:
+        """Wipes files/scip_defs/scip_refs for ONE service -- the same three tables
+        begin_service's own first loop clears (`for t in ("files", "scip_defs",
+        "scip_refs", "chunks")`), minus `chunks` (an S8 concern this S1-S6
+        incremental flow never touches -- see delete_file_layer for the narrower,
+        relpath-scoped chunk deletion incremental re-analyze uses instead).
+
+        Deliberately leaves nodes/edges/claims (S5/S6) untouched, unlike
+        begin_service: the incremental caller still needs the OLD staged nodes/
+        edges/claims of every NON-stale relpath to survive this call. Those get
+        cleared later, narrowly, by delete_file_layer(stale | dead) -- only once the
+        stale set is known, which itself requires the FRESH defs/refs this call
+        makes room for (a fresh S3/S4 pass can't write into a table that still
+        holds the old service's rows without first clearing it, same reasoning as
+        begin_service's own pre-S3 wipe)."""
+        for t in ("files", "scip_defs", "scip_refs"):
+            self._db.execute(f"DELETE FROM {t} WHERE service=?", (service,))  # noqa: S608
+        self._db.commit()
+
+    def delete_file_layer(
+        self, service: str, relpaths: set[str], *, drop_calls_evidence: set[str],
+    ) -> None:
+        """Wipes the S5/S6 layer (nodes/claims/chunks/edges) for a SUBSET of a
+        service's relpaths -- the stale∪deleted set an incremental analyze_service
+        is about to re-extract (or, for deleted files, never will again). Untouched
+        relpaths' nodes/claims/chunks/edges survive completely; that selectivity is
+        the entire point of this method existing alongside begin_service's
+        unconditional whole-service wipe.
+
+        nodes/claims/chunks each carry a `relpath` column directly, so `relpaths`
+        scopes all three with a plain `service=? AND relpath IN (...)`. Channel/
+        BusinessProcess nodes (relpath=None, made by make_channel_node/
+        make_process_node) can never match an IN-list of real relpath strings --
+        SQL's `NULL IN (...)` is never true -- so the workspace layer is safe by
+        construction, no extra WHERE clause needed to protect it.
+
+        edges have NO relpath column at all (an edge spans two possibly-different
+        files' worth of endpoints) -- `drop_calls_evidence` scopes edge deletion by
+        `origin_service=? AND evidence_file IN (...)` instead, mirroring
+        begin_service's own origin_service-keyed edge deletion (see its docstring)
+        but narrowed to the subset of evidence files whose OWN re-extraction is
+        about to re-emit them: a CALLS edge's evidence_file is the call-site's file
+        (extractors/calls.py); a python_core CONTAINS/IMPORTS or fastapi/kafka/
+        temporal domain edge's is the file the extractor ran over (see
+        extractors/python_core.py's evidence_file fix, M4 T5) -- always exactly the
+        file whose S5/S6 re-run re-emits that edge. Edges with no origin_service
+        (S7/linking-derived: NEXT_SEGMENT, CALLS_HTTP, PART_OF_PROCESS, ...) never
+        match `origin_service=?` regardless of evidence_file, so they survive
+        untouched -- the same workspace-layer immunity begin_service already has.
+
+        `relpaths` and `drop_calls_evidence` are independent parameters (not one
+        merged set) so a caller CAN scope them differently -- analyze.py's own
+        incremental branch always passes the same `stale | dead` set for both, but
+        this method makes no such assumption. Either (or both) may be empty --
+        each guards its own no-op rather than issuing a degenerate `IN ()` query."""
+        if relpaths:
+            placeholders = ",".join("?" * len(relpaths))
+            params = (service, *relpaths)
+            for table in ("nodes", "claims", "chunks"):
+                self._db.execute(
+                    f"DELETE FROM {table} WHERE service=? AND relpath IN ({placeholders})",  # noqa: S608
+                    params,
+                )
+        if drop_calls_evidence:
+            placeholders = ",".join("?" * len(drop_calls_evidence))
+            self._db.execute(
+                "DELETE FROM edges WHERE origin_service=? AND "
+                f"evidence_file IN ({placeholders})",  # noqa: S608
+                (service, *drop_calls_evidence),
+            )
         self._db.commit()
 
     def add_files(self, service: str, rows: list[tuple[str, str, int]]) -> None:
@@ -836,6 +919,42 @@ class Staging:
             (service, relpath))
         return [RefRow(*row) for row in cur.fetchall()]
 
+    def refs_hash_by_file(self, service: str) -> dict[str, str]:
+        """M4 T5: per-relpath sha256 over that file's CURRENT scip_refs rows, sorted
+        by (symbol, start_byte, end_byte, roles) -- deliberately NOT start_line
+        (two occurrences at the same byte span with different reported line numbers
+        would be a scip-python encoding artifact, not a real ref change). This is
+        incremental analyze_service's own "did this file's refs change" fingerprint
+        (see pipeline/analyze.py's module docstring for the full ref_dirty
+        mechanism it feeds): a file's OWN defs only change when its OWN content
+        changes (already caught by service_delta's added/changed sets), but a
+        symbol RENAMED in a DIFFERENT file changes how pyright/scip-python resolves
+        every REFERENCING occurrence in THIS file, without this file's bytes moving
+        at all -- refs are exactly where that shows up.
+
+        The SQL ORDER BY (relpath, symbol, start_byte, end_byte, roles) does the
+        sorting; rows are appended in that fetch order, grouped by relpath, so no
+        extra Python-side sort is needed -- the hash is therefore independent of
+        `add_refs`' own call/insertion order, only of the row *contents*.
+
+        A relpath with zero staged refs is simply ABSENT from the returned dict
+        (mirrors embedding_cache_get's "absent, not null" convention) -- callers
+        compare via `.get(relpath)` on both sides so a file that had refs before
+        and has none now (or vice versa) still reads as changed (some-hash != None),
+        never as a KeyError."""
+        cur = self._db.execute(
+            "SELECT relpath, symbol, start_byte, end_byte, roles FROM scip_refs "
+            "WHERE service=? ORDER BY relpath, symbol, start_byte, end_byte, roles",
+            (service,),
+        )
+        by_file: dict[str, list[str]] = defaultdict(list)
+        for relpath, symbol, start_byte, end_byte, roles in cur.fetchall():
+            by_file[relpath].append(f"{symbol}\x1f{start_byte}\x1f{end_byte}\x1f{roles}")
+        return {
+            relpath: hashlib.sha256("\n".join(lines).encode()).hexdigest()
+            for relpath, lines in by_file.items()
+        }
+
     def counts(self) -> dict:
         out = {}
         for key, table in (
@@ -847,6 +966,32 @@ class Staging:
             ("chunks", "chunks"),
         ):
             out[key] = self._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+        return out
+
+    def counts_for_service(self, service: str) -> dict:
+        """Per-service sibling of counts() (workspace-wide, no WHERE clause at
+        all). M4 T5's skip-mode report needs exactly this ("SQL COUNT по service"
+        per the brief): when incremental analyze_service finds nothing to do
+        (prior_delta.empty and the config fingerprint still matches), it does ZERO
+        staging writes and reports whatever this service's CURRENT staged counts
+        already are, instead of the per-run extraction/join counts every other mode
+        reports. Same 6 keys as counts() (files/defs/refs/nodes/edges/chunks);
+        `edges` has no `service` column of its own (only `origin_service`, see
+        upsert_edges/begin_service) -- scoped by that instead, same key
+        begin_service itself deletes by."""
+        out = {}
+        for key, table in (
+            ("files", "files"),
+            ("defs", "scip_defs"),
+            ("refs", "scip_refs"),
+            ("nodes", "nodes"),
+            ("edges", "edges"),
+            ("chunks", "chunks"),
+        ):
+            col = "origin_service" if table == "edges" else "service"
+            out[key] = self._db.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {col}=?", (service,)  # noqa: S608
+            ).fetchone()[0]
         return out
 
     def iter_nodes(self) -> Iterator[NodeRec]:

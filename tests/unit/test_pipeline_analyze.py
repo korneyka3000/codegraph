@@ -18,6 +18,7 @@ from codegraph.config.models import (
     ValueSpec,
 )
 from codegraph.pipeline.analyze import analyze_service
+from codegraph.pipeline.diff import ServiceDelta
 from codegraph.resolvers.scip import scip_pb2
 from codegraph.resolvers.scip.runner import ScipRunError, ScipRunResult
 from codegraph.stores.staging import Staging
@@ -479,3 +480,175 @@ def test_analyze_http_client_active_wires_http_call_claims(tmp_path):
     # "structurally empty besides claims" shape check.
     assert not any(n.roles for n in st.iter_nodes())
     assert not any(e.type == "CALLS_HTTP" for e in st.iter_edges())
+
+
+# -- M4 T5: incremental analyze_service -- mode tagging, skip precondition,
+# degraded-in-incremental fallback. These are fake-runner (fast, no real scip-python)
+# tests covering the ORCHESTRATION contract: mode dispatch, the skip precondition
+# (prior_delta.empty AND fingerprint_ok), ScipRunError-during-incremental falling back
+# to the full path, and stale-set detection driven by genuine on-disk content changes
+# (service_delta needs no SCIP at all). The one thing NO fake runner can prove --
+# cross-file ref_dirty detection, which depends on pyright/scip-python actually
+# re-resolving a renamed symbol's references -- is covered separately by the
+# scip-marked tests/integration/test_analyze_incremental.py.
+
+
+class _FailIfCalledRunner:
+    """Proves skip mode does ZERO scip work -- any call to .run() is itself a test
+    failure, not just an unwanted side effect."""
+
+    def run(self, *a, **kw):
+        raise AssertionError("skip mode must not invoke the scip runner at all")
+
+
+def test_analyze_full_path_default_reports_mode_full(tmp_path):
+    """Regression pin: the existing degraded-report-fields test only asserts
+    expected_keys <= report.keys() (subset check), which would NOT catch a missing
+    "mode" key on its own -- this test pins it directly. The plain default call
+    (incremental=False) is exactly today's pre-M4-T5 full path; "mode" is the only
+    new key it should ever gain."""
+    svc = ServiceConfig(name="document-management", path=FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+    assert report["mode"] == "full"
+    assert "stale_files" not in report
+
+
+def test_analyze_incremental_skip_when_delta_empty_and_fingerprint_ok(tmp_path):
+    svc = ServiceConfig(name="document-management", path=FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+    counts_before = st.counts_for_service(svc.name)
+
+    empty_delta = ServiceDelta(added=(), changed=(), deleted=(), unchanged=("app/main.py",))
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FailIfCalledRunner(),
+        incremental=True, prior_delta=empty_delta, fingerprint_ok=True,
+    )
+
+    assert report["mode"] == "skipped"
+    assert "stale_files" not in report
+    # zero staging writes: current per-service counts are UNCHANGED by the skip call.
+    assert st.counts_for_service(svc.name) == counts_before
+    assert report["files"] == counts_before["files"]
+    assert report["defs"] == counts_before["defs"]
+    assert report["refs"] == counts_before["refs"]
+    assert report["nodes"] == counts_before["nodes"]
+    assert report["edges"] == counts_before["edges"]
+    assert report["degraded"] is False
+    assert report["reason"] is None
+    assert report["from_cache"] is False
+
+
+def test_analyze_incremental_not_skipped_when_fingerprint_not_ok(tmp_path):
+    """prior_delta.empty alone is not enough -- a config-fingerprint mismatch
+    (fingerprint_ok=False) must force the real incremental branch to run, even
+    though nothing changed on disk."""
+    svc = ServiceConfig(name="document-management", path=FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    empty_delta = ServiceDelta(added=(), changed=(), deleted=(), unchanged=("x",))
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True, prior_delta=empty_delta, fingerprint_ok=False,
+    )
+    assert report["mode"] == "incremental"
+    # nothing on disk changed and the fake scip index is empty (no refs anywhere)
+    # -> no file is content-changed, added, or ref-dirty.
+    assert report["stale_files"] == 0
+
+
+def test_analyze_incremental_not_skipped_when_prior_delta_non_empty(tmp_path):
+    svc = ServiceConfig(name="document-management", path=FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    non_empty_delta = ServiceDelta(added=("new.py",), changed=(), deleted=(), unchanged=())
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True, prior_delta=non_empty_delta, fingerprint_ok=True,
+    )
+    assert report["mode"] == "incremental"
+
+
+def test_analyze_incremental_without_prior_delta_never_skips(tmp_path):
+    """prior_delta defaults to None -- with nothing to check .empty against, skip
+    eligibility can never be evaluated, so the incremental branch always runs for
+    real instead."""
+    svc = ServiceConfig(name="document-management", path=FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True,
+    )
+    assert report["mode"] == "incremental"
+
+
+def test_analyze_incremental_degraded_scip_falls_back_to_full_path(tmp_path):
+    """ScipRunError raised DURING the incremental branch's own scip attempt must
+    abandon incremental entirely and re-run as an ordinary full analyze (which
+    hits the SAME ScipRunError again and degrades exactly as it always has) --
+    never a half-incremental "degraded" hybrid, since the heuristic fallback
+    resolver gives no stable refs-diff to compute ref_dirty from."""
+    svc = ServiceConfig(name="document-management", path=FIXTURE)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        incremental=True, fingerprint_ok=False,
+    )
+
+    assert report["mode"] == "full"
+    assert report["degraded"] is True
+    assert report["reason"]
+    assert "stale_files" not in report
+    # the fallback is a REAL full re-analyze -- nodes/edges/calls still land.
+    assert report["nodes"] > 0
+    calls = [e for e in st.iter_edges() if e.type == "CALLS"]
+    assert calls and all(e.resolution == "heuristic" and e.confidence == 0.6 for e in calls)
+
+
+def test_analyze_incremental_stale_files_reflects_changed_file_on_disk(tmp_path):
+    """Fake-runner-only proof that a content change drives stale_files through
+    service_delta (needs no SCIP at all) -- and that a NON-stale file's staged node
+    survives the incremental call completely untouched. The genuine cross-file
+    ref_dirty mechanism needs real scip-python; proven by the scip-marked
+    integration test instead."""
+    svc_root = tmp_path / "svc"
+    (svc_root / "app").mkdir(parents=True)
+    (svc_root / "app" / "__init__.py").write_text("")
+    (svc_root / "app" / "main.py").write_text("def f():\n    pass\n")
+    (svc_root / "app" / "other.py").write_text("def g():\n    pass\n")
+    svc = ServiceConfig(name="svc", path=svc_root)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    other_before = next(
+        n for n in st.iter_nodes() if n.relpath == "app/other.py" and n.kind == "Module"
+    )
+    main_before = next(
+        n for n in st.iter_nodes() if n.relpath == "app/main.py" and n.kind == "Module"
+    )
+
+    (svc_root / "app" / "main.py").write_text("def f():\n    return 1\n")
+
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["stale_files"] == 1
+
+    other_after = next(
+        n for n in st.iter_nodes() if n.relpath == "app/other.py" and n.kind == "Module"
+    )
+    main_after = next(
+        n for n in st.iter_nodes() if n.relpath == "app/main.py" and n.kind == "Module"
+    )
+    assert other_after == other_before  # untouched: not in the stale set
+    assert main_after.content_hash != main_before.content_hash  # re-extracted

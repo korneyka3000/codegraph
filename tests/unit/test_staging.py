@@ -927,3 +927,319 @@ def test_embedding_cache_survives_clear_workspace_layer(tmp_path):
     assert st.embedding_cache_get([("ih-1", "model-a")]) == {
         ("ih-1", "model-a"): b"\x00" * 32,
     }
+
+
+# -- M4 T5: incremental analyze support --
+#
+# refs_hash_by_file: per-relpath sha256 over that file's scip_refs rows, sorted by
+# (symbol, start_byte, end_byte, roles) -- deterministic, order-independent, and
+# sensitive to every one of those 4 fields (but NOT start_line, deliberately excluded
+# per the brief's own tuple). clear_scip_layer/delete_file_layer: narrower siblings of
+# begin_service for incremental re-analyze -- clear_scip_layer wipes files/scip_defs/
+# scip_refs only (S5/S6/S8 layers survive); delete_file_layer wipes nodes/claims/chunks
+# by relpath and edges by (origin_service, evidence_file), leaving everything else
+# (other relpaths, other services, the workspace layer) untouched.
+
+
+def _refs_hash_for(tmp_path, name, row):
+    st = Staging(tmp_path / f"{name}.db")
+    st.begin_service("a")
+    st.add_refs("a", [row])
+    return st.refs_hash_by_file("a")["m.py"]
+
+
+def test_refs_hash_by_file_deterministic(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.add_refs("a", [RefRow("m.py", "SYM_A", 10, 12, 1, 0),
+                      RefRow("m.py", "SYM_B", 20, 22, 2, 1)])
+    assert st.refs_hash_by_file("a") == st.refs_hash_by_file("a")
+
+
+def test_refs_hash_by_file_independent_of_insertion_order(tmp_path):
+    st1 = Staging(tmp_path / "s1.db")
+    st1.begin_service("a")
+    st1.add_refs("a", [RefRow("m.py", "SYM_A", 10, 12, 1, 0),
+                       RefRow("m.py", "SYM_B", 20, 22, 2, 1)])
+
+    st2 = Staging(tmp_path / "s2.db")
+    st2.begin_service("a")
+    st2.add_refs("a", [RefRow("m.py", "SYM_B", 20, 22, 2, 1),
+                       RefRow("m.py", "SYM_A", 10, 12, 1, 0)])
+
+    assert st1.refs_hash_by_file("a")["m.py"] == st2.refs_hash_by_file("a")["m.py"]
+
+
+def test_refs_hash_by_file_sensitive_to_symbol(tmp_path):
+    base = _refs_hash_for(tmp_path, "base", RefRow("m.py", "SYM_A", 10, 12, 1, 0))
+    changed = _refs_hash_for(tmp_path, "changed", RefRow("m.py", "SYM_B", 10, 12, 1, 0))
+    assert base != changed
+
+
+def test_refs_hash_by_file_sensitive_to_start_byte(tmp_path):
+    base = _refs_hash_for(tmp_path, "base", RefRow("m.py", "SYM_A", 10, 12, 1, 0))
+    changed = _refs_hash_for(tmp_path, "changed", RefRow("m.py", "SYM_A", 11, 12, 1, 0))
+    assert base != changed
+
+
+def test_refs_hash_by_file_sensitive_to_end_byte(tmp_path):
+    base = _refs_hash_for(tmp_path, "base", RefRow("m.py", "SYM_A", 10, 12, 1, 0))
+    changed = _refs_hash_for(tmp_path, "changed", RefRow("m.py", "SYM_A", 10, 13, 1, 0))
+    assert base != changed
+
+
+def test_refs_hash_by_file_sensitive_to_roles(tmp_path):
+    base = _refs_hash_for(tmp_path, "base", RefRow("m.py", "SYM_A", 10, 12, 1, 0))
+    changed = _refs_hash_for(tmp_path, "changed", RefRow("m.py", "SYM_A", 10, 12, 1, 1))
+    assert base != changed
+
+
+def test_refs_hash_by_file_insensitive_to_start_line_only(tmp_path):
+    """start_line is NOT part of the hash tuple (symbol, start_byte, end_byte,
+    roles) -- pins the exact formula, not just "sensitive to something changing"."""
+    base = _refs_hash_for(tmp_path, "base", RefRow("m.py", "SYM_A", 10, 12, 1, 0))
+    same = _refs_hash_for(tmp_path, "same", RefRow("m.py", "SYM_A", 10, 12, 99, 0))
+    assert base == same
+
+
+def test_refs_hash_by_file_only_includes_files_with_refs(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.add_files("a", [("empty.py", "h", 0), ("m.py", "h2", 1)])
+    st.add_refs("a", [RefRow("m.py", "SYM_A", 10, 12, 1, 0)])
+    assert set(st.refs_hash_by_file("a")) == {"m.py"}
+
+
+def test_refs_hash_by_file_empty_service_returns_empty_dict(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    assert st.refs_hash_by_file("a") == {}
+
+
+def test_refs_hash_by_file_scoped_by_service(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.begin_service("b")
+    st.add_refs("a", [RefRow("m.py", "SYM_A", 10, 12, 1, 0)])
+    st.add_refs("b", [RefRow("m.py", "SYM_B", 10, 12, 1, 0)])
+    assert st.refs_hash_by_file("a")["m.py"] != st.refs_hash_by_file("b")["m.py"]
+
+
+def test_clear_scip_layer_wipes_files_defs_refs_for_service(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.add_files("a", [("m.py", "h", 1)])
+    st.add_defs("a", [DefRow("m.py", "SYM_F", 5, 8, 1)])
+    st.add_refs("a", [RefRow("m.py", "SYM_R", 20, 23, 2, 0)])
+
+    st.clear_scip_layer("a")
+
+    assert st.files_for_service("a") == []
+    assert st.def_symbol_at("a", "m.py", 5) is None
+    assert st.refs_hash_by_file("a") == {}
+
+
+def test_clear_scip_layer_does_not_touch_other_service(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.begin_service("b")
+    st.add_files("a", [("m.py", "h", 1)])
+    st.add_files("b", [("m.py", "h", 1)])
+
+    st.clear_scip_layer("a")
+
+    assert st.files_for_service("a") == []
+    assert st.files_for_service("b") == [("m.py", "h")]
+
+
+def test_clear_scip_layer_does_not_touch_nodes_edges_claims_chunks(tmp_path):
+    """Unlike begin_service (full wipe), clear_scip_layer is narrowly scoped to
+    files/scip_defs/scip_refs -- the S5/S6 layer (nodes/edges/claims) and chunks
+    (S8) belonging to NON-stale files must survive it, since the incremental caller
+    still needs them (see pipeline/analyze.py's module docstring)."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.upsert_nodes([_node("sym:a:`m`/f().", "a")])
+    st.upsert_edges(
+        [EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "CALLS", "static", 1.0, "calls")],
+        origin_service="a",
+    )
+    st.add_claims("a", "m.py", "kafka_producer", [{"topic": "t1"}])
+    st.upsert_chunks("a", "m.py", [_chunk("c1#c0", "c1", 0)])
+
+    st.clear_scip_layer("a")
+
+    assert len(list(st.iter_nodes())) == 1
+    assert len(list(st.iter_edges())) == 1
+    assert st.claims_for("kafka_producer", service="a") != []
+    assert len(st.chunks_for_service("a")) == 1
+
+
+def test_delete_file_layer_removes_nodes_claims_chunks_for_given_relpaths_only(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    na = NodeRec(id="sym:a:`a`/f().", kind="Function", service="a", relpath="a.py",
+                 name="f", qualified_name="a.f")
+    nb = NodeRec(id="sym:a:`b`/g().", kind="Function", service="a", relpath="b.py",
+                 name="g", qualified_name="b.g")
+    st.upsert_nodes([na, nb])
+    st.add_claims("a", "a.py", "kafka_producer", [{"topic": "t1"}])
+    st.add_claims("a", "b.py", "kafka_producer", [{"topic": "t2"}])
+    st.upsert_chunks("a", "a.py", [_chunk("ca#c0", "ca", 0)])
+    st.upsert_chunks("a", "b.py", [_chunk("cb#c0", "cb", 0)])
+
+    st.delete_file_layer("a", {"a.py"}, drop_calls_evidence=set())
+
+    assert {n.id for n in st.iter_nodes()} == {nb.id}
+    assert st.claims_for("kafka_producer", service="a") == [
+        {"topic": "t2", "_service": "a", "_relpath": "b.py"},
+    ]
+    assert {r.chunk_id for r in st.chunks_for_service("a")} == {"cb#c0"}
+
+
+def test_delete_file_layer_does_not_touch_other_service(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.begin_service("b")
+    na = NodeRec(id="sym:a:`x`/f().", kind="Function", service="a", relpath="x.py",
+                 name="f", qualified_name="x.f")
+    nb = NodeRec(id="sym:b:`x`/f().", kind="Function", service="b", relpath="x.py",
+                 name="f", qualified_name="x.f")
+    st.upsert_nodes([na, nb])
+
+    st.delete_file_layer("a", {"x.py"}, drop_calls_evidence=set())
+
+    assert {n.id for n in st.iter_nodes()} == {nb.id}
+
+
+def test_delete_file_layer_removes_edges_by_evidence_file_and_origin_service(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    e_match = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "CALLS", "static", 1.0,
+                       "calls", evidence_file="a.py", evidence_line=1)
+    e_other_file = EdgeRec("sym:a:`m`/h().", "sym:a:`m`/i().", "CALLS", "static", 1.0,
+                            "calls", evidence_file="b.py", evidence_line=1)
+    st.upsert_edges([e_match, e_other_file], origin_service="a")
+
+    st.delete_file_layer("a", set(), drop_calls_evidence={"a.py"})
+
+    remaining = {(e.src, e.dst) for e in st.iter_edges()}
+    assert remaining == {(e_other_file.src, e_other_file.dst)}
+
+
+def test_delete_file_layer_edge_deletion_scoped_by_origin_service_too(tmp_path):
+    """Same evidence_file, DIFFERENT origin_service -- a different service's own
+    S5/S6 batch must survive an unrelated service's delete_file_layer call, exactly
+    like begin_service's own origin_service-scoping."""
+    st = Staging(tmp_path / "s.db")
+    e_a = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "CALLS", "static", 1.0,
+                  "calls", evidence_file="shared.py", evidence_line=1)
+    st.upsert_edges([e_a], origin_service="a")
+    e_b = EdgeRec("sym:b:`m`/f().", "sym:b:`m`/g().", "CALLS", "static", 1.0,
+                  "calls", evidence_file="shared.py", evidence_line=1)
+    st.upsert_edges([e_b], origin_service="b")
+
+    st.delete_file_layer("a", set(), drop_calls_evidence={"shared.py"})
+
+    remaining = {(e.src, e.dst) for e in st.iter_edges()}
+    assert remaining == {(e_b.src, e_b.dst)}
+
+
+def test_delete_file_layer_does_not_touch_workspace_layer(tmp_path):
+    """Channel/BusinessProcess nodes (relpath=None) and origin_service=None
+    (S7/linking-derived) edges must survive -- the same workspace-layer immunity
+    contract as begin_service."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    code_node = NodeRec(id="sym:a:`a`/f().", kind="Function", service="a",
+                         relpath="a.py", name="f", qualified_name="a.f")
+    chan = NodeRec(id="chan:kafka_topic:orders", kind="Channel", service="",
+                   name="orders", qualified_name="chan:kafka_topic:orders")
+    st.upsert_nodes([code_node, chan])
+    linking_edge = EdgeRec("proc:place-order", "sym:a:`a`/f().", "PART_OF_PROCESS",
+                            "derived", 1.0, "linking", evidence_file="a.py")
+    st.upsert_edges([linking_edge])  # origin_service defaults to None
+
+    st.delete_file_layer("a", {"a.py"}, drop_calls_evidence={"a.py"})
+
+    assert {n.id for n in st.iter_nodes()} == {chan.id}
+    assert len(list(st.iter_edges())) == 1  # linking_edge survives (origin_service=None)
+
+
+def test_delete_file_layer_noop_for_empty_sets(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    n = NodeRec(id="sym:a:`a`/f().", kind="Function", service="a", relpath="a.py",
+                name="f", qualified_name="a.f")
+    st.upsert_nodes([n])
+    st.delete_file_layer("a", set(), drop_calls_evidence=set())  # must not raise
+    assert {nn.id for nn in st.iter_nodes()} == {n.id}
+
+
+def test_delete_file_layer_relpaths_alone_does_not_delete_edges(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    n = NodeRec(id="sym:a:`a`/f().", kind="Function", service="a", relpath="a.py",
+                name="f", qualified_name="a.f")
+    st.upsert_nodes([n])
+    e = EdgeRec("sym:a:`a`/f().", "sym:a:`a`/g().", "CALLS", "static", 1.0, "calls",
+                evidence_file="a.py", evidence_line=1)
+    st.upsert_edges([e], origin_service="a")
+
+    st.delete_file_layer("a", {"a.py"}, drop_calls_evidence=set())
+
+    assert list(st.iter_nodes()) == []
+    assert len(list(st.iter_edges())) == 1
+
+
+def test_delete_file_layer_drop_calls_evidence_alone_does_not_delete_nodes(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    n = NodeRec(id="sym:a:`a`/f().", kind="Function", service="a", relpath="a.py",
+                name="f", qualified_name="a.f")
+    st.upsert_nodes([n])
+    e = EdgeRec("sym:a:`a`/f().", "sym:a:`a`/g().", "CALLS", "static", 1.0, "calls",
+                evidence_file="a.py", evidence_line=1)
+    st.upsert_edges([e], origin_service="a")
+
+    st.delete_file_layer("a", set(), drop_calls_evidence={"a.py"})
+
+    assert {nn.id for nn in st.iter_nodes()} == {n.id}
+    assert list(st.iter_edges()) == []
+
+
+def test_counts_for_service_scoped_correctly(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.begin_service("b")
+    st.add_files("a", [("m.py", "h", 1)])
+    st.add_files("b", [("m1.py", "h", 1), ("m2.py", "h", 1)])
+    st.add_defs("a", [DefRow("m.py", "SYM_F", 5, 8, 1)])
+    st.add_refs("a", [RefRow("m.py", "SYM_R", 20, 23, 2, 0)])
+    st.upsert_nodes([
+        NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", relpath="m.py",
+                name="f", qualified_name="m.f"),
+        NodeRec(id="sym:b:`m1`/g().", kind="Function", service="b", relpath="m1.py",
+                name="g", qualified_name="m1.g"),
+    ])
+    st.upsert_edges(
+        [EdgeRec("sym:a:`m`/f().", "sym:a:`m`/f().", "CALLS", "static", 1.0, "calls")],
+        origin_service="a",
+    )
+    st.upsert_chunks("a", "m.py", [_chunk("ca#c0", "ca", 0)])
+
+    assert st.counts_for_service("a") == {
+        "files": 1, "defs": 1, "refs": 1, "nodes": 1, "edges": 1, "chunks": 1,
+    }
+    assert st.counts_for_service("b") == {
+        "files": 2, "defs": 0, "refs": 0, "nodes": 1, "edges": 0, "chunks": 0,
+    }
+
+
+def test_counts_for_service_edges_scoped_by_origin_service_not_endpoint_prefix(tmp_path):
+    """edges has no `service` column -- only origin_service (see upsert_edges/
+    begin_service docstrings). A chan:-src edge (e.g. HANDLES) tagged with its
+    emitting service's origin_service must still count for that service."""
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("chan:http:a:GET /x", "sym:a:`m`/handler().", "HANDLES",
+                "static", 1.0, "fastapi")
+    st.upsert_edges([e], origin_service="a")
+    assert st.counts_for_service("a")["edges"] == 1
+    assert st.counts_for_service("b")["edges"] == 0
