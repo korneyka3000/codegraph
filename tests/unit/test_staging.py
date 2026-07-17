@@ -823,6 +823,55 @@ def test_upsert_chunks_updates_text_on_conflict_when_content_changes(tmp_path):
     assert row.input_hash == "ih-old"
 
 
+def test_upsert_chunks_after_delete_file_layer_leaves_no_orphaned_chunk_id(tmp_path):
+    """M4 T6 (`pipeline.chunk_embed.run`'s `changed_files` parameter) leans on this
+    exact interaction, verified here directly: `upsert_chunks` is a per-chunk_id
+    UPSERT, never a per-file REPLACE (see its own docstring above) -- it has no way
+    to notice that a re-chunked file now produces FEWER pieces than it used to (e.g.
+    a function that shrank from a 2-piece line-split, ord 0/1, down to a single
+    ord-0 piece) and delete the now-surplus OLD chunk_id on its own.
+
+    The real incremental pipeline never hits this: T5's `_analyze_incremental` calls
+    `staging.delete_file_layer(svc.name, stale | dead, ...)` for its ENTIRE stale set
+    BEFORE its own S5/S6 re-run (`pipeline/analyze.py` step 7) -- and `chunk_embed.
+    run` (S8) only ever executes AFTER S1-S7 has fully completed for the whole
+    workspace, so any relpath T7 threads into `changed_files` from that same stale
+    set has had its chunk layer sitting EMPTY since T5's own pass, well before S8
+    ever re-chunks it. This test proves both halves directly: upsert_chunks alone
+    leaves an orphan behind; delete_file_layer first (T5's own precondition) does
+    not."""
+    st = Staging(tmp_path / "s.db")
+    # A file with TWO chunk pieces under the same symbol_id -- mirrors a function
+    # that WAS split by splitter.py's line-split rule 4 (ord 0/1).
+    st.upsert_chunks("a", "big.py", [
+        _chunk("sym:a:big.py/f().#c0", "sym:a:big.py/f().", 0, text="piece 0"),
+        _chunk("sym:a:big.py/f().#c1", "sym:a:big.py/f().", 1, text="piece 1"),
+    ])
+    assert len(st.chunks_for_service("a")) == 2
+
+    # The file "shrinks" so the same symbol now fits in ONE piece -- upsert_chunks
+    # alone, called with just the new ord-0 piece, leaves the OLD ord-1 row (a
+    # DIFFERENT chunk_id -- no INSERT/ON-CONFLICT collision with it at all) sitting
+    # in the table untouched: not a per-file replace.
+    st.upsert_chunks("a", "big.py", [
+        _chunk("sym:a:big.py/f().#c0", "sym:a:big.py/f().", 0, text="piece 0, shrunk"),
+    ])
+    remaining = {r.chunk_id for r in st.chunks_for_service("a")}
+    assert remaining == {"sym:a:big.py/f().#c0", "sym:a:big.py/f().#c1"}  # orphan survives
+
+    # The real pipeline's own precondition: delete_file_layer(stale, ...) runs BEFORE
+    # the re-chunk (T5's analyze.py step 7 -- and chunk_embed/S8 runs even later,
+    # after S7). Clearing the relpath's entire chunk layer first makes the following
+    # upsert_chunks call a re-chunk-from-EMPTY, which is clean by construction --
+    # nothing stale is left to collide with or survive.
+    st.delete_file_layer("a", {"big.py"}, drop_calls_evidence=set())
+    assert st.chunks_for_service("a") == []
+    st.upsert_chunks("a", "big.py", [
+        _chunk("sym:a:big.py/f().#c0", "sym:a:big.py/f().", 0, text="piece 0, shrunk"),
+    ])
+    assert {r.chunk_id for r in st.chunks_for_service("a")} == {"sym:a:big.py/f().#c0"}
+
+
 # -- M4 T1: chunks.input_hash (set_input_hashes) + the persistent, cross-run
 # embedding_cache table (embedding_cache_get/embedding_cache_put) --
 

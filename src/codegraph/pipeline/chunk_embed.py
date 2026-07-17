@@ -33,12 +33,13 @@ caller, not in chunking/splitter.py or chunking/augment.py themselves):
     loop (which would each independently re-scan the whole nodes/edges/chunks tables --
     O(services x graph) instead of O(graph)).
 
-`run(cfg, staging, embedder)`, per service in `cfg.services`:
+`run(cfg, staging, embedder, changed_files=None)`, per service in `cfg.services`:
   1. Read every staged file's bytes off disk (`ServiceConfig.path / relpath`, relpaths
      from `staging.files_for_service` -- the SAME set `analyze_service` already scanned
-     and staged earlier in this same `codegraph index` run). A file gone by the time
-     THIS read runs (removed/renamed since analyze -- OSError) is warned about and
-     skipped, not fatal -- see the loop below.
+     and staged earlier in this same `codegraph index` run -- unless `changed_files` is
+     given, see the M4 T6 section below, in which case relpaths come from THAT instead).
+     A file gone by the time THIS read runs (removed/renamed since analyze -- OSError) is
+     warned about and skipped, not fatal -- see the loop below.
   2. `build_file_facts` (tree-sitter) -- the same parse `analyze_service` itself ran;
      re-run here rather than cached, since `chunk_embed` has no access to
      `analyze_service`'s ephemeral in-memory `FileFacts` (only their DERIVED staged
@@ -79,7 +80,74 @@ module for the write/read pairing with `pipeline/load.py`'s decode side) ->
 `begin_service` wipe-and-recreate of this exact chunk_id). `run`'s own report splits
 the combined `embedded` count into `embedded_fresh` (genuine provider calls) and
 `embedded_from_cache` (free reuses) -- `cli.index`'s paid-provider warning keys off
-`embedded_fresh` alone, not the combined total (see `pipeline/report.py`/`cli.py`)."""
+`embedded_fresh` alone, not the combined total (see `pipeline/report.py`/`cli.py`).
+
+M4 T6 (`changed_files: dict[str, set[str]] | None = None`, new trailing parameter):
+`None` (the default) reproduces every byte of the behavior described above, unchanged
+-- every existing caller (`cli.py`'s own `run_chunk_embed(cfg, staging, embedder)`
+call, every pre-M4 test) stays byte-identical, since step 1's per-service relpath list
+is computed exactly as it always was. A non-None dict instead SCOPES step 1's per-file
+loop to `changed_files.get(svc.name, set())` -- a service with no key in the dict has
+its ENTIRE chunk loop skipped (`.get(..., set())` defaults to an empty set, so the
+inner per-file loop simply never runs for it), not merely left with a coincidentally
+empty relpath list. Chunks already staged for a relpath NOT named in
+`changed_files[svc.name]` are left completely alone by this loop -- they simply
+persist in `chunks` exactly as some EARLIER run (or, within this same run, an earlier
+`analyze_service` call that never had its own `begin_service` invoked -- T5's
+"skipped"/"incremental" modes) last left them.
+
+`fill_headers_all` and the embed pass (both described just above) are DELIBERATELY
+left workspace-wide and unconditional in BOTH the None and non-None cases -- this is
+the one part of S8 that must NOT be `changed_files`-scoped. A header renders a
+chunk's GRAPH POSITION (imports/produces/consumes/handles/depends_on/calls -- see
+`chunking.augment`'s own module docstring), and an edit confined to service A's own
+files can change a CALLS/DEPENDS_ON/... edge whose OTHER endpoint sits in service B's
+completely untouched chunk (e.g. renaming a function in A changes the `calls:` clause
+of every OTHER chunk, anywhere in the workspace, that calls it). Recomputing every
+header is an in-memory, staging-only pass (one `_GraphIndex` snapshot, see the T4
+carry above) -- cheap regardless of how many files were actually re-chunked this run
+-- and its own `input_hash` write-back is what keeps the embed pass HONEST despite
+staying workspace-wide: a chunk whose header text didn't actually change is
+recomputed to the exact SAME `input_hash` it already had, so `chunks_missing_
+embedding` (itself completely unchanged by this task) leaves it alone (free
+`reused`); a chunk whose header DID change gets a genuinely NEW `input_hash`, so that
+SAME workspace-wide embed pass picks it up for a real re-embed -- through the T1
+persistent cache when that exact input was embedded before (e.g. a rename-and-back),
+or a real provider call otherwise. Scoping the embed pass to `changed_files` too
+(instead of leaving it workspace-wide) would MISS exactly this cross-service
+header-drift case -- a chunk whose OWN file was never touched this run would keep
+serving a stale vector for its now-wrong header forever.
+
+Caller precondition this parameter leans on (verified against `upsert_chunks`' actual
+behavior, not just assumed -- see the M4 T6 task brief's own "IMPORTANT deletion
+nuance"): `upsert_chunks` (see its own docstring, `stores/staging.py`) is a
+per-`chunk_id` UPSERT, never a per-file REPLACE -- it has no way to notice that a
+re-chunked file now produces FEWER pieces than it used to (e.g. a function that
+shrank from a 2-piece line-split, ord 0/1, down to a single ord-0 piece) and delete
+the now-surplus OLD chunk_id on its own. Calling this function with a relpath in
+`changed_files[svc.name]` is therefore only SAFE when the caller has already cleared
+that relpath's entire OLD chunk layer first: `Staging.delete_file_layer(service,
+relpaths, ...)` deletes chunks (alongside nodes/claims) `WHERE service=? AND relpath
+IN (...)`, so a relpath re-chunked immediately after a `delete_file_layer` call that
+included it starts from a genuinely EMPTY set of rows -- the following `upsert_chunks`
+call is then a plain from-scratch insert, and no surplus ordinal can survive something
+that was never there to begin with. This precondition holds by construction for
+`changed_files`' one intended real producer: T5's `_analyze_incremental` calls
+`staging.delete_file_layer(svc.name, stale | dead, ...)` for its entire stale set
+BEFORE its own S5/S6 re-run (`pipeline/analyze.py` step 7) -- and `chunk_embed.run`
+(S8) only ever executes AFTER S1-S7 has fully completed for the whole workspace (see
+this module's own opening paragraph), so by the time this function's changed_files-
+scoped loop reaches any relpath T7 threads through from that same stale set, its
+chunk layer has already been sitting empty since T5's own pass. `chunk_embed.run`
+does NOT re-verify or re-enforce this itself (no redundant delete-then-insert here)
+-- it is a documented CONTRACT of the parameter, not a defensive runtime check,
+matching this module's existing trust-the-caller posture elsewhere (`chunk_file`'s
+own `symbol_ids` KeyError-trusts-caller contract, see its docstring). A caller that
+violates this precondition (passes a relpath whose old chunk layer was never
+cleared) observes exactly the surplus-row symptom described above, not a crash --
+both halves (orphan-without-precondition, clean-with-precondition) are pinned
+directly, at the `Staging` level, by `tests/unit/test_staging.py::
+test_upsert_chunks_after_delete_file_layer_leaves_no_orphaned_chunk_id`."""
 
 from __future__ import annotations
 
@@ -217,7 +285,12 @@ def _embed_missing(staging: Staging, embedder: Embedder) -> tuple[int, int]:
     return len(cache_misses), len(cache_hits)
 
 
-def run(cfg: WorkspaceConfig, staging: Staging, embedder: Embedder | None) -> dict:
+def run(
+    cfg: WorkspaceConfig,
+    staging: Staging,
+    embedder: Embedder | None,
+    changed_files: dict[str, set[str]] | None = None,
+) -> dict:
     """S8: chunk + augment + (maybe) embed every service in `cfg.services`. See module
     docstring for the full per-file/per-workspace breakdown. Returns
     `{chunks_total, embedded, embedded_fresh, embedded_from_cache, reused,
@@ -226,14 +299,30 @@ def run(cfg: WorkspaceConfig, staging: Staging, embedder: Embedder | None) -> di
     embedding cache, see `_embed_missing`'s docstring): `embedded` remains their SUM,
     unchanged in meaning from every pre-M4 consumer's point of view (total chunks
     that got a usable vector THIS call, whether via a real provider call or a cache
-    reuse)."""
+    reuse).
+
+    `changed_files` (M4 T6, `{service: {relpath, ...}}`) -- `None` (every pre-M4
+    caller, unchanged) chunks every currently-staged file of every configured
+    service, exactly as before; given, the chunk loop below is scoped to
+    `changed_files.get(svc.name, set())` per service instead -- see the module
+    docstring's own "M4 T6" section for the full contract (scope, the deliberately
+    still-workspace-wide header/embed phases, and the caller-side deletion
+    precondition this parameter leans on)."""
     nodes_by_file: dict[tuple[str, str], list[NodeRec]] = defaultdict(list)
     for n in staging.iter_nodes():
         if n.relpath is not None:
             nodes_by_file[(n.service, n.relpath)].append(n)
 
     for svc in cfg.services:
-        relpaths = [rp for rp, _ in staging.files_for_service(svc.name)]
+        if changed_files is None:
+            relpaths = [rp for rp, _ in staging.files_for_service(svc.name)]
+        else:
+            # sorted(): deterministic iteration order over a caller-supplied `set`
+            # (matches this codebase's existing "sorted files for determinism"
+            # convention elsewhere, e.g. pipeline/analyze.py's own `stale_sorted`) --
+            # correctness doesn't depend on it (each file's chunking is independent),
+            # but log/warning order and test assertions do.
+            relpaths = sorted(changed_files.get(svc.name, set()))
         for rp in relpaths:
             try:
                 source = (svc.path / rp).read_bytes()

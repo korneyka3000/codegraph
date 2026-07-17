@@ -555,3 +555,146 @@ def test_span_shifting_midrun_edit_skips_file_with_warning_instead_of_crashing(
     services_with_chunks = {row.service for row in staging.iter_chunks()}
     assert services_with_chunks == {"b"}
     assert any("spans no longer match" in rec.getMessage() for rec in caplog.records)
+
+
+# ======================================================================================
+# -- M4 T6: changed_files -- incremental S8 chunk-loop scoping. `changed_files=None`
+# (every test ABOVE this section, unmodified) is the byte-identical full-run default;
+# this section exercises the non-None path -- see chunk_embed.py's own module
+# docstring for the full contract (chunk loop scoped, fill_headers_all/embed phase
+# always workspace-wide).
+# ======================================================================================
+
+
+def test_changed_files_scopes_chunk_loop_to_named_relpaths_only(tmp_path, monkeypatch):
+    """The brief's own Step 1 scenario: two services, `changed_files` names exactly
+    one (service, relpath) pair -- `upsert_chunks` must be called ONLY for that pair;
+    every other already-staged chunk (a's OWN other file, and the whole other
+    service) must be left byte-for-byte untouched, embeddings included -- while
+    headers still get recomputed workspace-wide (`fill_headers_all` is never
+    changed_files-scoped) and the embed phase still only re-embeds the ONE row whose
+    input_hash actually changed."""
+    svc_a = _write_service(tmp_path, "a", {"x.py": SRC_ONE_FUNC, "y.py": SRC_TWO_FUNCS})
+    svc_b = _write_service(tmp_path, "b", {"n.py": SRC_ONE_FUNC})
+    cfg = _cfg(svc_a, svc_b)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+
+    first = chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))
+    assert first["chunks_total"] == 4  # a/x.py:1 + a/y.py:2 + b/n.py:1
+
+    before_b = {
+        r.chunk_id: (r.embedding, r.context_header, r.input_hash)
+        for r in staging.chunks_for_service("b")
+    }
+    before_a_y = {
+        r.chunk_id: (r.embedding, r.context_header, r.input_hash)
+        for r in staging.chunks_for_service("a") if r.relpath == "y.py"
+    }
+    assert before_b and before_a_y  # non-vacuous -- both actually have rows to compare
+
+    calls: list[tuple[str, str]] = []
+    original_upsert = Staging.upsert_chunks
+
+    def spy_upsert(self, service, relpath, rows):
+        calls.append((service, relpath))
+        return original_upsert(self, service, relpath, rows)
+
+    monkeypatch.setattr(Staging, "upsert_chunks", spy_upsert)
+
+    # Same-length edit (T3-carry technique -- see test_edited_chunk_only_gets_re_
+    # embedded_the_second_time above): keeps a/x.py's staged node span matching the
+    # fresh parse without a fresh analyze_service call in between, for the same
+    # reason that test needs it (_symbol_ids_for_file span-matches staged nodes
+    # against the CURRENT on-disk parse -- see its own docstring).
+    (svc_a.path / "x.py").write_text("def mul(a, b):\n    return b * a\n")
+
+    second = chunk_embed.run(cfg, staging, FakeEmbedder(dim=8), changed_files={"a": {"x.py"}})
+
+    assert calls == [("a", "x.py")]  # upsert_chunks called ONLY for a/x.py
+
+    after_b = {
+        r.chunk_id: (r.embedding, r.context_header, r.input_hash)
+        for r in staging.chunks_for_service("b")
+    }
+    after_a_y = {
+        r.chunk_id: (r.embedding, r.context_header, r.input_hash)
+        for r in staging.chunks_for_service("a") if r.relpath == "y.py"
+    }
+    assert after_b == before_b  # b: byte-untouched, embeddings included
+    assert after_a_y == before_a_y  # a/y.py: byte-untouched too -- not in changed_files
+
+    # embed phase: chunks_missing_embedding is still workspace-wide (unscoped by
+    # changed_files) -- but only x.py's chunk actually got a NEW input_hash (its own
+    # text changed; the other 3 chunks' headers/text never budged), so it's the only
+    # genuine re-embed.
+    assert second["chunks_total"] == 4
+    assert second["embedded_fresh"] == 1
+    assert second["embedded_from_cache"] == 0
+    assert second["reused"] == 3
+
+
+def test_changed_files_service_absent_from_dict_skips_its_chunk_loop_entirely(
+    tmp_path, monkeypatch
+):
+    """"service absent -> skip its chunk loop entirely" (brief's own Interfaces
+    line): an empty dict names NO service, so BOTH services' chunk loops must be
+    skipped, not just left with an empty relpath list coincidentally computed from
+    files_for_service. fill_headers_all/the embed phase still run (unconditional,
+    workspace-wide) but find nothing new to do against unchanged staged chunks."""
+    svc_a = _write_service(tmp_path, "a", {"m.py": SRC_ONE_FUNC})
+    svc_b = _write_service(tmp_path, "b", {"n.py": SRC_ONE_FUNC})
+    cfg = _cfg(svc_a, svc_b)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+    chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))  # baseline: both fully embedded
+
+    calls: list[tuple[str, str]] = []
+    original_upsert = Staging.upsert_chunks
+
+    def spy_upsert(self, service, relpath, rows):
+        calls.append((service, relpath))
+        return original_upsert(self, service, relpath, rows)
+
+    monkeypatch.setattr(Staging, "upsert_chunks", spy_upsert)
+
+    report = chunk_embed.run(cfg, staging, FakeEmbedder(dim=8), changed_files={})
+
+    assert calls == []  # neither service is a key -> zero chunk-loop upserts at all
+    assert report["chunks_total"] == 2
+    assert report["reused"] == 2  # nothing re-chunked, nothing re-embedded
+    assert report["embedded_fresh"] == 0
+    assert report["embedded_from_cache"] == 0
+
+
+def test_changed_files_still_recomputes_headers_workspace_wide(tmp_path, monkeypatch):
+    """fill_headers_all itself must still be called (workspace-wide, unconditional)
+    even though the chunk loop only touched one service's one file -- the T4 carry's
+    own spy technique (test_run_builds_header_index_exactly_once_not_per_service
+    above), reused here to prove changed_files doesn't ALSO (wrongly) scope this
+    call: a header can depend on a DIFFERENT service's graph position (see module
+    docstring), so it must be recomputed for everyone every time, regardless of how
+    narrow the chunk loop itself was this run."""
+    svc_a = _write_service(tmp_path, "a", {"x.py": SRC_ONE_FUNC})
+    svc_b = _write_service(tmp_path, "b", {"n.py": SRC_ONE_FUNC})
+    cfg = _cfg(svc_a, svc_b)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+    chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))
+
+    fill_headers_all_calls: list[int] = []
+    original_fill_headers_all = augment.fill_headers_all
+
+    def spy_fill_headers_all(st):
+        fill_headers_all_calls.append(1)
+        return original_fill_headers_all(st)
+
+    monkeypatch.setattr(chunk_embed.augment, "fill_headers_all", spy_fill_headers_all)
+
+    (svc_a.path / "x.py").write_text("def mul(a, b):\n    return b * a\n")
+    report = chunk_embed.run(
+        cfg, staging, FakeEmbedder(dim=8), changed_files={"a": {"x.py"}}
+    )
+
+    assert len(fill_headers_all_calls) == 1
+    assert report["chunks_total"] == 2  # a/x.py + b/n.py, both still staged
