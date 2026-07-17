@@ -780,6 +780,82 @@ def test_fill_headers_all_is_idempotent(tmp_path):
 
 
 # ======================================================================================
+# -- M4 T1: fill_headers_all also writes chunks.input_hash (Staging.set_input_hashes) --
+# ======================================================================================
+
+
+def test_fill_headers_all_also_writes_input_hashes(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_node("fn", "Function", qualified_name="app.m.f")])
+    st.upsert_chunks("svc", "app/m.py", [_chunk("fn#c0", "fn", text="def f(): pass")])
+    assert _chunk_row(st, "svc", "fn").input_hash is None
+
+    augment.fill_headers_all(st)
+    row = _chunk_row(st, "svc", "fn")
+    assert row.input_hash is not None
+    expected = hashlib.sha256(
+        augment.augment_text(row.context_header, row.text).encode()
+    ).hexdigest()
+    assert row.input_hash == expected
+
+
+def test_fill_headers_all_calls_set_input_hashes_exactly_once(tmp_path):
+    """Mirrors test_fill_headers_all_calls_set_context_headers_exactly_once --
+    "batched" means ONE `set_input_hashes` call carrying every row, not N individual
+    calls."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes(
+        [
+            _node("a1", "Function", qualified_name="app.a.f", service="a"),
+            _node("b1", "Function", qualified_name="app.b.f", service="b"),
+        ]
+    )
+    st.upsert_chunks("a", "app/a.py", [_chunk("a1#c0", "a1")])
+    st.upsert_chunks("b", "app/b.py", [_chunk("b1#c0", "b1")])
+
+    calls: list[list[tuple[str, str]]] = []
+    original = st.set_input_hashes
+
+    def spy(rows):
+        calls.append(list(rows))
+        return original(rows)
+
+    st.set_input_hashes = spy
+    augment.fill_headers_all(st)
+
+    assert len(calls) == 1
+    assert {chunk_id for chunk_id, _ in calls[0]} == {"a1#c0", "b1#c0"}
+
+
+def test_fill_headers_all_input_hash_changes_when_header_changes_but_text_does_not(
+    tmp_path,
+):
+    """The M4 T1 headline scenario, pinned at the layer where the mechanism actually
+    lives: `fn`'s own source text never changes across the two `fill_headers_all`
+    calls below, but its header DOES (a brand new PRODUCES edge appears on `fn`
+    between the two calls, changing its `graph:` line) -- input_hash must follow the
+    header, not the text alone."""
+    st = Staging(tmp_path / "s.db")
+    chan = make_channel_node("event_type", name="Evt")
+    st.upsert_nodes([_node("fn", "Function", qualified_name="app.m.f"), chan])
+    st.upsert_chunks("svc", "app/m.py", [_chunk("fn#c0", "fn", text="def f(): pass")])
+
+    augment.fill_headers_all(st)
+    before = _chunk_row(st, "svc", "fn")
+    assert "graph:" not in before.context_header
+
+    # graph position changes (a new PRODUCES edge on the SAME symbol) -- fn's own
+    # chunk text/content_hash is completely untouched.
+    st.upsert_edges([_edge("fn", chan.id, "PRODUCES")])
+    augment.fill_headers_all(st)
+    after = _chunk_row(st, "svc", "fn")
+
+    assert after.content_hash == before.content_hash  # text genuinely unchanged
+    assert after.context_header != before.context_header  # header DID change
+    assert after.input_hash != before.input_hash  # input_hash follows the header
+
+
+# ======================================================================================
 # -- real fixtures: degraded pipeline + link (mirrors test_linking_smoke.py) --
 # ======================================================================================
 

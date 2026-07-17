@@ -97,6 +97,7 @@ only WIDENS what the brief's literal annotation would accept, never narrows it.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 from codegraph.core.schema import EdgeRec, NodeRec
@@ -353,8 +354,31 @@ def augment_text(header: str, chunk_text: str) -> str:
     """header + a blank line + the chunk's own (unmodified) code text -- what actually
     goes to the embedder/fulltext index. `chunk.text` in staging itself stays pure
     source (see module docstring's opening paragraph) -- this function's RETURN value
-    is never written back into `chunks.text`."""
+    is never written back into `chunks.text`.
+
+    M4 T1: this is ALSO the single source of truth for `input_hash`'s format
+    (`sha256(augment_text(header, text))`, see `_input_hash` below) -- the persistent
+    embedding cache's whole cache-key contract rests on this function's output being
+    EXACTLY what gets embedded, so a future change to the header/text join here
+    automatically (and correctly) invalidates every existing cache entry, rather than
+    silently drifting out of sync with a hash built some other way elsewhere."""
     return header + "\n\n" + chunk_text
+
+
+def _input_hash(header: str, text: str) -> str:
+    """`input_hash` = sha256 of the EXACT embedder input (`augment_text(header,
+    text)`), hex-encoded -- the persistent `Staging.embedding_cache`/
+    `chunks.embedded_hash` cache key (M4 T1, see core/schema.py's SCHEMA_VERSION
+    "4 -> 5" history entry). Computed HERE, never in `stores/staging.py` (staging only
+    ever stores whatever string it's handed -- see `Staging.set_input_hashes`'s own
+    docstring) -- `augment_text` above is this value's single source of truth, so a
+    future change to the augmentation format flows into cache-key hashing everywhere
+    through this one function. `header or ""` mirrors `chunk_embed._embed_missing`'s
+    own defensive guard against a chunk whose header hasn't been rendered at all
+    (never actually reached here in practice -- `header` is always this SAME call's
+    own freshly-rendered `_render_header` result, never None -- but keeps this
+    function's own contract honest independent of that caller detail)."""
+    return hashlib.sha256(augment_text(header or "", text).encode()).hexdigest()
 
 
 def fill_headers(staging: Staging, service: str) -> int:
@@ -389,10 +413,26 @@ def fill_headers_all(staging: Staging) -> int:
     of `chunk_embed.run` looping `fill_headers(staging, svc.name)` once per service
     (each of which would independently re-scan the full nodes/edges/chunks tables --
     O(services x graph) instead of O(graph); see `_GraphIndex`'s own docstring for why
-    that per-call rescan exists at all). Semantics are otherwise IDENTICAL to
-    `fill_headers` run once per service -- same header content per chunk (both go
-    through the same `_render_header`), same idempotency (a pure function of currently-
-    staged nodes/edges/chunks), same one-batched-`set_context_headers`-call shape.
+    that per-call rescan exists at all). Header content/idempotency are otherwise
+    IDENTICAL to `fill_headers` run once per service -- same header content per chunk
+    (both go through the same `_render_header`), same idempotency (a pure function of
+    currently-staged nodes/edges/chunks).
+
+    M4 T1 addition: ALSO computes and writes each chunk's `input_hash` (`_input_hash`,
+    the exact embedder input's hash -- see that function's own docstring) via
+    `Staging.set_input_hashes`, in its own batched call right after
+    `set_context_headers` -- unconditionally, for EVERY currently-staged chunk, same as
+    the headers themselves. This is deliberately the ONLY place `input_hash` gets
+    (re)computed (see this function's own callers -- `chunk_embed.run` always calls
+    this immediately before `_embed_missing`, so `chunks_missing_embedding`'s
+    input_hash-vs-embedded_hash comparison is always working off a FRESH value, never
+    a stale one from a prior call). `fill_headers` (the per-service sibling) does NOT
+    get this treatment -- it has no real caller in this milestone (see its own
+    docstring) and M4's own incremental-chunking task (T6 in the M4 plan) keeps
+    `fill_headers_all`'s own full, unconditional recompute as the ONLY input_hash
+    write path, by design (headers can change from a graph edit anywhere in the
+    workspace, not just in the chunk's own file).
+
     Returns the total number of chunks updated (0 -- without ever building the graph
     index -- if nothing is staged yet anywhere, mirroring `fill_headers`'s own
     no-chunks-yet shortcut)."""
@@ -404,6 +444,12 @@ def fill_headers_all(staging: Staging) -> int:
     # `staging.iter_chunks()` query a second time back to back -- code review finding;
     # see `_build_index`'s own docstring for why `fill_headers` itself doesn't do this).
     index = _build_index(staging, chunks=chunks)
-    rows = [(c.chunk_id, _render_header(index, c)) for c in chunks]
-    staging.set_context_headers(rows)
-    return len(rows)
+    header_rows: list[tuple[str, str]] = []
+    hash_rows: list[tuple[str, str]] = []
+    for c in chunks:
+        header = _render_header(index, c)
+        header_rows.append((c.chunk_id, header))
+        hash_rows.append((c.chunk_id, _input_hash(header, c.text)))
+    staging.set_context_headers(header_rows)
+    staging.set_input_hashes(hash_rows)
+    return len(header_rows)

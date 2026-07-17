@@ -39,8 +39,10 @@ def build_report(
     последний M2 final review: orphan-Channel-узлы, выметенные в конце link_workspace).
     chunk_stats (M3 T6, ещё один аддитивный параметр, тем же принципом что link_stats
     -- дефолт None сохраняет идентичный dict для каждого существующего 2/3-позиционного
-    вызова): возврат pipeline.chunk_embed.run() (chunks_total/embedded/reused/
-    skipped_no_embedder -- S8, между S7-линковкой и S9-load в cli.index).
+    вызова): возврат pipeline.chunk_embed.run() (chunks_total/embedded/embedded_fresh/
+    embedded_from_cache/reused/skipped_no_embedder -- embedded_fresh/embedded_from_cache
+    -- аддитивная разбивка M4 T1, embedded остаётся их суммой -- S8, между
+    S7-линковкой и S9-load в cli.index).
 
     Возврат -- JSON-сериализуемый dict: {"services", "totals", "load", "health"} + ключ
     "linking" (ТОЛЬКО если link_stats передан) + ключ "chunking" (ТОЛЬКО если
@@ -167,12 +169,19 @@ def print_report(report: dict, console: Console) -> None:
 
     # M3 T6 (additive, same "absent -> strict no-op" contract as linking above):
     # "chunking" key only present when build_report was given chunk_stats.
+    #
+    # M4 T1: the embedded count is broken down into fresh (genuine provider calls)
+    # vs. cached (persistent embedding_cache reuses, zero cost) -- .get(..., 0)
+    # defaults keep this a no-op shape change for a pre-M4 chunk_stats dict that
+    # happens not to carry these two keys (same defensive convention as every other
+    # field read here).
     chunking = report.get("chunking")
     if chunking:
         line = (
-            f"chunking: chunks_total = {chunking.get('chunks_total', 0)}, "
-            f"embedded = {chunking.get('embedded', 0)}, "
-            f"reused = {chunking.get('reused', 0)}"
+            f"chunking: chunks = {chunking.get('chunks_total', 0)} "
+            f"(embedded: {chunking.get('embedded_fresh', 0)} fresh + "
+            f"{chunking.get('embedded_from_cache', 0)} cached, "
+            f"reused: {chunking.get('reused', 0)})"
         )
         skipped = chunking.get("skipped_no_embedder", 0)
         if skipped:

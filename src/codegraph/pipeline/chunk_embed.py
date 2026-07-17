@@ -14,13 +14,18 @@ points.
 Mandatory carries from the T3/T4 review (both closed HERE, in their first real
 caller, not in chunking/splitter.py or chunking/augment.py themselves):
 
-  - T3 carry (cache hardening): `Staging.chunks_missing_embedding` now also re-flags a
-    chunk whose `embedded_hash` (the content_hash AT THE TIME it was last embedded)
-    disagrees with its CURRENT `content_hash` -- closes the "silently stale embedding
-    after an in-run content edit" footgun (same chunk_id, edited text, same
-    embed_model -- the pre-T6 `chunks_missing_embedding` only checked embed_model/
-    NULL-ness, never content freshness). `set_embeddings` now takes a 4th positional
-    field (`content_hash`) per row, written as `embedded_hash`; see stores/staging.py.
+  - T3 carry (cache hardening): `Staging.chunks_missing_embedding` also re-flags a
+    chunk whose `embedded_hash` disagrees with its CURRENT hash -- closes the
+    "silently stale embedding after an in-run content edit" footgun (same chunk_id,
+    edited text, same embed_model -- the pre-T6 `chunks_missing_embedding` only
+    checked embed_model/NULL-ness, never content freshness). `set_embeddings` takes a
+    4th positional field per row, written as `embedded_hash`; see stores/staging.py.
+    M4 T1 changed WHAT that 4th field/`embedded_hash` compare against: `content_hash`
+    (the chunk's own source text alone) through M3 T6, `input_hash` (the exact
+    embedder input's hash -- text AND augmentation header -- see `chunking.augment.
+    _input_hash`) from M4 T1 onward, which additionally catches a header-only change
+    content_hash alone could never see (see core/schema.py's SCHEMA_VERSION "4 -> 5"
+    history entry).
   - T4 carry (one header index per workspace): `chunking.augment.fill_headers_all`
     (new, additive -- `fill_headers` itself is untouched) builds ONE `_GraphIndex`
     snapshot covering every currently-staged chunk across every service, instead of
@@ -55,16 +60,26 @@ The node index (`(service, relpath) -> [NodeRec, ...]`) is built ONCE, from a si
 `staging.iter_nodes()` pass, up front -- reused across every file of every service in
 step 3 above, the same "read once, reuse many" discipline as the T4 carry.
 
-Then, ONCE for the whole workspace (not per service): `fill_headers_all` (see above),
+Then, ONCE for the whole workspace (not per service): `fill_headers_all` (see above --
+M4 T1 addition: this ALSO (re)computes every chunk's `input_hash`, unconditionally),
 then the embed pass -- SKIPPED (`skipped_no_embedder` counted instead) when `embedder`
 is None, e.g. `cli.index`'s graceful-degradation path for a missing local-emb/openai/
 voyage dependency or API key, or its explicit `--no-embed` flag. Otherwise:
 `chunks_missing_embedding(embedder.model_id)` (workspace-wide, so a chunk from ANY
 service that needs (re-)embedding is found, not just the ones this exact call happened
-to re-chunk) -- batched <=64 rows at a time, `augment_text` (header + blank line +
-code) -> `embedder.embed_batch` -> `set_embeddings` (`embedding.codec.pack_vector` --
-the shared float32 little-endian wire format FalkorDB's `vecf32()` expects on read,
-see that module for the write/read pairing with `pipeline/load.py`'s decode side)."""
+to re-chunk) -- EVERY missing row is first checked against the persistent, cross-run
+`Staging.embedding_cache` table (M4 T1, keyed on `(input_hash, embed_model)` -- see
+`_embed_missing`'s own docstring): a cache HIT reuses the stored vector via
+`set_embeddings` alone, at zero provider cost; only a genuine cache MISS is batched
+<=64 rows at a time, run through `augment_text` (header + blank line + code) ->
+`embedder.embed_batch` -> `set_embeddings` (`embedding.codec.pack_vector` -- the shared
+float32 little-endian wire format FalkorDB's `vecf32()` expects on read, see that
+module for the write/read pairing with `pipeline/load.py`'s decode side) ->
+`embedding_cache_put` (so a LATER run reuses it too, even across a full
+`begin_service` wipe-and-recreate of this exact chunk_id). `run`'s own report splits
+the combined `embedded` count into `embedded_fresh` (genuine provider calls) and
+`embedded_from_cache` (free reuses) -- `cli.index`'s paid-provider warning keys off
+`embedded_fresh` alone, not the combined total (see `pipeline/report.py`/`cli.py`)."""
 
 from __future__ import annotations
 
@@ -78,7 +93,7 @@ from codegraph.core.schema import NodeRec
 from codegraph.embedding.base import Embedder
 from codegraph.embedding.codec import pack_vector
 from codegraph.parsing.facts import FileFacts, build_file_facts
-from codegraph.stores.staging import Staging
+from codegraph.stores.staging import ChunkRow, Staging
 
 logger = logging.getLogger(__name__)
 
@@ -126,27 +141,92 @@ def _symbol_ids_for_file(
     return symbol_ids, module_id
 
 
-def _embed_missing(staging: Staging, embedder: Embedder) -> int:
+def _embed_missing(staging: Staging, embedder: Embedder) -> tuple[int, int]:
     """Embeds every chunk `Staging.chunks_missing_embedding` currently flags
-    (workspace-wide -- see module docstring), batched <=64 rows per `embed_batch`
-    call. Returns the count actually embedded."""
+    (workspace-wide -- see module docstring), first partitioned against the
+    persistent, cross-run `Staging.embedding_cache` table (M4 T1):
+
+      - cache HIT: a missing chunk whose exact embedder input (its own `input_hash`
+        -- already fresh, since `run()` always calls `augment.fill_headers_all`
+        immediately before this function, see that function's own M4 T1 addition)
+        already has a vector cached under this exact `embedder.model_id` reuses it
+        via `set_embeddings` alone, at ZERO provider cost. Additionally gated on the
+        cached vector's DECODED dimension (`len(blob) // 4`, the same convention
+        `embedding.codec.unpack_vector` uses) matching `embedder.dim` -- a mismatch
+        (e.g. a corrupt/unexpected blob length, or two genuinely different-dimension
+        embedders that happen to share a `model_id` string) is treated as a MISS, not
+        a crash: it falls through to a real `embed_batch` call and the cache entry is
+        overwritten with a fresh, correctly-sized vector.
+      - cache MISS: batched <=64 rows per `embed_batch` call (unchanged batch size),
+        `set_embeddings` writes the fresh vector into `chunks` AND
+        `embedding_cache_put` writes it into the persistent cache too, so a LATER run
+        (even one that wipes and recreates this exact chunk_id via `begin_service`)
+        can reuse it.
+
+    Both partitions preserve `missing`'s own order (`chunks_missing_embedding`'s own
+    `ORDER BY chunk_id`) -- cache hits are written in one `set_embeddings` call up
+    front, then cache misses are walked in that SAME relative order for batching, so
+    which rows land in which `embed_batch` call is fully deterministic for a given
+    staging state.
+
+    Returns `(embedded_fresh, embedded_from_cache)` -- `run`'s own report counters
+    (see its docstring)."""
     missing = staging.chunks_missing_embedding(embedder.model_id)
-    for i in range(0, len(missing), _EMBED_BATCH_SIZE):
-        batch = missing[i : i + _EMBED_BATCH_SIZE]
+    if not missing:
+        return 0, 0
+
+    # `row.input_hash` is expected to already be fresh here (see docstring above) --
+    # a defensive `is not None` guard routes a chunk with no input_hash yet (not
+    # reachable via `run()`'s own call order, but this function has no other way to
+    # enforce that a caller behaves) straight to a cache miss, rather than passing
+    # `None` into `embedding_cache_get`'s `list[tuple[str, str]]` contract.
+    cache_pairs = [
+        (row.input_hash, embedder.model_id) for row in missing if row.input_hash is not None
+    ]
+    cached = staging.embedding_cache_get(cache_pairs) if cache_pairs else {}
+
+    cache_hits: list[tuple[str, bytes, str, str]] = []
+    cache_misses: list[ChunkRow] = []
+    for row in missing:
+        vec_blob = (
+            cached.get((row.input_hash, embedder.model_id))
+            if row.input_hash is not None else None
+        )
+        if vec_blob is not None and len(vec_blob) // 4 == embedder.dim:
+            cache_hits.append((row.chunk_id, vec_blob, embedder.model_id, row.input_hash))
+        else:
+            cache_misses.append(row)
+
+    if cache_hits:
+        staging.set_embeddings(cache_hits)
+
+    for i in range(0, len(cache_misses), _EMBED_BATCH_SIZE):
+        batch = cache_misses[i : i + _EMBED_BATCH_SIZE]
         texts = [augment.augment_text(row.context_header or "", row.text) for row in batch]
         vectors = embedder.embed_batch(texts)
+        packed = [pack_vector(vec) for vec in vectors]
         staging.set_embeddings([
-            (row.chunk_id, pack_vector(vec), embedder.model_id, row.content_hash)
-            for row, vec in zip(batch, vectors, strict=True)
+            (row.chunk_id, blob, embedder.model_id, row.input_hash)
+            for row, blob in zip(batch, packed, strict=True)
         ])
-    return len(missing)
+        staging.embedding_cache_put([
+            (row.input_hash, embedder.model_id, embedder.dim, blob)
+            for row, blob in zip(batch, packed, strict=True)
+        ])
+
+    return len(cache_misses), len(cache_hits)
 
 
 def run(cfg: WorkspaceConfig, staging: Staging, embedder: Embedder | None) -> dict:
     """S8: chunk + augment + (maybe) embed every service in `cfg.services`. See module
     docstring for the full per-file/per-workspace breakdown. Returns
-    `{chunks_total, embedded, reused, skipped_no_embedder}` (`pipeline.report.
-    build_report`'s own per-run S8 line)."""
+    `{chunks_total, embedded, embedded_fresh, embedded_from_cache, reused,
+    skipped_no_embedder}` (`pipeline.report.build_report`'s own per-run S8 line) --
+    `embedded_fresh`/`embedded_from_cache` are M4 T1's own addition (persistent
+    embedding cache, see `_embed_missing`'s docstring): `embedded` remains their SUM,
+    unchanged in meaning from every pre-M4 consumer's point of view (total chunks
+    that got a usable vector THIS call, whether via a real provider call or a cache
+    reuse)."""
     nodes_by_file: dict[tuple[str, str], list[NodeRec]] = defaultdict(list)
     for n in staging.iter_nodes():
         if n.relpath is not None:
@@ -202,10 +282,11 @@ def run(cfg: WorkspaceConfig, staging: Staging, embedder: Embedder | None) -> di
     chunks_total = staging.counts()["chunks"]
 
     if embedder is None:
-        embedded, reused, skipped_no_embedder = 0, 0, chunks_total
+        embedded_fresh, embedded_from_cache, reused, skipped_no_embedder = 0, 0, 0, chunks_total
         model_meta, dim_meta = "", ""
     else:
-        embedded = _embed_missing(staging, embedder)
+        embedded_fresh, embedded_from_cache = _embed_missing(staging, embedder)
+        embedded = embedded_fresh + embedded_from_cache
         reused, skipped_no_embedder = chunks_total - embedded, 0
         model_meta, dim_meta = embedder.model_id, str(embedder.dim)
 
@@ -220,6 +301,10 @@ def run(cfg: WorkspaceConfig, staging: Staging, embedder: Embedder | None) -> di
     staging.set_meta("embed_model", model_meta)
     staging.set_meta("embed_dim", dim_meta)
     return {
-        "chunks_total": chunks_total, "embedded": embedded,
-        "reused": reused, "skipped_no_embedder": skipped_no_embedder,
+        "chunks_total": chunks_total,
+        "embedded": embedded_fresh + embedded_from_cache,
+        "embedded_fresh": embedded_fresh,
+        "embedded_from_cache": embedded_from_cache,
+        "reused": reused,
+        "skipped_no_embedder": skipped_no_embedder,
     }

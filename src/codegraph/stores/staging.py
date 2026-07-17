@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,16 +21,34 @@ class ChunkRow:
     """Full on-disk shape of one `chunks` row -- a superset of `ChunkRec` (chunk_id,
     symbol_id, ord, text, start_line, end_line, content_hash) plus the staging-only
     columns `upsert_chunks` injects (service, relpath) and the ones only
-    `set_embeddings`/`set_context_headers` ever populate (context_header, embedding,
-    embed_model, embedded_hash). Lives here rather than in `chunking.splitter` alongside
-    `ChunkRec` on purpose: the splitter is storage-agnostic (it has never heard of
-    "service" or "embedding"), this type is exactly the staging table's own column list.
+    `set_embeddings`/`set_context_headers`/`set_input_hashes` ever populate
+    (context_header, embedding, embed_model, embedded_hash, input_hash). Lives here
+    rather than in `chunking.splitter` alongside `ChunkRec` on purpose: the splitter is
+    storage-agnostic (it has never heard of "service" or "embedding"), this type is
+    exactly the staging table's own column list.
 
-    `embedded_hash` (M3 T6 carry, cache hardening): the chunk's `content_hash` AT THE
-    MOMENT it was last embedded, written by `set_embeddings` alongside `embedding`/
-    `embed_model`. See `chunks_missing_embedding`'s own docstring for the footgun this
-    closes -- `embedding`/`embedded_hash` are always set together, so `embedded_hash`
-    is None exactly when `embedding` is (never independently null)."""
+    `embedded_hash` (M3 T6 carry, cache hardening; M4 T1 changed its SEMANTICS -- see
+    core/schema.py's SCHEMA_VERSION "4 -> 5" history entry): the chunk's `input_hash`
+    (NOT `content_hash` any more) AT THE MOMENT it was last embedded, written by
+    `set_embeddings` alongside `embedding`/`embed_model`. See
+    `chunks_missing_embedding`'s own docstring for the footgun this closes (now also
+    covering a HEADER-only change, which content_hash alone could never see) --
+    `embedding`/`embedded_hash` are always set together, so `embedded_hash` is None
+    exactly when `embedding` is (never independently null, enforced by the `chunks`
+    table's own CHECK constraint -- see `_DDL`).
+
+    `input_hash` (M4 T1, persistent cross-run embedding cache): the EXACT embedder
+    input's hash (`sha256(augment_text(header, text))` -- `chunking.augment` is the
+    single source of truth for that format, staging itself never builds the hash) --
+    NULL until `chunking.augment.fill_headers_all` writes it via `set_input_hashes`
+    (alongside `context_header`, same call). This is the cache key
+    `Staging.embedding_cache_get`/`embedding_cache_put` use (paired with
+    `embed_model`), and what `chunks_missing_embedding` compares `embedded_hash`
+    against. Populated INDEPENDENTLY of `embedding`/`embed_model`/`embedded_hash` (at
+    header-fill time, before any embed call even happens) -- so, unlike that trio, it
+    is NOT covered by the CHECK constraint's NULL-together guarantee: a freshly
+    chunked, headers-filled-but-not-yet-embedded row legitimately has a non-NULL
+    `input_hash` and a still-NULL `embedding` at the same time."""
 
     chunk_id: str
     symbol_id: str
@@ -44,17 +63,23 @@ class ChunkRow:
     embedding: bytes | None
     embed_model: str | None
     embedded_hash: str | None
+    input_hash: str | None
 
 
 # Column list for every `SELECT ... FROM chunks` that feeds a `ChunkRow(*row)` --
 # `chunks_for_service`/`chunks_missing_embedding`/`iter_chunks` below all read the
-# exact same 13 columns, in `ChunkRow`'s own field order (positional unpacking
+# exact same 14 columns, in `ChunkRow`'s own field order (positional unpacking
 # depends on that order matching exactly) -- one constant instead of three
 # hand-copied literals that would silently drift apart on a future column change.
 _CHUNK_COLUMNS = (
     "chunk_id, symbol_id, service, relpath, ord, text, start_line, end_line, "
-    "content_hash, context_header, embedding, embed_model, embedded_hash"
+    "content_hash, context_header, embedding, embed_model, embedded_hash, input_hash"
 )
+
+# M4 T1: `Staging.embedding_cache_get`'s own per-query IN-clause row cap -- keeps a
+# single SELECT well under SQLite's own bound-parameter-count ceiling for a whole
+# workspace's worth of cache-miss candidates.
+_CACHE_LOOKUP_BATCH = 400
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -92,9 +117,13 @@ CREATE TABLE IF NOT EXISTS chunks(
   chunk_id TEXT PRIMARY KEY, symbol_id TEXT, service TEXT, relpath TEXT,
   ord INTEGER, text TEXT, start_line INTEGER, end_line INTEGER, content_hash TEXT,
   context_header TEXT, embedding BLOB, embed_model TEXT, embedded_hash TEXT,
+  input_hash TEXT,
   CHECK ((embedding IS NULL) = (embed_model IS NULL)
          AND (embedding IS NULL) = (embedded_hash IS NULL)));
 CREATE INDEX IF NOT EXISTS idx_chunks_service ON chunks(service);
+CREATE TABLE IF NOT EXISTS embedding_cache(
+  input_hash TEXT, embed_model TEXT, dim INTEGER, vec BLOB,
+  PRIMARY KEY(input_hash, embed_model));
 """
 # M3 T3 (history): `chunks` arrived as a BRAND NEW table -- unlike the 2 -> 3
 # edges-PK migration, `CREATE TABLE IF NOT EXISTS` for a name no pre-T3 v3 staging.db
@@ -115,6 +144,18 @@ CREATE INDEX IF NOT EXISTS idx_chunks_service ON chunks(service);
 # cache; no data-preserving upgrade path is written for it), not an absence of a
 # migration mechanism -- the version check IS the mechanism, and it works (pinned by
 # tests/unit/test_staging.py's v2- and v3-shaped-database tests).
+#
+# M4 T1: same reshape pattern again, one column further -- `chunks` gains
+# `input_hash TEXT` (a real column addition to a table every v4 staging.db already
+# has), and a brand new `embedding_cache` table appears alongside it. The
+# SCHEMA_VERSION 4 -> 5 bump (core/schema.py's "4 -> 5" history entry -- read it for
+# the full input_hash/embedding_cache/embedded_hash-semantics story) routes a pre-M4
+# (v4) file through the exact same loud InvariantError path, before this DDL or any
+# input_hash-referencing query ever runs (pinned by test_v4_pre_m4_database_raises_
+# invariant_error_not_operational_error). `embedding_cache` itself needs no such
+# guard to worry about on the FRESH-create side: like `chunks` at T3, it is a brand
+# new table no pre-M4 staging.db could already have one of to collide with -- `CREATE
+# TABLE IF NOT EXISTS` for it is purely additive.
 
 
 def _id_service(node_id: str) -> str | None:
@@ -234,11 +275,24 @@ class Staging:
         `gc_orphan_channels` (the companion fix for the orphaned Channel node itself)."""
         cur = self._db
         # M3 T3: "chunks" joins this same simple "WHERE service=?" family (like
-        # files/scip_defs/scip_refs) -- a full per-service wipe, embeddings included;
-        # there's no cross-run embedding cache to preserve here (M3 always re-chunks a
-        # freshly begin_service'd file within the SAME index run -- see chunks table's
-        # own upsert_chunks docstring for where an ON-CONFLICT-preserving upsert still
-        # matters, which is purely a WITHIN-run idempotency concern, not this one).
+        # files/scip_defs/scip_refs) -- a full per-service wipe, embeddings included.
+        #
+        # M4 T1 update: wiping a service's `chunks` rows here no longer loses the
+        # actual VECTORS -- they live on in the separate, global `embedding_cache`
+        # table (keyed by (input_hash, embed_model), see core/schema.py's
+        # SCHEMA_VERSION "4 -> 5" history entry), which this loop deliberately does
+        # NOT include: embedding_cache has no `service` column at all, and nothing
+        # anywhere ever deletes from it. A freshly re-chunked row with the SAME exact
+        # embedder input (header + text unchanged since some prior run) rejoins its
+        # old vector from that cache at embed time (chunk_embed._embed_missing) at
+        # ZERO provider cost, even though its OWN `chunks` row here was just deleted
+        # and will be recreated from scratch -- see chunk_embed.py's own module
+        # docstring for the full cross-run mechanism this enables (`codegraph index`
+        # run twice on an unchanged workspace -> `embedded_fresh == 0`). Within ONE
+        # index run, `upsert_chunks`' own ON-CONFLICT-preserving upsert is a SEPARATE,
+        # narrower idempotency concern (see that method's own docstring) -- it never
+        # even reaches this DELETE, since begin_service always runs before the SAME
+        # run's own chunking pass touches this service's rows again.
         for t in ("files", "scip_defs", "scip_refs", "chunks"):
             cur.execute(f"DELETE FROM {t} WHERE service=?", (service,))  # noqa: S608
         cur.execute("DELETE FROM nodes WHERE service=?", (service,))
@@ -525,23 +579,31 @@ class Staging:
         per-file, so a single call always stages one file's worth of chunks.
 
         Deliberately NOT a blanket `INSERT OR REPLACE`: that would reset
-        context_header/embedding/embed_model/embedded_hash to NULL on every call, even
-        when a chunk_id's content hasn't changed at all. `ON CONFLICT(chunk_id) DO
-        UPDATE` instead only ever touches the content-derived columns (symbol_id,
-        service, relpath, ord, text, start_line, end_line, content_hash); embedding/
-        embed_model/embedded_hash/context_header survive a re-upsert with the SAME
-        chunk_id untouched -- INCLUDING when the content itself changed (a same-chunk_id
-        re-upsert with EDITED text updates content_hash but leaves the OLD embedding in
-        place, which is exactly why `chunks_missing_embedding` also compares
-        `embedded_hash` against the fresh `content_hash` rather than trusting
-        embedding's mere presence, see that method's own docstring). This survival is
+        context_header/embedding/embed_model/embedded_hash/input_hash to NULL on every
+        call, even when a chunk_id's content hasn't changed at all. `ON CONFLICT
+        (chunk_id) DO UPDATE` instead only ever touches the content-derived columns
+        (symbol_id, service, relpath, ord, text, start_line, end_line, content_hash);
+        embedding/embed_model/embedded_hash/context_header/input_hash ALL survive a
+        re-upsert with the SAME chunk_id untouched -- INCLUDING when the content itself
+        changed (a same-chunk_id re-upsert with EDITED text updates content_hash but
+        leaves the OLD embedding AND the now-STALE input_hash in place, until the next
+        `chunking.augment.fill_headers_all` pass recomputes both the header and
+        `input_hash` from the fresh text -- see `chunks_missing_embedding`'s own
+        docstring for how that staleness gets detected once it does). This survival is
         what makes `chunks_missing_embedding` a genuine cache check rather than always
-        finding everything "missing" -- T6's chunk_embed.run relies on exactly this for
-        its own idempotency (a second call, same files, embeds nothing new). Note this
-        only ever matters WITHIN one index run's staging lifetime: `begin_service`
-        still deletes chunk rows outright on the NEXT `codegraph index` invocation (see
-        its own docstring) -- there is no cross-run embedding cache in M3, incremental
-        indexing is M4 scope."""
+        finding everything "missing" -- chunk_embed.run relies on exactly this for its
+        own WITHIN-run idempotency (a second call, same files, embeds nothing new).
+
+        That in-place survival only ever matters WITHIN one staging session's chunk
+        rows: `begin_service` still deletes chunk rows outright on the NEXT `codegraph
+        index` invocation (see its own docstring). Unlike M3, that is no longer the end
+        of the embedding-caching story -- M4 T1 adds a SEPARATE, global
+        `embedding_cache` table (keyed by `(input_hash, embed_model)`, never touched by
+        `begin_service`) that survives exactly this kind of wipe-and-recreate, so a
+        cross-run repeat `codegraph index` can still avoid re-embedding unchanged
+        chunks even though their `chunks` rows themselves were deleted and recreated
+        from scratch -- see that method's own docstring and core/schema.py's
+        SCHEMA_VERSION "4 -> 5" history entry for the full mechanism."""
         self._db.executemany(
             "INSERT INTO chunks "
             "(chunk_id, symbol_id, service, relpath, ord, text, start_line, end_line, "
@@ -580,59 +642,75 @@ class Staging:
         """Every chunk (any service) that either has no embedding yet, was last
         embedded under a DIFFERENT model id than `model_id` (e.g. the workspace config
         switched embedding models -- everything needs re-embedding, not just new
-        chunks), OR (M3 T6 carry, cache hardening) was RE-UPSERTED with different
-        content since it was last embedded.
+        chunks), OR (M4 T1 -- was content_hash-keyed through M3 T6, see
+        core/schema.py's SCHEMA_VERSION "4 -> 5" history entry for why the swap) has an
+        `embedded_hash` that no longer matches its current `input_hash`.
 
-        That third condition -- `embedded_hash != content_hash` -- closes a footgun
-        `upsert_chunks`'s own ON-CONFLICT-preserving upsert opens: re-staging the SAME
-        chunk_id with EDITED text (same symbol, same ord, different body -- e.g. a file
-        changed between two `chunk_embed.run` calls within one staging session, with no
-        intervening `begin_service`) updates `content_hash` but leaves the OLD
-        `embedding` in place untouched (by design, for the common no-change case). Only
-        checking `embedding IS NULL OR embed_model != ?` (the pre-T6 condition) would
-        never notice that mismatch -- `embedding` is still non-NULL and `embed_model`
-        still matches, so the chunk would silently keep serving a STALE vector forever,
-        never flagged for re-embedding. `embedded_hash` (written by `set_embeddings`
-        alongside `embedding`/`embed_model`, see its own docstring) records exactly
-        which `content_hash` that embedding was actually computed FROM, so a later
-        content change is detectable independent of embed_model/NULL-ness. A
-        never-embedded row (`embedding IS NULL`) is caught by the first disjunct
-        regardless of `embedded_hash`'s value (NULL `!=` comparisons are non-TRUE in
-        SQL, but `OR` doesn't need them to be -- the first disjunct alone is enough).
+        That third/fourth condition -- `embedded_hash IS NULL OR embedded_hash !=
+        input_hash` -- is the real cache-freshness check, and it is keyed on
+        `input_hash` (`chunks.input_hash`, written by `chunking.augment.
+        fill_headers_all` via `set_input_hashes` -- the EXACT embedder input's hash,
+        `sha256(augment_text(header, text))`), not `content_hash` (the chunk's own
+        source text alone, blind to its augmentation header). `embedded_hash` (written
+        by `set_embeddings` alongside `embedding`/`embed_model`, see its own
+        docstring) records exactly which `input_hash` that embedding was actually
+        computed FROM.
 
-        This whole disjunct-completeness argument leans on `embedding`/`embed_model`/
-        `embedded_hash` always being NULL together or set together (never a PARTIAL
-        NULL -- e.g. `embedding` set but `embedded_hash` still NULL would slip through
-        every disjunct here: `embedding IS NULL` false, `embed_model != ?` false if
-        the model matches, `embedded_hash != content_hash` evaluates to SQL NULL --
-        not TRUE -- against a NULL `embedded_hash`, so `OR` never catches it). That
-        invariant isn't just a convention `set_embeddings` happens to uphold (it's the
-        sole writer of all three columns, always together, in one UPDATE) -- it's
-        enforced by the `chunks` table's own `CHECK` constraint (_DDL above), so a
-        future write path that ever tried to set one without the other two would fail
-        loudly (`sqlite3.IntegrityError`) at INSERT/UPDATE time, not silently produce
-        an unreachable "missing embedding" row here."""
+        Keying on input_hash rather than content_hash is the whole point of the M4 T1
+        redesign: content_hash alone can NEVER detect a chunk whose own source text
+        never changed but whose HEADER did (e.g. some OTHER symbol elsewhere in the
+        graph got renamed, or gained/lost an edge, changing THIS chunk's
+        `graph:`/`imports:`/`parent:` line without touching this chunk's own body) --
+        embedded_hash == content_hash would never budge, so a stale embedding
+        (computed from the OLD header + unchanged text) would silently keep serving
+        forever. `input_hash` folds the header into the hash, so a header-only change
+        and a text-only change are both visible through this exact same single
+        disjunct.
+
+        `embedded_hash IS NULL` is its own explicit disjunct (not folded into
+        `embedded_hash != input_hash` alone) because SQL's `!=` against a NULL
+        `input_hash` (a chunk whose `fill_headers_all` pass simply hasn't run yet this
+        session) evaluates to SQL NULL, not TRUE -- `OR` would silently fail to flag it
+        without this. A never-embedded row (`embedding IS NULL`) is caught by the
+        first disjunct regardless of either hash's value.
+
+        This whole disjunct-completeness argument (for the embedding/embed_model/
+        embedded_hash trio) leans on those three always being NULL together or set
+        together (never a PARTIAL NULL). That invariant isn't just a convention
+        `set_embeddings` happens to uphold (it's the sole writer of all three columns,
+        always together, in one UPDATE) -- it's enforced by the `chunks` table's own
+        `CHECK` constraint (_DDL above), so a future write path that ever tried to set
+        one without the other two would fail loudly (`sqlite3.IntegrityError`) at
+        INSERT/UPDATE time. `input_hash` is deliberately OUTSIDE that CHECK trio (see
+        core/schema.py's SCHEMA_VERSION "4 -> 5" history entry): it is set
+        independently of embedding, at header-fill time, so a freshly-chunked,
+        headers-filled-but-not-yet-embedded row legitimately has non-NULL `input_hash`
+        and NULL `embedding` at the same time -- exactly the "never embedded" case the
+        first disjunct already catches on its own."""
         cur = self._db.execute(
             f"SELECT {_CHUNK_COLUMNS} FROM chunks WHERE embedding IS NULL "  # noqa: S608
-            "OR embed_model != ? OR embedded_hash != content_hash ORDER BY chunk_id",
+            "OR embed_model != ? OR embedded_hash IS NULL OR embedded_hash != input_hash "
+            "ORDER BY chunk_id",
             (model_id,),
         )
         return [ChunkRow(*row) for row in cur.fetchall()]
 
     def set_embeddings(self, rows: list[tuple[str, bytes, str, str]]) -> None:
-        """`rows` -- `(chunk_id, embedding_blob, model_id, content_hash)`; `content_hash`
-        (M3 T6 carry) is the chunk's `content_hash` AT THE MOMENT it was embedded --
-        the caller reads it off the SAME `ChunkRow` it fed to the embedder, and it's
-        stored as `embedded_hash` so a LATER `upsert_chunks` call that changes this
-        chunk_id's content without a matching re-embed leaves `embedded_hash` stale and
+        """`rows` -- `(chunk_id, embedding_blob, model_id, input_hash)`; `input_hash`
+        (M4 T1 -- was `content_hash` through M3 T6, see core/schema.py's
+        SCHEMA_VERSION "4 -> 5" history entry for why the swap) is the chunk's
+        `input_hash` AT THE MOMENT it was embedded -- the caller reads it off the SAME
+        `ChunkRow` it fed (via `augment_text`) to the embedder, and it's stored as
+        `embedded_hash` so a LATER change to this chunk's exact embedder input (its own
+        text OR its augmentation header) leaves `embedded_hash` stale and
         `chunks_missing_embedding` correctly flags it (see that method's own docstring
         for the full footgun this closes). No-op for a `chunk_id` that doesn't exist
         (matches `update_edge_props`'s missing-key tolerance)."""
         self._db.executemany(
             "UPDATE chunks SET embedding=?, embed_model=?, embedded_hash=? WHERE chunk_id=?",
             [
-                (blob, model_id, content_hash, chunk_id)
-                for chunk_id, blob, model_id, content_hash in rows
+                (blob, model_id, input_hash, chunk_id)
+                for chunk_id, blob, model_id, input_hash in rows
             ],
         )
         self._db.commit()
@@ -644,6 +722,73 @@ class Staging:
             "UPDATE chunks SET context_header=? WHERE chunk_id=?",
             [(header, chunk_id) for chunk_id, header in rows],
         )
+        self._db.commit()
+
+    def set_input_hashes(self, rows: list[tuple[str, str]]) -> None:
+        """`rows` -- `(chunk_id, input_hash)`; M4 T1's own write-back, called from
+        `chunking.augment.fill_headers_all` alongside `set_context_headers` (same
+        plain-UPDATE-by-chunk_id shape, same no-op-for-missing-chunk_id tolerance as
+        that method and `set_embeddings`). `input_hash` -- the exact embedder input's
+        hash (`sha256(augment_text(header, text))`) -- is computed BY THE CALLER
+        (`chunking.augment` is its single source of truth, see `augment_text`'s own
+        docstring); this method only ever stores whatever string it's handed, same
+        division of responsibility as `set_context_headers`/`set_embeddings`."""
+        self._db.executemany(
+            "UPDATE chunks SET input_hash=? WHERE chunk_id=?",
+            [(input_hash, chunk_id) for chunk_id, input_hash in rows],
+        )
+        self._db.commit()
+
+    # -- M4 T1: embedding_cache -- a GLOBAL, cross-`codegraph index`-run cache, keyed
+    # on (input_hash, embed_model) -- see core/schema.py's SCHEMA_VERSION "4 -> 5"
+    # history entry for the full design rationale. Never wiped by begin_service or
+    # clear_workspace_layer (neither touches it at all -- it has no `service` column
+    # to scope a DELETE by in the first place); no GC is implemented (staging.db is
+    # itself a disposable, one-shot derived cache per workspace, same reasoning as
+    # every other "no migration, just recreate" entry in SCHEMA_VERSION's history).
+
+    def embedding_cache_get(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], bytes]:
+        """Batched lookup: `pairs` -- every `(input_hash, embed_model)` key
+        `chunk_embed._embed_missing` wants a cache hit for, workspace-wide, in ONE
+        logical call -- never a per-chunk round trip. Grouped by `embed_model` (in
+        practice a single `run()` call only ever asks about ONE model -- the current
+        embedder's own `model_id` -- so this rarely does more than one real batch of
+        queries), each group's input_hash list chunked to `_CACHE_LOOKUP_BATCH` rows
+        per `SELECT ... IN (...)` query to stay well under SQLite's own bound
+        parameter-count ceiling for a single statement.
+
+        A miss is simply ABSENT from the returned dict, never a `None` value (mirrors
+        this module's existing "absent, not null" convention elsewhere, e.g.
+        `claims_for`). `{}` for `pairs == []`, without issuing any query at all."""
+        if not pairs:
+            return {}
+        by_model: dict[str, list[str]] = defaultdict(list)
+        for input_hash, embed_model in pairs:
+            by_model[embed_model].append(input_hash)
+        out: dict[tuple[str, str], bytes] = {}
+        for embed_model, hashes in by_model.items():
+            for i in range(0, len(hashes), _CACHE_LOOKUP_BATCH):
+                batch = hashes[i : i + _CACHE_LOOKUP_BATCH]
+                placeholders = ",".join("?" * len(batch))
+                cur = self._db.execute(
+                    "SELECT input_hash, vec FROM embedding_cache "  # noqa: S608
+                    f"WHERE embed_model=? AND input_hash IN ({placeholders})",
+                    (embed_model, *batch),
+                )
+                for input_hash, vec in cur.fetchall():
+                    out[(input_hash, embed_model)] = vec
+        return out
+
+    def embedding_cache_put(self, rows: list[tuple[str, str, int, bytes]]) -> None:
+        """`rows` -- `(input_hash, embed_model, dim, vec)`; INSERT OR REPLACE (a
+        re-put of an existing `(input_hash, embed_model)` key overwrites its `dim`/
+        `vec` -- matches `set_embeddings`'s own "last write wins" contract, though in
+        practice the SAME `(input_hash, embed_model)` pair should always compute to
+        the identical vector, since both are pure functions of the -- deterministic --
+        embedder and its exact input text). No-op for `rows == []`."""
+        if not rows:
+            return
+        self._db.executemany("INSERT OR REPLACE INTO embedding_cache VALUES (?,?,?,?)", rows)
         self._db.commit()
 
     # -- чтение --

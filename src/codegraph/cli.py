@@ -278,21 +278,27 @@ def index(
     report = build_report(per_service, load_stats, link_report, chunk_report)
     write_report(report, codegraph_dir / "report.json")
     print_report(report, console)
-    # Paid-provider notice (M3 final review): a local embedder is a one-time cost
-    # (the model runs on this machine), but openai/voyage bill per API call -- and M3
-    # has NO persistent embedding cache across `codegraph index` runs (content_hash
-    # caching only survives WITHIN one staging.db across repeated calls in the SAME
-    # session, see chunks_missing_embedding's own docstring; M4 scope is a cache that
-    # survives a full re-index). Surfaced here, not inside print_report itself, so
-    # print_report (also called from `load`-adjacent report plumbing/tests) stays
-    # embedding-provider-agnostic -- this is CLI-command-level context (cfg.embedding),
-    # not part of the plain chunk_stats dict every other consumer of build_report sees.
-    if chunk_report["embedded"] > 0 and cfg.embedding.provider != "local":
+    # Paid-provider notice (M3 final review; M4 T1 updated for the persistent
+    # embedding cache): a local embedder is a one-time cost (the model runs on this
+    # machine), but openai/voyage bill per API call. M4 T1 adds a persistent,
+    # cross-run `embedding_cache` table (staging.db) keyed on the exact embedder
+    # input -- so an UNCHANGED re-index no longer re-embeds anything, even paid-API
+    # chunks. `chunk_report["embedded_fresh"]` (not the combined `embedded`, which
+    # also counts free cache reuses) is what actually gates this warning now: it
+    # counts real, billed provider calls THIS run, so a repeat run that served
+    # everything from cache (`embedded_fresh == 0`) correctly prints nothing, even
+    # though `embedded` itself may be > 0. Surfaced here, not inside print_report
+    # itself, so print_report (also called from `load`-adjacent report plumbing/
+    # tests) stays embedding-provider-agnostic -- this is CLI-command-level context
+    # (cfg.embedding), not part of the plain chunk_stats dict every other consumer of
+    # build_report sees.
+    if chunk_report["embedded_fresh"] > 0 and cfg.embedding.provider != "local":
         console.print(
-            f"[yellow]{chunk_report['embedded']} chunk(s) embedded via "
-            f"{cfg.embedding.provider} API this run; re-running 'codegraph index' "
-            "will re-embed all of them again -- there is no persistent embedding "
-            "cache across runs until M4[/]"
+            f"[yellow]{chunk_report['embedded_fresh']} chunk(s) embedded via "
+            f"{cfg.embedding.provider} API this run (billed); "
+            f"{chunk_report.get('embedded_from_cache', 0)} more served from the "
+            "persistent embedding cache at zero cost. Re-running 'codegraph index' "
+            "unchanged will re-embed 0 of them[/]"
         )
 
 

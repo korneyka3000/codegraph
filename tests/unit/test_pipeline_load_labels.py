@@ -145,12 +145,13 @@ def _row(
     chunk_id="c#c0", symbol_id="sym:a:f", service="a", relpath="m.py", ord_=0,
     text="hello", start_line=1, end_line=1, content_hash="hash1",
     context_header="file: m.py", embedding=None, embed_model=None, embedded_hash=None,
+    input_hash=None,
 ):
     return ChunkRow(
         chunk_id=chunk_id, symbol_id=symbol_id, service=service, relpath=relpath,
         ord=ord_, text=text, start_line=start_line, end_line=end_line,
         content_hash=content_hash, context_header=context_header, embedding=embedding,
-        embed_model=embed_model, embedded_hash=embedded_hash,
+        embed_model=embed_model, embedded_hash=embedded_hash, input_hash=input_hash,
     )
 
 
@@ -185,12 +186,19 @@ def test_chunk_props_never_includes_embedding_or_embedded_hash():
     """The vector value travels via a SEPARATE top-level row field ("embedding"), not
     inside props at all -- see batch.upsert_nodes' own vector_props docstring for why
     (a plain `SET n += {embedding: [...]}"` would store an ordinary array property, not
-    the vecf32-encoded type the vector index needs). embedded_hash is a staging-only
-    bookkeeping column, never a graph-visible property."""
-    row = _row(embedding=b"\x00\x00\x80?", embed_model="m", embedded_hash="hash1")
+    the vecf32-encoded type the vector index needs). embedded_hash AND input_hash (M4
+    T1's own new ChunkRow column) are both staging-only bookkeeping columns, never a
+    graph-visible property -- input_hash in particular is staging-internal cache-key
+    plumbing the graph has no use for at all (see core/schema.py's SCHEMA_VERSION
+    "4 -> 5" history entry)."""
+    row = _row(
+        embedding=b"\x00\x00\x80?", embed_model="m", embedded_hash="hash1",
+        input_hash="ih-1",
+    )
     props = _chunk_props(row)
     assert "embedding" not in props
     assert "embedded_hash" not in props
+    assert "input_hash" not in props
 
 
 # -- M3 T7 review fix: qualified_name denormalized onto the Chunk node at load time

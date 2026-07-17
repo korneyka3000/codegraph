@@ -59,7 +59,47 @@ from codegraph.core import ids
 #     `ensure_schema`'s DDL -- and therefore before any embedded_hash-touching code --
 #     ever runs. No data-preserving upgrade path here either (same "staging is a
 #     disposable derived cache" reasoning as 2 -> 3) -- delete and re-run indexing.
-SCHEMA_VERSION = 4
+#   4 -> 5 (M4 T1, persistent cross-run embedding cache): chunks gains `input_hash
+#     TEXT` (NULL until chunking/augment.py's `fill_headers_all` writes it via the new
+#     `Staging.set_input_hashes` -- see that function and ChunkRow's own docstring in
+#     stores/staging.py) -- the EXACT embedder input's hash
+#     (`sha256(augment_text(header, text))`; augment.py is the single source of truth
+#     for that format, staging itself never builds the hash) -- plus a brand new table,
+#     `embedding_cache(input_hash, embed_model, dim, vec, PRIMARY KEY(input_hash,
+#     embed_model))`: a GLOBAL, cross-`codegraph index`-run cache. Unlike `chunks`
+#     itself, `begin_service` never wipes it (see that method's own docstring's "M3 T3"
+#     comment, updated for this change) -- it has no `service` column and no DELETE
+#     statement anywhere ever targets it -- so a chunk whose exact embedder input
+#     (header + text) is unchanged since ANY prior run reuses its vector from this
+#     table at ZERO provider cost, even after its OWN `chunks` row was deleted and
+#     recreated from scratch by begin_service (a full re-analyze of that service). No
+#     GC is implemented for this table: staging.db is itself a disposable, one-shot
+#     derived cache per workspace (same "delete and recreate, never migrate" reasoning
+#     as every entry above) -- an occasionally stale/orphaned embedding_cache row costs
+#     a few bytes forever, never correctness.
+#
+#     `embedded_hash` (the column T6 added, 3 -> 4 above) CHANGES SEMANTICS here: it
+#     used to store the chunk's `content_hash` AT EMBED TIME; it now stores the
+#     chunk's `input_hash` AT EMBED TIME instead (still written by `set_embeddings`,
+#     still compared inside `chunks_missing_embedding` -- see that method's own
+#     docstring, rewritten for this change). This is not just a rename: content_hash
+#     is blind to the augmentation HEADER (graph position/imports/doc/produces-
+#     consumes-calls...), so a v4 workspace where some OTHER symbol's rename/edge
+#     change altered THIS chunk's header text, with this chunk's OWN source untouched,
+#     silently kept serving a stale embedding forever (embedded_hash == content_hash
+#     never budged -- content_hash cannot see a header-only change by construction).
+#     Comparing against input_hash instead closes that hole for free, since input_hash
+#     already folds the header in -- a header-only change and a text-only change are
+#     now detected through the exact same single comparison.
+#
+#     `input_hash` is populated INDEPENDENTLY of `embedding`/`embed_model`/
+#     `embedded_hash` (at header-fill time, before any embed call happens even runs) --
+#     so it stays OUTSIDE the `chunks` table's existing embedding/embed_model/
+#     embedded_hash CHECK constraint (see `_DDL` in stores/staging.py): a chunk can
+#     legitimately have a non-NULL `input_hash` and a still-NULL `embedding` (freshly
+#     chunked, headers filled, not embedded yet), which that CHECK's NULL-together
+#     invariant says nothing about.
+SCHEMA_VERSION = 5
 NODE_KINDS = frozenset({
     "Service", "Module", "Class", "Function", "Channel", "BusinessProcess",
 })

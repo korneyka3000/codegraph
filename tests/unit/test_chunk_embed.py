@@ -97,7 +97,8 @@ def test_run_chunks_all_services_and_embeds_everything(tmp_path):
     report = chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))
 
     assert report == {
-        "chunks_total": 3, "embedded": 3, "reused": 0, "skipped_no_embedder": 0,
+        "chunks_total": 3, "embedded": 3, "embedded_fresh": 3,
+        "embedded_from_cache": 0, "reused": 0, "skipped_no_embedder": 0,
     }
 
     rows = list(staging.iter_chunks())
@@ -105,7 +106,11 @@ def test_run_chunks_all_services_and_embeds_everything(tmp_path):
     for row in rows:
         assert row.embedding is not None
         assert row.embed_model == "fake-8d"
-        assert row.embedded_hash == row.content_hash
+        # M4 T1: embedded_hash is compared against (and now equals) input_hash, not
+        # content_hash any more -- both are non-None and fresh after a real run
+        # (fill_headers_all always populates input_hash before the embed pass).
+        assert row.input_hash is not None
+        assert row.embedded_hash == row.input_hash
         assert row.context_header is not None
         assert row.context_header.startswith("file:")
 
@@ -136,6 +141,8 @@ def test_rerun_without_changes_embeds_zero_and_reuses_all(tmp_path):
 
     first = chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))
     assert first["embedded"] == first["chunks_total"] == 2
+    assert first["embedded_fresh"] == 2
+    assert first["embedded_from_cache"] == 0
     assert first["reused"] == 0
 
     before = {row.chunk_id: row.embedding for row in staging.iter_chunks()}
@@ -144,9 +151,103 @@ def test_rerun_without_changes_embeds_zero_and_reuses_all(tmp_path):
     assert second["chunks_total"] == 2
     assert second["embedded"] == 0
     assert second["reused"] == 2
+    # These rows were never "missing" at all (WITHIN-run reuse, chunks table
+    # untouched) -- distinct from a genuine embedding_cache HIT (see
+    # test_repeat_run_after_service_rewipe_reuses_persistent_cache_with_zero_
+    # provider_calls below for that path): neither fresh nor cache-sourced.
+    assert second["embedded_fresh"] == 0
+    assert second["embedded_from_cache"] == 0
 
     after = {row.chunk_id: row.embedding for row in staging.iter_chunks()}
     assert after == before  # byte-identical -- nothing was re-embedded
+
+
+# ======================================================================================
+# -- M4 T1: persistent, cross-run embedding cache (Staging.embedding_cache table) --
+# ======================================================================================
+
+
+def test_repeat_run_after_service_rewipe_reuses_persistent_cache_with_zero_provider_calls(
+    tmp_path,
+):
+    """The M4 T1 headline behavior (the master-plan cross-run promise), proven here at
+    the chunk_embed.run level (see tests/integration/test_pipeline_chunk_embed.py for
+    the same proof against the real fixtures, end to end). Unlike
+    test_rerun_without_changes_embeds_zero_and_reuses_all above -- which only proves
+    chunks SURVIVING untouched in staging reuse their in-place embedding (the
+    `reused` counter, `chunks_missing_embedding` never even sees these rows as
+    missing) -- this wipes and regenerates the `chunks` rows themselves (a second
+    `analyze_service` pass over the SAME unchanged files: exactly what a real repeat
+    `codegraph index` run does, since `analyze_service` always begins with its own
+    `begin_service`) and proves the SECOND `run` makes ZERO `embed_batch` calls:
+    every chunk is served from the persistent `embedding_cache` table instead, which
+    `begin_service` never touches."""
+    svc = _write_service(tmp_path, "a", {"m.py": SRC_TWO_FUNCS})
+    cfg = _cfg(svc)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+
+    embedder = _RecordingEmbedder(FakeEmbedder(dim=8))
+    first = chunk_embed.run(cfg, staging, embedder)
+    assert first["chunks_total"] == 2
+    assert first["embedded_fresh"] == 2
+    assert first["embedded_from_cache"] == 0
+    assert first["embedded"] == 2
+    assert len(embedder.batch_sizes) == 1  # one genuine provider call happened
+
+    # keyed by symbol_id, not chunk_id: chunk_ids are stable across the re-analyze
+    # below (same file, same defs, same span-derived ids) anyway, but symbol_id is
+    # the more fundamental invariant this test leans on.
+    before = {row.symbol_id: row.embedding for row in staging.iter_chunks()}
+
+    # Simulate a repeat `codegraph index` run: re-analyze the SAME unchanged files --
+    # begin_service (inside analyze_service) wipes+recreates this service's `chunks`
+    # rows (embedding=NULL) from scratch, with the SAME content -- deterministic ids
+    # and content_hash, so the SAME input_hash once fill_headers_all re-renders it.
+    _analyze_all(cfg, staging, tmp_path)
+    embedder.batch_sizes.clear()
+
+    second = chunk_embed.run(cfg, staging, embedder)
+    assert second["chunks_total"] == 2
+    assert second["embedded_fresh"] == 0  # the master-plan gate itself
+    assert second["embedded_from_cache"] == 2
+    assert second["embedded"] == 2
+    # these rows WERE missing (fresh chunk rows, embedding=NULL) -- served from cache,
+    # not the WITHIN-run "reused" path (which never even calls chunks_missing_embedding
+    # positively for them).
+    assert second["reused"] == 0
+    assert embedder.batch_sizes == []  # embed_batch never called at all
+
+    # The cache-reused vectors are byte-identical to what the first run's real
+    # provider call actually produced.
+    after = {row.symbol_id: row.embedding for row in staging.iter_chunks()}
+    assert after == before
+
+
+def test_embedding_cache_hit_requires_matching_dim(tmp_path):
+    """A cached vector whose DECODED dimension doesn't match the CURRENT embedder's
+    `dim` is treated as a cache MISS, not silently reused (see _embed_missing's own
+    docstring) -- constructed directly (same model_id string, genuinely different
+    dim) rather than relying on a hard-to-arrange natural repro."""
+    svc = _write_service(tmp_path, "a", {"m.py": SRC_ONE_FUNC})
+    cfg = _cfg(svc)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+
+    chunk_embed.run(cfg, staging, FakeEmbedder(dim=8, model_id="shared-model"))
+    assert staging.get_meta("embed_dim") == "8"
+
+    _analyze_all(cfg, staging, tmp_path)  # wipe+recreate this service's chunks rows
+    # SAME model_id string, but a genuinely DIFFERENT dim -- the cached 8-dim vector
+    # under "shared-model" no longer matches this embedder's own dim=4.
+    spy = _RecordingEmbedder(FakeEmbedder(dim=4, model_id="shared-model"))
+    report = chunk_embed.run(cfg, staging, spy)
+
+    assert report["embedded_from_cache"] == 0
+    assert report["embedded_fresh"] == 1  # fell through to a real embed_batch call
+    assert len(spy.batch_sizes) == 1
+    row = next(staging.iter_chunks())
+    assert len(row.embedding) // 4 == 4  # the FRESH (4-dim) vector, not the stale 8-dim one
 
 
 # ======================================================================================
@@ -208,6 +309,11 @@ def test_edited_chunk_only_gets_re_embedded_the_second_time(tmp_path):
     assert second["chunks_total"] == 2
     assert second["embedded"] == 1
     assert second["reused"] == 1
+    # The edited chunk's augmented text (header + new body) is genuinely NEW --
+    # never embedded under this input_hash before -- so this is a real provider
+    # call, not a cache hit.
+    assert second["embedded_fresh"] == 1
+    assert second["embedded_from_cache"] == 0
 
     after = {row.chunk_id: row.embedding for row in staging.iter_chunks()}
     changed = [chunk_id for chunk_id in before if before[chunk_id] != after[chunk_id]]
@@ -273,7 +379,8 @@ def test_run_with_no_embedder_chunks_without_embedding(tmp_path):
     report = chunk_embed.run(cfg, staging, None)
 
     assert report == {
-        "chunks_total": 2, "embedded": 0, "reused": 0, "skipped_no_embedder": 2,
+        "chunks_total": 2, "embedded": 0, "embedded_fresh": 0,
+        "embedded_from_cache": 0, "reused": 0, "skipped_no_embedder": 2,
     }
     rows = list(staging.iter_chunks())
     assert len(rows) == 2
@@ -294,6 +401,8 @@ def test_run_with_no_embedder_then_rerun_with_embedder_embeds_everything(tmp_pat
     chunk_embed.run(cfg, staging, None)
     report = chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))
     assert report["embedded"] == 2
+    assert report["embedded_fresh"] == 2  # nothing was ever cached (no-embedder run)
+    assert report["embedded_from_cache"] == 0
     assert report["skipped_no_embedder"] == 0
 
 
@@ -313,6 +422,8 @@ def test_embed_batches_capped_at_64(tmp_path):
 
     assert report["chunks_total"] == 130
     assert report["embedded"] == 130
+    assert report["embedded_fresh"] == 130  # first run, nothing cached yet
+    assert report["embedded_from_cache"] == 0
     assert spy.batch_sizes == [64, 64, 2]
 
 
@@ -402,6 +513,11 @@ def test_reused_never_negative_when_a_service_is_removed_from_config(tmp_path):
     assert second["embedded"] == 2  # a's (this run) AND b's (stale) rows both embedded
     assert second["chunks_total"] == 2  # workspace-wide total, not "just a's own"
     assert second["embedded"] + second["reused"] == second["chunks_total"]
+    # neither row was ever cached before (the first run had no embedder at all, so
+    # _embed_missing/embedding_cache_put never ran) -- both are genuine provider calls.
+    assert second["embedded_fresh"] == 2
+    assert second["embedded_from_cache"] == 0
+    assert second["embedded_fresh"] + second["embedded_from_cache"] == second["embedded"]
 
 
 # ======================================================================================

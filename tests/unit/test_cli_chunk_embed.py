@@ -105,7 +105,10 @@ def test_index_calls_chunk_embed_between_link_and_load(tmp_path, monkeypatch):
 
     def chunk_embed_spy(cfg, staging, embedder):
         call_order.append("chunk_embed")
-        return {"chunks_total": 0, "embedded": 0, "reused": 0, "skipped_no_embedder": 0}
+        return {
+            "chunks_total": 0, "embedded": 0, "embedded_fresh": 0,
+            "embedded_from_cache": 0, "reused": 0, "skipped_no_embedder": 0,
+        }
 
     def load_spy(staging, store_factory, graph_name):
         call_order.append("load_graph")
@@ -135,7 +138,10 @@ def test_index_passes_make_embedder_result_to_chunk_embed(tmp_path, monkeypatch)
 
     def chunk_embed_spy(cfg, staging, embedder):
         received.append(embedder)
-        return {"chunks_total": 0, "embedded": 0, "reused": 0, "skipped_no_embedder": 0}
+        return {
+            "chunks_total": 0, "embedded": 0, "embedded_fresh": 0,
+            "embedded_from_cache": 0, "reused": 0, "skipped_no_embedder": 0,
+        }
 
     _patch_pipeline(monkeypatch)
     monkeypatch.setattr("codegraph.cli.run_chunk_embed", chunk_embed_spy)
@@ -157,7 +163,10 @@ def test_index_no_embed_flag_skips_make_embedder_and_passes_none(tmp_path, monke
 
     def chunk_embed_spy(cfg, staging, embedder):
         received.append(embedder)
-        return {"chunks_total": 0, "embedded": 0, "reused": 0, "skipped_no_embedder": 0}
+        return {
+            "chunks_total": 0, "embedded": 0, "embedded_fresh": 0,
+            "embedded_from_cache": 0, "reused": 0, "skipped_no_embedder": 0,
+        }
 
     def _boom(cfg):
         raise AssertionError("make_embedder must not be called under --no-embed")
@@ -186,7 +195,10 @@ def test_index_embedder_construction_failure_warns_and_continues_with_none(
 
     def chunk_embed_spy(cfg, staging, embedder):
         received.append(embedder)
-        return {"chunks_total": 0, "embedded": 0, "reused": 0, "skipped_no_embedder": 0}
+        return {
+            "chunks_total": 0, "embedded": 0, "embedded_fresh": 0,
+            "embedded_from_cache": 0, "reused": 0, "skipped_no_embedder": 0,
+        }
 
     def _raise_hint(cfg):
         raise CodegraphError("uv sync --extra local-emb")
@@ -212,7 +224,10 @@ def test_index_report_includes_chunking_stats_from_chunk_embed(tmp_path, monkeyp
     root = _write_workspace(tmp_path, n_services=1, graph_name="wsgraph")
 
     def chunk_embed_spy(cfg, staging, embedder):
-        return {"chunks_total": 7, "embedded": 5, "reused": 2, "skipped_no_embedder": 0}
+        return {
+            "chunks_total": 7, "embedded": 5, "embedded_fresh": 3,
+            "embedded_from_cache": 2, "reused": 2, "skipped_no_embedder": 0,
+        }
 
     _patch_pipeline(monkeypatch)
     monkeypatch.setattr("codegraph.cli.run_chunk_embed", chunk_embed_spy)
@@ -223,7 +238,8 @@ def test_index_report_includes_chunking_stats_from_chunk_embed(tmp_path, monkeyp
 
     report = json.loads((root / ".codegraph" / "report.json").read_text())
     assert report["chunking"] == {
-        "chunks_total": 7, "embedded": 5, "reused": 2, "skipped_no_embedder": 0,
+        "chunks_total": 7, "embedded": 5, "embedded_fresh": 3,
+        "embedded_from_cache": 2, "reused": 2, "skipped_no_embedder": 0,
     }
     assert "chunking" in result.output.lower()
     assert "7" in result.output
@@ -245,7 +261,9 @@ def test_index_dry_run_does_not_call_chunk_embed(tmp_path, monkeypatch):
 
 
 # ======================================================================================
-# -- MINOR-9 (M3 final review): paid-provider warning when embedded>0 and provider!=local
+# -- MINOR-9 (M3 final review; M4 T1 re-gated the trigger from `embedded` to
+# `embedded_fresh` -- a repeat run served entirely from the persistent embedding
+# cache must NOT warn, even though `embedded` (the combined total) is > 0) --
 # ======================================================================================
 
 
@@ -253,7 +271,10 @@ def test_index_warns_about_paid_provider_when_chunks_were_embedded(tmp_path, mon
     root = _write_workspace(tmp_path, graph_name="wsgraph", embedding_provider="openai")
 
     def chunk_embed_spy(cfg, staging, embedder):
-        return {"chunks_total": 5, "embedded": 5, "reused": 0, "skipped_no_embedder": 0}
+        return {
+            "chunks_total": 5, "embedded": 5, "embedded_fresh": 5,
+            "embedded_from_cache": 0, "reused": 0, "skipped_no_embedder": 0,
+        }
 
     _patch_pipeline(monkeypatch)
     monkeypatch.setattr("codegraph.cli.run_chunk_embed", chunk_embed_spy)
@@ -269,7 +290,10 @@ def test_index_no_paid_provider_warning_for_local_provider(tmp_path, monkeypatch
     root = _write_workspace(tmp_path, graph_name="wsgraph")  # default provider: local
 
     def chunk_embed_spy(cfg, staging, embedder):
-        return {"chunks_total": 5, "embedded": 5, "reused": 0, "skipped_no_embedder": 0}
+        return {
+            "chunks_total": 5, "embedded": 5, "embedded_fresh": 5,
+            "embedded_from_cache": 0, "reused": 0, "skipped_no_embedder": 0,
+        }
 
     _patch_pipeline(monkeypatch)
     monkeypatch.setattr("codegraph.cli.run_chunk_embed", chunk_embed_spy)
@@ -284,7 +308,35 @@ def test_index_no_paid_provider_warning_when_nothing_embedded(tmp_path, monkeypa
     root = _write_workspace(tmp_path, graph_name="wsgraph", embedding_provider="voyage")
 
     def chunk_embed_spy(cfg, staging, embedder):
-        return {"chunks_total": 5, "embedded": 0, "reused": 5, "skipped_no_embedder": 0}
+        return {
+            "chunks_total": 5, "embedded": 0, "embedded_fresh": 0,
+            "embedded_from_cache": 0, "reused": 5, "skipped_no_embedder": 0,
+        }
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr("codegraph.cli.run_chunk_embed", chunk_embed_spy)
+    monkeypatch.setattr("codegraph.cli.make_embedder", lambda cfg: _FakeEmbedder())
+
+    result = runner.invoke(app, ["index", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "embedded via" not in result.output
+
+
+def test_index_no_paid_provider_warning_when_everything_served_from_cache(
+    tmp_path, monkeypatch
+):
+    """The M4 T1 regression this whole re-gating exists for: a repeat run against an
+    unchanged, paid-provider workspace has `embedded == 5` (chunks got a usable
+    vector) but `embedded_fresh == 0` (every one of them came from the persistent
+    embedding_cache, zero provider calls) -- must NOT print the paid-provider notice,
+    even though the OLD `embedded > 0` gate would have fired here."""
+    root = _write_workspace(tmp_path, graph_name="wsgraph", embedding_provider="openai")
+
+    def chunk_embed_spy(cfg, staging, embedder):
+        return {
+            "chunks_total": 5, "embedded": 5, "embedded_fresh": 0,
+            "embedded_from_cache": 5, "reused": 0, "skipped_no_embedder": 0,
+        }
 
     _patch_pipeline(monkeypatch)
     monkeypatch.setattr("codegraph.cli.run_chunk_embed", chunk_embed_spy)

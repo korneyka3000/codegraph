@@ -196,6 +196,37 @@ def test_v3_pre_t6_database_raises_invariant_error_not_operational_error(tmp_pat
     assert not isinstance(exc_info.value, sqlite3.OperationalError)
 
 
+def test_v4_pre_m4_database_raises_invariant_error_not_operational_error(tmp_path):
+    """M4 T1's own 4 -> 5 bump, pinned specifically (same pattern as the v2/v3 tests
+    above): a v4-shaped staging.db (pre-M4: `chunks` has `embedded_hash` + its CHECK
+    constraint, per T6's DDL, but no `input_hash` column -- and no `embedding_cache`
+    table at all) must fail with the loud, actionable InvariantError at Staging()
+    construction -- via the version-check-BEFORE-DDL path -- never by letting any
+    input_hash/embedding_cache-referencing SQL reach the old table (or a missing
+    table) and raise a raw sqlite3.OperationalError."""
+    path = tmp_path / "v4.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    raw.execute("INSERT INTO meta VALUES ('schema_version', '4')")
+    # the v4-era chunks table shape (T6's DDL -- embedded_hash + CHECK, but no
+    # input_hash column), so an unguarded input_hash query genuinely WOULD
+    # OperationalError -- and there is no embedding_cache table at all yet.
+    raw.execute(
+        "CREATE TABLE chunks(chunk_id TEXT PRIMARY KEY, symbol_id TEXT, service TEXT, "
+        "relpath TEXT, ord INTEGER, text TEXT, start_line INTEGER, end_line INTEGER, "
+        "content_hash TEXT, context_header TEXT, embedding BLOB, embed_model TEXT, "
+        "embedded_hash TEXT, "
+        "CHECK ((embedding IS NULL) = (embed_model IS NULL) "
+        "AND (embedding IS NULL) = (embedded_hash IS NULL)))"
+    )
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(InvariantError, match="recreate") as exc_info:
+        Staging(path)
+    assert not isinstance(exc_info.value, sqlite3.OperationalError)
+
+
 def test_fresh_staging_path_still_initializes_after_version_check_reorder(tmp_path):
     """The fresh-create path (no pre-existing file, no meta table at all) must keep
     working after the version-check-before-DDL reorder above -- pins the exact failure
@@ -609,6 +640,7 @@ def test_upsert_chunks_and_chunks_for_service_round_trip(tmp_path):
     assert row.embedding is None
     assert row.embed_model is None
     assert row.embedded_hash is None
+    assert row.input_hash is None
 
 
 def test_chunks_for_service_scoped_by_service(tmp_path):
@@ -623,12 +655,17 @@ def test_chunks_missing_embedding_filters_correctly(tmp_path):
     st = Staging(tmp_path / "s.db")
     c1, c2, c3 = _chunk("c1#c0", "c1", 0), _chunk("c2#c0", "c2", 0), _chunk("c3#c0", "c3", 0)
     st.upsert_chunks("a", "m.py", [c1, c2, c3])
+    # M4 T1: embedded_hash is compared against input_hash now (not content_hash) --
+    # set_input_hashes simulates fill_headers_all's write-back so "up to date" is
+    # exercised for real, not by coincidence of a NULL input_hash column.
+    st.set_input_hashes([("c1#c0", "ih-c1"), ("c2#c0", "ih-c2"), ("c3#c0", "ih-c3")])
     st.set_embeddings([
-        ("c1#c0", b"\x00\x01", "model-a", c1.content_hash),
-        ("c2#c0", b"\x02\x03", "model-old", c2.content_hash),
+        ("c1#c0", b"\x00\x01", "model-a", "ih-c1"),
+        ("c2#c0", b"\x02\x03", "model-old", "ih-c2"),
     ])
 
-    # c1: embedded under the CURRENT model, hash matches (up to date) -- not missing.
+    # c1: embedded under the CURRENT model, embedded_hash matches its current
+    # input_hash (up to date) -- not missing.
     # c2: embedded, but under a DIFFERENT (stale) model -- missing.
     # c3: never embedded at all -- missing.
     missing = {r.chunk_id for r in st.chunks_missing_embedding("model-a")}
@@ -636,37 +673,76 @@ def test_chunks_missing_embedding_filters_correctly(tmp_path):
 
 
 def test_chunks_missing_embedding_flags_stale_embedded_hash(tmp_path):
-    """M3 T6 carry (cache hardening): a chunk embedded under the CURRENT model, whose
-    `embedded_hash` no longer matches its CURRENT `content_hash` (simulates a
-    same-chunk_id content edit that landed between the embed and this check, e.g. a
-    file changed within one staging session with no intervening `begin_service`), must
-    still be flagged -- embedding presence + matching model alone are NOT enough."""
+    """M4 T1 (was content_hash-keyed through M3 T6, see core/schema.py's
+    SCHEMA_VERSION "4 -> 5" history entry): a chunk embedded under the CURRENT model,
+    whose `embedded_hash` no longer matches its CURRENT `input_hash`, must still be
+    flagged -- embedding presence + matching model alone are NOT enough. Editing a
+    chunk's text alone is NOT, by itself, enough to retrigger this any more (a
+    same-chunk_id `upsert_chunks` re-upsert leaves BOTH `embedded_hash` and
+    `input_hash` untouched, so they still agree with each other even though the text
+    changed) -- staleness only becomes visible once `input_hash` is refreshed (the
+    real pipeline does this via `chunking.augment.fill_headers_all`, ALWAYS called
+    before `chunk_embed._embed_missing` -- see that function's own docstring), which
+    this test simulates directly via `set_input_hashes`."""
     st = Staging(tmp_path / "s.db")
     c1 = _chunk("c1#c0", "c1", 0, text="original")
     st.upsert_chunks("a", "m.py", [c1])
-    st.set_embeddings([("c1#c0", b"\xaa", "model-a", c1.content_hash)])
+    st.set_input_hashes([("c1#c0", "ih-v1")])
+    st.set_embeddings([("c1#c0", b"\xaa", "model-a", "ih-v1")])
     assert st.chunks_missing_embedding("model-a") == []  # up to date immediately after
 
     # re-upsert the SAME chunk_id with DIFFERENT text -- content_hash changes,
-    # embedding/embed_model/embedded_hash survive untouched (upsert_chunks' own
-    # ON CONFLICT contract).
+    # embedding/embed_model/embedded_hash/input_hash all survive untouched (upsert_
+    # chunks' own ON CONFLICT contract) -- so embedded_hash and input_hash STILL
+    # agree (both "ih-v1"): not yet flagged, since nothing recomputed input_hash.
     st.upsert_chunks("a", "m.py", [_chunk("c1#c0", "c1", 0, text="edited")])
+    assert st.chunks_missing_embedding("model-a") == []
+
+    # NOW simulate fill_headers_all recomputing input_hash for the edited text.
+    st.set_input_hashes([("c1#c0", "ih-v2")])
+    missing = {r.chunk_id for r in st.chunks_missing_embedding("model-a")}
+    assert missing == {"c1#c0"}
+
+
+def test_chunks_missing_embedding_flags_header_change_with_same_content_hash(tmp_path):
+    """M4 T1's own headline fix (the v4 hole input_hash-keying closes): a chunk whose
+    TEXT never changed (content_hash identical throughout, so a v4/content_hash-keyed
+    check would see NOTHING to flag) but whose augmentation HEADER did (e.g. some
+    OTHER symbol elsewhere in the graph got renamed or gained a new edge, changing
+    THIS chunk's `graph:`/`imports:` line with this chunk's own source untouched)
+    must still be flagged for re-embedding -- input_hash folds the header into the
+    hash, so this is visible through the exact same comparison as a text change."""
+    st = Staging(tmp_path / "s.db")
+    c1 = _chunk("c1#c0", "c1", 0, text="same text throughout")
+    st.upsert_chunks("a", "m.py", [c1])
+    st.set_input_hashes([("c1#c0", "ih-header-v1")])
+    st.set_embeddings([("c1#c0", b"\xaa", "model-a", "ih-header-v1")])
+    assert st.chunks_missing_embedding("model-a") == []  # up to date
+
+    # re-upsert with IDENTICAL text -- content_hash is unchanged.
+    st.upsert_chunks("a", "m.py", [c1])
+    assert st.chunks_for_service("a")[0].content_hash == c1.content_hash
+
+    # ...but the header changed for some unrelated graph reason -- input_hash follows.
+    st.set_input_hashes([("c1#c0", "ih-header-v2")])
 
     missing = {r.chunk_id for r in st.chunks_missing_embedding("model-a")}
     assert missing == {"c1#c0"}
 
 
-def test_set_embeddings_and_set_context_headers(tmp_path):
+def test_set_embeddings_set_context_headers_and_set_input_hashes(tmp_path):
     st = Staging(tmp_path / "s.db")
     c1 = _chunk("c1#c0", "c1", 0)
     st.upsert_chunks("a", "m.py", [c1])
-    st.set_embeddings([("c1#c0", b"\x01\x02\x03", "model-a", c1.content_hash)])
+    st.set_input_hashes([("c1#c0", "ih-1")])
+    st.set_embeddings([("c1#c0", b"\x01\x02\x03", "model-a", "ih-1")])
     st.set_context_headers([("c1#c0", "file: m.py")])
 
     row = st.chunks_for_service("a")[0]
     assert row.embedding == b"\x01\x02\x03"
     assert row.embed_model == "model-a"
-    assert row.embedded_hash == c1.content_hash
+    assert row.embedded_hash == "ih-1"
+    assert row.input_hash == "ih-1"
     assert row.context_header == "file: m.py"
 
 
@@ -674,6 +750,7 @@ def test_set_embeddings_noop_for_missing_chunk_id(tmp_path):
     st = Staging(tmp_path / "s.db")
     st.set_embeddings([("nope#c0", b"\x00", "model-a", "somehash")])  # must not raise
     st.set_context_headers([("nope#c0", "header")])  # must not raise
+    st.set_input_hashes([("nope#c0", "somehash")])  # must not raise
 
 
 def test_begin_service_clears_chunks(tmp_path):
@@ -700,40 +777,153 @@ def test_iter_chunks_across_services(tmp_path):
 
 def test_upsert_chunks_preserves_embedding_on_conflict_same_content(tmp_path):
     """Re-upserting the SAME chunk_id (identical content) must not wipe an
-    already-set embedding -- `ON CONFLICT DO UPDATE` only ever touches the
-    content-derived columns, which is what makes T6's chunk_embed.run idempotent on
-    a repeated call (see upsert_chunks' own docstring)."""
+    already-set embedding (or its input_hash) -- `ON CONFLICT DO UPDATE` only ever
+    touches the content-derived columns, which is what makes chunk_embed.run
+    idempotent on a repeated call (see upsert_chunks' own docstring)."""
     st = Staging(tmp_path / "s.db")
     c1 = _chunk("c1#c0", "c1", 0, text="same text")
     st.upsert_chunks("a", "m.py", [c1])
-    st.set_embeddings([("c1#c0", b"\xaa\xbb", "model-a", c1.content_hash)])
+    st.set_input_hashes([("c1#c0", "ih-1")])
+    st.set_embeddings([("c1#c0", b"\xaa\xbb", "model-a", "ih-1")])
 
     st.upsert_chunks("a", "m.py", [c1])  # re-chunk, identical content
     row = st.chunks_for_service("a")[0]
     assert row.embedding == b"\xaa\xbb"
     assert row.embed_model == "model-a"
-    assert row.embedded_hash == c1.content_hash
+    assert row.embedded_hash == "ih-1"
+    assert row.input_hash == "ih-1"
 
 
 def test_upsert_chunks_updates_text_on_conflict_when_content_changes(tmp_path):
-    """M3 T6 carry fix: this test used to document the OPPOSITE as an accepted
-    limitation ("the now-stale embedding survives... not content_hash freshness") --
-    embedded_hash now closes that gap, see chunks_missing_embedding's own docstring."""
+    """upsert_chunks' ON CONFLICT contract: content-derived columns (text/
+    content_hash) update in place; the augmentation/embedding-cache columns it never
+    writes (context_header/embedding/embed_model/embedded_hash/input_hash) all survive
+    untouched -- INCLUDING when the content itself changed. The resulting STALE
+    input_hash (still describing the OLD text) is exactly why re-detecting staleness
+    needs a fresh `fill_headers_all` pass to recompute it -- see
+    test_chunks_missing_embedding_flags_stale_embedded_hash for that mechanism, pinned
+    directly at the chunks_missing_embedding level."""
     st = Staging(tmp_path / "s.db")
     c1 = _chunk("c1#c0", "c1", 0, text="old text")
     st.upsert_chunks("a", "m.py", [c1])
-    st.set_embeddings([("c1#c0", b"\xaa", "model-a", c1.content_hash)])
+    st.set_input_hashes([("c1#c0", "ih-old")])
+    st.set_embeddings([("c1#c0", b"\xaa", "model-a", "ih-old")])
 
     c1_edited = _chunk("c1#c0", "c1", 0, text="new text, edited")
     st.upsert_chunks("a", "m.py", [c1_edited])
     row = st.chunks_for_service("a")[0]
     assert row.text == "new text, edited"
     assert row.content_hash == c1_edited.content_hash
-    # the OLD embedding blob itself still sits in the column (upsert_chunks never
-    # touches it) -- but embedded_hash (still c1's ORIGINAL hash) now disagrees with
-    # the fresh content_hash, so chunks_missing_embedding correctly flags this row for
-    # re-embedding instead of silently serving a stale vector forever.
+    # the OLD embedding blob, embedded_hash AND input_hash all still sit in their
+    # columns untouched (upsert_chunks never writes any of them) -- input_hash is now
+    # stale (still describes the OLD text), which is what lets a LATER
+    # fill_headers_all pass detect the staleness (see this test's own docstring).
     assert row.embedding == b"\xaa"
-    assert row.embedded_hash == c1.content_hash
-    missing_ids = {r.chunk_id for r in st.chunks_missing_embedding("model-a")}
-    assert "c1#c0" in missing_ids
+    assert row.embedded_hash == "ih-old"
+    assert row.input_hash == "ih-old"
+
+
+# -- M4 T1: chunks.input_hash (set_input_hashes) + the persistent, cross-run
+# embedding_cache table (embedding_cache_get/embedding_cache_put) --
+
+
+def test_set_input_hashes_round_trips(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [_chunk("c1#c0", "c1", 0)])
+    assert st.chunks_for_service("a")[0].input_hash is None
+
+    st.set_input_hashes([("c1#c0", "ih-1")])
+    assert st.chunks_for_service("a")[0].input_hash == "ih-1"
+
+
+def test_set_input_hashes_survives_begin_service_of_a_different_service(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [_chunk("ca#c0", "ca", 0)])
+    st.set_input_hashes([("ca#c0", "ih-a")])
+    st.begin_service("b")  # unrelated service
+    assert st.chunks_for_service("a")[0].input_hash == "ih-a"
+
+
+def test_embedding_cache_put_and_get_round_trip(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.embedding_cache_put([("ih-1", "model-a", 8, b"\x00" * 32)])
+    assert st.embedding_cache_get([("ih-1", "model-a")]) == {
+        ("ih-1", "model-a"): b"\x00" * 32,
+    }
+
+
+def test_embedding_cache_get_empty_pairs_returns_empty_dict_without_querying(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    assert st.embedding_cache_get([]) == {}
+
+
+def test_embedding_cache_get_omits_unknown_pairs_rather_than_none(tmp_path):
+    """A cache miss is simply ABSENT from the returned dict -- never a `None` value --
+    mirroring this module's existing "absent, not null" convention elsewhere."""
+    st = Staging(tmp_path / "s.db")
+    st.embedding_cache_put([("ih-1", "model-a", 8, b"\xaa" * 32)])
+    got = st.embedding_cache_get([("ih-1", "model-a"), ("nope", "model-a")])
+    assert got == {("ih-1", "model-a"): b"\xaa" * 32}
+    assert ("nope", "model-a") not in got
+
+
+def test_embedding_cache_get_scoped_by_model_not_just_input_hash(tmp_path):
+    """The SAME input_hash embedded under two DIFFERENT models are two distinct cache
+    entries -- a lookup for one model must never return the other's vector (a model
+    switch must genuinely re-embed, per chunks_missing_embedding's own model-mismatch
+    disjunct)."""
+    st = Staging(tmp_path / "s.db")
+    st.embedding_cache_put([("ih-1", "model-a", 8, b"\xaa" * 32)])
+    assert st.embedding_cache_get([("ih-1", "model-b")]) == {}
+    assert st.embedding_cache_get([("ih-1", "model-a")]) == {
+        ("ih-1", "model-a"): b"\xaa" * 32,
+    }
+
+
+def test_embedding_cache_get_batches_multiple_pairs_across_models(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.embedding_cache_put([
+        ("ih-1", "model-a", 4, b"\x01" * 4),
+        ("ih-2", "model-a", 4, b"\x02" * 4),
+        ("ih-1", "model-b", 4, b"\x03" * 4),
+    ])
+    got = st.embedding_cache_get(
+        [("ih-1", "model-a"), ("ih-2", "model-a"), ("ih-1", "model-b"), ("missing", "model-a")]
+    )
+    assert got == {
+        ("ih-1", "model-a"): b"\x01" * 4,
+        ("ih-2", "model-a"): b"\x02" * 4,
+        ("ih-1", "model-b"): b"\x03" * 4,
+    }
+
+
+def test_embedding_cache_put_replaces_on_same_key(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.embedding_cache_put([("ih-1", "model-a", 8, b"\x00" * 32)])
+    st.embedding_cache_put([("ih-1", "model-a", 8, b"\xff" * 32)])
+    assert st.embedding_cache_get([("ih-1", "model-a")]) == {
+        ("ih-1", "model-a"): b"\xff" * 32,
+    }
+
+
+def test_embedding_cache_survives_begin_service(tmp_path):
+    """The headline M4 T1 contract: unlike `chunks` itself, `embedding_cache` is NEVER
+    wiped by `begin_service` -- it has no `service` column at all, and this is the
+    exact mechanism that lets a chunk whose `chunks` row was deleted and recreated
+    from scratch (a real service re-analyze) still reuse its vector at zero provider
+    cost (see core/schema.py's SCHEMA_VERSION "4 -> 5" history entry)."""
+    st = Staging(tmp_path / "s.db")
+    st.embedding_cache_put([("ih-1", "model-a", 8, b"\x00" * 32)])
+    st.begin_service("a")
+    assert st.embedding_cache_get([("ih-1", "model-a")]) == {
+        ("ih-1", "model-a"): b"\x00" * 32,
+    }
+
+
+def test_embedding_cache_survives_clear_workspace_layer(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.embedding_cache_put([("ih-1", "model-a", 8, b"\x00" * 32)])
+    st.clear_workspace_layer()
+    assert st.embedding_cache_get([("ih-1", "model-a")]) == {
+        ("ih-1", "model-a"): b"\x00" * 32,
+    }

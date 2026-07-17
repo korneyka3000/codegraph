@@ -38,7 +38,8 @@ LINK_STATS = {
     "next_segments": 3, "processes": 2, "marks": 1, "channels_gc": 4,
 }
 CHUNK_STATS = {
-    "chunks_total": 42, "embedded": 40, "reused": 2, "skipped_no_embedder": 0,
+    "chunks_total": 42, "embedded": 40, "embedded_fresh": 30,
+    "embedded_from_cache": 10, "reused": 2, "skipped_no_embedder": 0,
 }
 
 
@@ -276,13 +277,17 @@ def test_print_report_shows_chunking_summary_when_present():
     text = console.export_text()
 
     assert "chunking" in text.lower()
-    for value in ("42", "40", "2"):  # chunks_total, embedded, reused
+    # chunks_total, embedded_fresh, embedded_from_cache, reused
+    for value in ("42", "30", "10", "2"):
         assert value in text
+    assert "fresh" in text.lower()
+    assert "cached" in text.lower()
 
 
 def test_print_report_shows_skipped_no_embedder_when_nonzero():
     degraded_chunk_stats = {
-        "chunks_total": 10, "embedded": 0, "reused": 0, "skipped_no_embedder": 10,
+        "chunks_total": 10, "embedded": 0, "embedded_fresh": 0,
+        "embedded_from_cache": 0, "reused": 0, "skipped_no_embedder": 10,
     }
     report = build_report([SERVICE_OK], LOAD_STATS, chunk_stats=degraded_chunk_stats)
     console = Console(record=True, width=200)
@@ -298,6 +303,23 @@ def test_print_report_hides_skipped_no_embedder_when_zero():
     print_report(report, console)
     text = console.export_text()
     assert "skipped_no_embedder" not in text.lower()
+
+
+def test_print_report_chunking_summary_defaults_missing_fresh_cache_keys_to_zero():
+    """M4 T1 added embedded_fresh/embedded_from_cache -- a chunk_stats dict that
+    doesn't carry them (e.g. a pre-M4 report.json, or any future caller that only
+    ever knew about the older key set) must not KeyError; the printed line degrades
+    to "0 fresh + 0 cached" rather than crashing (same defensive `.get(..., 0)`
+    convention as every other field this function reads)."""
+    pre_m4_shaped_chunk_stats = {
+        "chunks_total": 5, "embedded": 5, "reused": 0, "skipped_no_embedder": 0,
+    }
+    report = build_report([SERVICE_OK], LOAD_STATS, chunk_stats=pre_m4_shaped_chunk_stats)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise
+    text = console.export_text()
+    assert "0 fresh" in text
+    assert "0 cached" in text
 
 
 def test_print_report_no_chunking_line_when_absent():
