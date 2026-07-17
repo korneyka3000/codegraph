@@ -113,6 +113,32 @@ def test_upsert_edges_cross_origin_service_pk_collision_preserves_first_writer(t
     assert row[0] == "svc-a"
 
 
+def test_upsert_edges_cross_origin_service_pk_collision_mirror_order_first_writer_wins(tmp_path):
+    """Mirror of the test above with the write ORDER swapped (svc-b first): svc-b's
+    row must survive svc-a's later conflicting write. Pins that the guard's WHERE
+    clause is genuinely SYMMETRIC ("whichever origin writes first wins") rather than
+    accidentally favoring one hardcoded service/ordering -- without this, a
+    regression that, say, compared against a fixed service name (or inverted the IS
+    comparison) could still pass the one-ordering test above."""
+    st = Staging(tmp_path / "s.db")
+    e_b = EdgeRec("chan:kafka_topic:t", "chan:event_type:e", "CONTAINS", "static", 1.0,
+                  "kafka", evidence_file="b.py", evidence_line=2)
+    st.upsert_edges([e_b], origin_service="svc-b")
+
+    e_a = EdgeRec("chan:kafka_topic:t", "chan:event_type:e", "CONTAINS", "static", 1.0,
+                  "kafka", evidence_file="a.py", evidence_line=1)
+    st.upsert_edges([e_a], origin_service="svc-a")
+
+    edges = list(st.iter_edges())
+    assert len(edges) == 1
+    assert edges[0].evidence_file == "b.py"  # first writer (svc-b this time) still wins
+    row = st._db.execute(  # noqa: SLF001 -- origin_service isn't surfaced by iter_edges()
+        "SELECT origin_service FROM edges WHERE src=? AND dst=? AND type=?",
+        (e_b.src, e_b.dst, e_b.type),
+    ).fetchone()
+    assert row[0] == "svc-b"
+
+
 def test_upsert_edges_same_origin_service_re_upsert_still_replaces(tmp_path):
     """The new cross-origin guard must never block a service from refreshing its OWN
     row (e.g. a re-run after that file's content changed) -- full REPLACE semantics

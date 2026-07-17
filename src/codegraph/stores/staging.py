@@ -534,8 +534,28 @@ class Staging:
         DIFFERENT owner, never self-overwrite; a row with no owner yet
         (origin_service IS NULL, e.g. S7/linking-derived) can still be claimed by
         anyone, matching the pre-fix behavior for that case exactly (see
-        tests/unit/test_staging.py's three dedicated tests for these three
-        branches)."""
+        tests/unit/test_staging.py's dedicated tests for these branches, including
+        the mirror-ordering one pinning that the WHERE clause is symmetric --
+        whichever origin writes first wins, not one hardcoded service). Note the
+        loser's write is discarded WHOLESALE: every non-key column it carried
+        (resolution/confidence/extractor/evidence_file/evidence_line/props), not
+        just the ownership fields -- the same all-columns-at-once shape the old
+        blind REPLACE had, only now the outcome is deterministic instead of
+        order-dependent.
+
+        KNOWN RESIDUAL GAP (M4 T7, deliberately not closed here -- needs a schema
+        change): if the CURRENT owner of a shared PK stops emitting that edge (e.g.
+        its producer/consumer registration is deleted from source) in a run where
+        the OTHER, still-asserting service is `--incremental`-SKIPPED, the owner's
+        own delete_file_layer/begin_service correctly clears the row -- and nothing
+        re-inserts it, because the sibling that still legitimately asserts it was
+        never reprocessed. The edge then wrongly stays absent until the sibling's
+        next non-skip run (and, mirror-wise, a full reindex of the same tree WOULD
+        have it -- a dump-equivalence divergence). Fully closing this requires
+        per-origin edge rows (origin_service joins the PK, both assertions coexist,
+        deletion becomes exact) -- a real SCHEMA_VERSION bump, tracked in the M4
+        backlog (.superpowers/sdd/progress.md, "M4-T7 backlog carry"), out of scope
+        for the conflict-resolution fix above."""
         prepared = []
         for e in rows:
             ss, ds = _id_service(e.src), _id_service(e.dst)
