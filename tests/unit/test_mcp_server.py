@@ -7,12 +7,15 @@ degraded build_server вообще поднимается (serve без embedder
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 import codegraph.mcp.server as server_mod
 from codegraph.config.models import ServiceConfig, WorkspaceConfig
 from codegraph.core.errors import CodegraphError
 from codegraph.embedding.fake import FakeEmbedder
+from codegraph.query.api import GraphQuery
 
 
 def _cfg(tmp_path) -> WorkspaceConfig:
@@ -67,6 +70,41 @@ def test_default_embedder_factory_propagates_non_codegraph_errors(tmp_path, monk
     factory = server_mod._default_embedder_factory(_cfg(tmp_path))
     with pytest.raises(ValueError):
         factory()
+
+
+def test_default_embedder_factory_logs_loading_message_before_the_real_build(
+    tmp_path, monkeypatch, caplog
+):
+    """M4 T2 (backlog polish): a logger.info("loading embedding model ...") sits
+    immediately before the (possibly multi-second: sentence-transformers model
+    download/load, or a first HTTP handshake) real make_embedder() call inside the
+    factory closure -- so a user watching `codegraph serve`'s stderr understands what
+    the pause on their FIRST search_code/find_entrypoint call is, instead of a
+    server that looks hung. The factory itself is cheap/stateless -- the "first call
+    logs, second doesn't" contract is GraphQuery._get_embedder's cache one layer up
+    (it never calls embedder_factory() again once it has a non-None embedder, see
+    test_query_api.py's own test_get_embedder_caches_after_first_successful_
+    creation) -- proven here through the REAL factory wired into a REAL GraphQuery,
+    not a fake, so this pins the actual integration, not just the two pieces
+    separately."""
+    embedder = FakeEmbedder(dim=4)
+    monkeypatch.setattr(server_mod, "make_embedder", lambda embedding_cfg: embedder)
+    cfg = _cfg(tmp_path)
+    q = GraphQuery(
+        store_factory=lambda: None,  # never touched by _get_embedder()
+        service_paths={},
+        embedder_factory=server_mod._default_embedder_factory(cfg),
+    )
+
+    with caplog.at_level(logging.INFO, logger=server_mod.__name__):
+        first = q._get_embedder()
+        second = q._get_embedder()
+
+    assert first is embedder
+    assert second is embedder
+    loading_logs = [m for m in caplog.messages if "loading embedding model" in m]
+    assert len(loading_logs) == 1  # logged once (first call) -- not again on the cached second
+    assert cfg.embedding.model in loading_logs[0]
 
 
 def test_build_server_constructs_fine_when_make_embedder_raises(tmp_path, monkeypatch):

@@ -60,6 +60,19 @@ def _weakest_resolution(a: str, b: str) -> str:
     return "static" if a == "static" and b == "static" else "heuristic"
 
 
+def _is_channel_containment(e: EdgeRec) -> bool:
+    """M4 T2 (M3 final review triage) scale prefilter: the topic<->event_type CONTAINS
+    map below only ever pairs Channel nodes (kafka_ext.py emits topic_chan.id ->
+    event_chan.id, both "chan:"-prefixed -- see its own CONTAINS call sites). Plain
+    code-structure CONTAINS edges (python_core.py: "svc:"-prefixed/plain symbol ids,
+    module/class/function AST nesting -- can vastly outnumber channel edges in a real
+    codebase) can never match a producer/consumer dict key (those are ALWAYS keyed by
+    a Channel id -- the dst of PRODUCES/CALLS_HTTP/CONSUMES or the src of HANDLES), so
+    keeping them out of contains_pairs changes scan scope only, never derive()'s
+    output (see this module's own tests for the behavior-preserving proof)."""
+    return e.src.startswith("chan:") and e.dst.startswith("chan:")
+
+
 def _next_segment_edge(x_id: str, x_edge: EdgeRec, y_id: str, y_edge: EdgeRec,
                         via_channel_id: str) -> EdgeRec:
     return EdgeRec(
@@ -83,7 +96,7 @@ def derive(staging: Staging) -> dict:
             consumers.setdefault(e.dst, []).append((e.src, e))
         elif e.type == "HANDLES":
             consumers.setdefault(e.src, []).append((e.dst, e))
-        elif e.type == "CONTAINS":
+        elif e.type == "CONTAINS" and _is_channel_containment(e):
             contains_pairs.append((e.src, e.dst))
 
     for lst in (*producers.values(), *consumers.values()):

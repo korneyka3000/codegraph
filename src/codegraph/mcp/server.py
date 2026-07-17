@@ -59,6 +59,17 @@ def _default_embedder_factory(cfg: WorkspaceConfig) -> Callable[[], Embedder | N
     docstring); writing anything to stdout here would corrupt that protocol stream."""
 
     def factory() -> Embedder | None:
+        # M4 T2: logged immediately before the real (possibly multi-second --
+        # sentence-transformers model load/download, or a first provider API
+        # handshake) construction call, NOT after -- a user watching `codegraph
+        # serve`'s stderr on their first search_code/find_entrypoint call sees WHY
+        # the server is pausing instead of it looking hung. Fires exactly once per
+        # GraphQuery lifetime in practice: GraphQuery._get_embedder() caches any
+        # non-None result and never calls this factory again afterwards (see its own
+        # docstring) -- this factory has no cache of its own, that's deliberate,
+        # _get_embedder already owns caching policy.
+        logger.info("loading embedding model %s (provider=%s)...", cfg.embedding.model,
+                    cfg.embedding.provider)
         try:
             return make_embedder(cfg.embedding)
         except CodegraphError as e:

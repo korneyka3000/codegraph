@@ -2,10 +2,13 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+import codegraph
+from codegraph import cli
 from codegraph.cli import app
 
 runner = CliRunner()
 FIXTURES_WS = Path(__file__).parents[2] / "fixtures" / "workspace.yaml"
+REPO_ROOT = Path(__file__).parents[2]
 
 
 def test_index_dry_run_lists_stages_and_services():
@@ -48,6 +51,28 @@ def test_init_defaults_to_cwd(tmp_path, monkeypatch):
     result = runner.invoke(app, ["init"])
     assert result.exit_code == 0, result.output
     assert (tmp_path / "codegraph.yaml").exists()
+
+
+# -- M4 T2: TEMPLATE must be wheel-safe (importlib.resources, not a repo-root-escaping
+# Path(__file__).parent.parent.parent) -- a wheel install has no repo checkout beside
+# it, so the old construction would raise FileNotFoundError there. These tests can't
+# build+install a real wheel, but they pin the structural property that actually
+# guarantees wheel-safety: TEMPLATE must resolve INSIDE the codegraph package tree.
+
+
+def test_template_lives_inside_the_package_not_via_repo_root_escape():
+    package_root = str(Path(codegraph.__file__).parent)
+    assert str(cli.TEMPLATE).startswith(package_root)
+
+
+def test_root_and_packaged_example_yaml_copies_are_byte_identical():
+    """Root-level codegraph.example.yaml (kept for humans browsing the repo) must
+    never drift from the packaged copy under src/codegraph/data/ that `codegraph
+    init`/TEMPLATE actually reads (the packaged copy is the source of truth) -- this
+    only catches the two copies diverging, it doesn't enforce which one to edit."""
+    root_copy = REPO_ROOT / "codegraph.example.yaml"
+    packaged_copy = REPO_ROOT / "src" / "codegraph" / "data" / "codegraph.example.yaml"
+    assert root_copy.read_bytes() == packaged_copy.read_bytes()
 
 
 # test_stub_commands_exit_2 (M2-era: asserted `codegraph eval` alone exited 2 with

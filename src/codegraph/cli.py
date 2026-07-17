@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.resources
 import warnings
 from pathlib import Path
 
@@ -177,7 +178,15 @@ def doctor(
     raise typer.Exit(0 if ok else 1)
 
 
-TEMPLATE = Path(__file__).parent.parent.parent / "codegraph.example.yaml"
+# M4 T2 (wheel-safe packaging): reads from the INSTALLED package's own data dir
+# (src/codegraph/data/codegraph.example.yaml -- ships as package data, see
+# pyproject.toml), not a repo-root-relative Path(__file__).parent.parent.parent --
+# that old construction reached OUTSIDE the package entirely and raised
+# FileNotFoundError from a real wheel install (no repo checkout sits beside
+# site-packages/codegraph/). A byte-identical copy stays at the repo root for humans
+# browsing the checkout (see tests/unit/test_cli.py's drift-guard test) -- the
+# packaged copy above is the source of truth.
+TEMPLATE = importlib.resources.files("codegraph") / "data" / "codegraph.example.yaml"
 
 
 def _make_embedder_or_warn(cfg: WorkspaceConfig):

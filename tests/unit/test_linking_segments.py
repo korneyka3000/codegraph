@@ -223,6 +223,60 @@ def test_empty_staging_derives_nothing(tmp_path):
 # -- parallel channels between the same (X, Y) pair (M3 final review fix) --
 
 
+# -- M4 T2 (M3 final review triage): contains_pairs scale prefilter -- topic/event
+# CONTAINS edges (kafka_ext.py: chan:topic -> chan:event) are the only ones that can
+# ever join the producer/consumer channel-id-keyed maps below; code-structure CONTAINS
+# edges (python_core.py: svc:x -> module, module -> class/function nesting -- can vastly
+# outnumber channel edges in a real codebase) can never match a channel id and are
+# filtered out before ever entering contains_pairs, not merely ignored downstream.
+
+
+def test_is_channel_containment_true_for_channel_to_channel_edge():
+    e = _edge("chan:kafka_topic:T", "chan:event_type:E", "CONTAINS")
+    assert segments._is_channel_containment(e) is True
+
+
+def test_is_channel_containment_false_for_code_structure_contains_edge():
+    e = _edge("svc:orders-api", "sym:orders-api:app", "CONTAINS")
+    assert segments._is_channel_containment(e) is False
+
+
+def test_is_channel_containment_false_when_only_one_side_is_a_channel():
+    # AND, not OR -- a real topic/event CONTAINS edge always has BOTH endpoints on
+    # Channel nodes (see kafka_ext.py); a single chan:-prefixed side proves nothing.
+    topic_to_code = _edge("chan:kafka_topic:T", "sym:a:x", "CONTAINS")
+    code_to_event = _edge("sym:a:x", "chan:event_type:E", "CONTAINS")
+    assert segments._is_channel_containment(topic_to_code) is False
+    assert segments._is_channel_containment(code_to_event) is False
+
+
+def test_code_structure_contains_edges_do_not_affect_channel_derivation(tmp_path):
+    """Noise robustness: a batch of code-structure CONTAINS edges (AST nesting shape,
+    NOT channel containment) sitting alongside a real topic/event containment pairing
+    must not change derive()'s output -- the scale prefilter changes scan SCOPE only,
+    never behavior (see module docstring/brief)."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_edges([
+        _edge("svc:orders-api", "sym:orders-api:app", "CONTAINS"),
+        _edge("sym:orders-api:app", "sym:orders-api:app.OrderService", "CONTAINS"),
+        _edge(
+            "sym:orders-api:app.OrderService", "sym:orders-api:app.OrderService.create",
+            "CONTAINS",
+        ),
+        _edge("chan:kafka_topic:T", "chan:event_type:E", "CONTAINS"),
+        _edge("sym:a:x", "chan:event_type:E", "PRODUCES", resolution="static", confidence=1.0),
+        _edge("sym:b:y", "chan:kafka_topic:T", "CONSUMES", resolution="heuristic", confidence=0.6),
+    ])
+
+    stats = segments.derive(st)
+
+    ns = [e for e in st.iter_edges() if e.type == "NEXT_SEGMENT"]
+    assert stats == {"next_segments": 1}
+    assert len(ns) == 1
+    assert (ns[0].src, ns[0].dst) == ("sym:a:x", "sym:b:y")
+    assert ns[0].props["via_channel_id"] == "chan:event_type:E"
+
+
 def test_parallel_channels_between_same_pair_both_derived(tmp_path):
     """X reaches Y via TWO different channels (a Kafka event AND a direct HTTP call --
     e.g. PRODUCES->event plus CALLS_HTTP->route) -- both NEXT_SEGMENT edges must
