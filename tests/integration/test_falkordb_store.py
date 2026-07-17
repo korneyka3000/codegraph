@@ -268,6 +268,98 @@ def test_find_by_qualified_picks_lowest_id_when_multiple_match(falkordb_cfg):
         _cleanup(falkordb_cfg, FIND_QUALIFIED)
 
 
+OR_FALLBACK = "__m4t3_or_fallback__"
+
+
+def test_search_text_chunks_or_fallback_finds_mixed_language_query(falkordb_cfg):
+    """M4 T3 Step 1: RediSearch's implicit AND over "создание OrderCreated заказа"'s
+    3 sanitized tokens finds nothing in an English-identifier corpus -- only
+    "OrderCreated" ever appears literally anywhere in it, "создание"/"заказа" match
+    NO chunk at all, so the AND-only first pass returns [] even though the chunk an
+    engineer actually wants (the one containing "OrderCreated") is right there. The
+    OR-joined second pass ("создание | OrderCreated | заказа") matches on
+    "OrderCreated" alone and surfaces it -- this is the exact scenario from the M3
+    final review finding (mixed RU/EN NL queries going fulltext-dead) this task
+    fixes."""
+    store = FalkorStore(falkordb_cfg, OR_FALLBACK)
+    try:
+        store.ensure_schema()
+        store.upsert_nodes(("Chunk",), [
+            {
+                "id": "chunk:order-created",
+                "props": {
+                    "service": "orders-api",
+                    "text": "def create_order(): emit(OrderCreated(order_id=order.id))",
+                    "context_header": "symbol: app.services.order.OrderService.create (Function)",
+                },
+            },
+        ])
+
+        results = store.search_text_chunks("создание OrderCreated заказа", k=5)
+        assert any(props["id"] == "chunk:order-created" for props, _score in results)
+
+        # purely-Cyrillic query: EVERY token misses this English-only corpus in
+        # EITHER pass -- OR of all-misses is still a miss, so this stays [] (the M3
+        # gate's own Q1-Q5 expectation, see .superpowers/sdd/task-3-brief.md).
+        assert store.search_text_chunks("создание заказа", k=5) == []
+    finally:
+        _cleanup(falkordb_cfg, OR_FALLBACK)
+
+
+def test_search_text_chunks_and_success_does_not_widen_with_or(falkordb_cfg):
+    """Binding contract (brief's Interfaces section): an AND-successful query is
+    ZERO behavior change -- the fallback must never even run once the first pass
+    already found something. "widget" alone would also match a second, unrelated
+    chunk that has no "orders" token at all; if the OR-fallback incorrectly ran
+    anyway (e.g. a bug that doesn't check the first pass's row count), that second
+    chunk would leak into the result. It must not."""
+    store = FalkorStore(falkordb_cfg, OR_FALLBACK)
+    try:
+        store.ensure_schema()
+        store.upsert_nodes(("Chunk",), [
+            {
+                "id": "chunk:both-tokens",
+                "props": {"service": "svc-a", "text": "orders widget helper"},
+            },
+            {
+                "id": "chunk:widget-only",
+                "props": {"service": "svc-a", "text": "widget gadget thing, no relation"},
+            },
+        ])
+
+        results = store.search_text_chunks("orders widget", k=5)
+        assert {props["id"] for props, _score in results} == {"chunk:both-tokens"}
+    finally:
+        _cleanup(falkordb_cfg, OR_FALLBACK)
+
+
+def test_search_fulltext_or_fallback_finds_mixed_language_query(falkordb_cfg):
+    """Same OR-fallback contract as the search_text_chunks tests above, mirrored on
+    the Sym fulltext leg (name/qualified_name/docstring) -- this task's brief
+    modifies BOTH search_fulltext (Sym) and search_text_chunks (Chunk), not just
+    one of the two fulltext methods."""
+    store = FalkorStore(falkordb_cfg, OR_FALLBACK)
+    try:
+        store.ensure_schema()
+        store.upsert_nodes(("Sym", "Function"), [
+            {
+                "id": "sym:orders-api:create_order",
+                "props": {
+                    "kind": "Function", "name": "create_order",
+                    "qualified_name": "app.routes.orders.create_order",
+                    "docstring": "Creates a new order and emits OrderCreated.",
+                },
+            },
+        ])
+
+        results = store.search_fulltext("создание OrderCreated заказа", k=5)
+        assert any(r["id"] == "sym:orders-api:create_order" for r in results)
+
+        assert store.search_fulltext("создание заказа", k=5) == []
+    finally:
+        _cleanup(falkordb_cfg, OR_FALLBACK)
+
+
 def test_graph_exists_is_read_only_and_flips_after_write(falkordb_cfg):
     """graph_exists() (M1b T6 fix A): False для никогда не индексированного имени,
     и -- критично -- БЕЗ auto-vivify побочного эффекта (в отличие от GRAPH.QUERY,

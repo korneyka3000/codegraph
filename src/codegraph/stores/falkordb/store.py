@@ -74,6 +74,24 @@ def _sanitize_fulltext_query(query: str) -> str:
     return " ".join(_FULLTEXT_SPECIAL_CHARS.sub(" ", query).split())
 
 
+def _fulltext_or_query(sanitized: str) -> str | None:
+    """M4 T3: builds the second-pass (AND -> OR) RediSearch query text from an
+    already-sanitized query (see _sanitize_fulltext_query) -- `None` when there is
+    nothing to widen: a single-token query's implicit-AND and OR forms are
+    identical (AND/OR over exactly one term is just that term), so callers must
+    skip the second pass entirely rather than re-run an identical query against
+    the same index. `"".split()` is also `[]` (0 tokens), so an already-empty
+    sanitized query (defensively -- real callers short-circuit on that before
+    ever reaching here) likewise yields `None`, not a bogus `""` OR-query.
+
+    Multi-token: the same tokens re-joined with `" | "` -- RediSearch's OR
+    operator (see _FULLTEXT_SPECIAL_CHARS' own docstring for why a raw `|` in
+    USER input is stripped; here it is deliberately reintroduced as an operator,
+    not user-supplied text)."""
+    tokens = sanitized.split()
+    return " | ".join(tokens) if len(tokens) > 1 else None
+
+
 class FalkorStore:
     """GraphStore над одним графом FalkorDB; graph_name -- redis-ключ этого графа
     (см. swap_in() для blue/green переключения build-графа на это имя)."""
@@ -232,7 +250,13 @@ class FalkorStore:
         filter alongside the fulltext YIELD, same parameterization pattern as
         neighbors()'s `type(e) IN $types` -- no injection surface). Results are
         ordered by RediSearch relevance score, descending, capped at `k`; each
-        result is the node's properties with an added "score" key (float)."""
+        result is the node's properties with an added "score" key (float).
+
+        M4 T3: when this first (implicit-AND) pass returns zero rows AND the
+        sanitized query has more than one token, a second pass re-runs the same
+        query OR-joined -- see _fulltext_result_set's docstring for the full
+        mixed-language rationale and the RRF-dampens-OR-noise argument (shared
+        with search_text_chunks, which gets the identical fallback over Chunk)."""
         sanitized = _sanitize_fulltext_query(query)
         if not sanitized:
             return []
@@ -242,8 +266,49 @@ class FalkorStore:
             cypher += " WHERE node.kind IN $kinds"
             params["kinds"] = list(kinds)
         cypher += " RETURN node, score ORDER BY score DESC LIMIT $k"
+        result_set = self._fulltext_result_set(cypher, params, sanitized)
+        return [{**node.properties, "score": score} for node, score in result_set]
+
+    def _fulltext_result_set(
+        self, cypher: str, params: dict[str, Any], sanitized: str
+    ) -> list:
+        """M4 T3: shared two-pass (AND -> OR) execution for search_fulltext (Sym)
+        and search_text_chunks (Chunk) -- both build their own index/WHERE/RETURN
+        `cypher` (with `params["q"]` holding the first-pass, implicit-AND query
+        text) and hand the finished query here just for this fallback, so the
+        AND->OR logic itself lives in exactly one place.
+
+        Why: RediSearch's fulltext queryNodes runs an implicit AND over query
+        tokens (see _sanitize_fulltext_query) -- ALL of them must match the SAME
+        document. A mixed-language natural-language query (e.g. a Russian question
+        naming an English identifier, the M3 final review's own finding) needs
+        just ONE token with zero matches in an English-identifier corpus to zero
+        out the whole AND query, even though the English identifier token alone
+        would have found exactly the right node. Retrying with OR only when the
+        first pass is EMPTY keeps this a pure widening with no other behavior
+        change: a query that already found something under AND is returned as-is
+        (identical results, a single round trip, the fallback isn't even
+        attempted), and a single-token query has no second pass to run at all
+        (_fulltext_or_query returns None -- its AND and OR forms coincide).
+
+        Noise from a widened OR match (a result sharing only ONE of several query
+        tokens, not all of them) isn't filtered out here -- it doesn't need to be:
+        every caller of search_fulltext/search_text_chunks feeds this leg's
+        ranking into RRF (query/retrieval.rrf, k=60), which is rank-based, not
+        score-based -- a weak OR-only match ranks low within THIS leg's own
+        ordering and so contributes only a small 1/(k+rank+1) term to the fused
+        score, the same self-dampening RRF already gives any weak candidate in
+        either leg. No schema/mode_used change: OR is an internal detail of
+        whichever text leg triggered it, invisible to callers of search_code/
+        find_entrypoint beyond "more candidates, ranked appropriately"."""
         res = self._g.query(cypher, params)
-        return [{**node.properties, "score": score} for node, score in res.result_set]
+        if res.result_set:
+            return res.result_set
+        or_query = _fulltext_or_query(sanitized)
+        if or_query is None:
+            return res.result_set
+        res = self._g.query(cypher, {**params, "q": or_query})
+        return res.result_set
 
     def search_vector_chunks(
         self, vec: list[float], k: int, service: str | None = None
@@ -299,7 +364,11 @@ class FalkorStore:
         procedure itself takes no `k` argument, so (unlike search_vector_chunks) a
         plain `ORDER BY score DESC LIMIT $k` AFTER the WHERE is already correct with no
         over-fetch needed. Returns `[(chunk_props, score)]` tuples -- see
-        search_vector_chunks's own docstring for why, shared with it."""
+        search_vector_chunks's own docstring for why, shared with it.
+
+        M4 T3: also mirrors search_fulltext's AND->OR fallback (see
+        _fulltext_result_set's docstring for the full mixed-language rationale) --
+        zero rows on a multi-token first pass retries OR-joined before returning."""
         sanitized = _sanitize_fulltext_query(query)
         if not sanitized:
             return []
@@ -309,8 +378,8 @@ class FalkorStore:
             cypher += " WHERE node.service = $service"
             params["service"] = service
         cypher += " RETURN node, score ORDER BY score DESC LIMIT $k"
-        res = self._g.query(cypher, params)
-        return [(node.properties, score) for node, score in res.result_set]
+        result_set = self._fulltext_result_set(cypher, params, sanitized)
+        return [(node.properties, score) for node, score in result_set]
 
     def graph_exists(self) -> bool:
         """True, если граф-ключ self.graph_name существует (membership в GRAPH.LIST).

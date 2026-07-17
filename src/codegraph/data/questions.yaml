@@ -55,20 +55,29 @@
 # rephrase -- questions 1-4 all hit@3 on the FIRST (plan-original) wording once
 # their accept lists reflected the real chunk granularity (correction 1).
 #
-# FULLTEXT-COVERAGE DISCLOSURE (M3 final whole-milestone review carry-item): questions
-# 1-5 are all Russian natural-language questions over an English-identifier codebase.
-# Live-verified (mode="text", fulltext only, no vector): EVERY ONE of questions 1-5
-# returns ZERO fulltext hits -- RediSearch's `db.idx.fulltext.queryNodes` runs an
-# implicit-AND over the query's tokens (see stores/falkordb/store.py's
-# `_sanitize_fulltext_query`), and none of a Russian question's Cyrillic tokens ever
+# FULLTEXT-COVERAGE DISCLOSURE (M3 final whole-milestone review carry-item --
+# HISTORICAL: written when the fulltext leg was implicit-AND ONLY; partially
+# superseded by the OR-FALLBACK section below): questions 1-5 are all Russian
+# natural-language questions over an English-identifier codebase. Live-verified
+# (mode="text", fulltext only, no vector, PRE-OR-fallback): EVERY ONE of questions
+# 1-5 returned ZERO fulltext hits -- RediSearch's `db.idx.fulltext.queryNodes` runs
+# an implicit-AND over the query's tokens (see stores/falkordb/store.py's
+# `_sanitize_fulltext_query`), none of a Russian question's Cyrillic tokens ever
 # literally appears in this corpus's (English-identifier) chunk text/context_header,
-# so every token fails to match and the implicit AND yields nothing. In other words:
-# `mode="hybrid"` on questions 1-5 is, IN PRACTICE, vector-only -- the fulltext leg of
-# RRF fusion contributes zero candidates for any of them, and every "hit" recorded
-# below for 1-5 comes entirely from jina-embeddings-v2-base-code's cross-lingual
-# semantic match. That's a real gap in this gate's OWN coverage: a hybrid retrieval
-# gate with 5/5 questions silently exercising only one of its two legs never actually
-# proves the fulltext leg (or its RRF fusion with vector) works at all.
+# and under AND a single missing token zeroes the whole query. So UNDER AND-ONLY,
+# `mode="hybrid"` on questions 1-5 was in practice vector-only -- every "hit" in the
+# M3-close History ranks below came entirely from jina-embeddings-v2-base-code's
+# cross-lingual semantic match, and a hybrid gate with 5/5 questions silently
+# exercising only one of its two legs never actually proved the fulltext leg (or
+# its RRF fusion with vector) worked -- the gap question 6 was added to close.
+# CURRENT TRUTH (M4 T3, measured per-question via store.search_text_chunks against
+# a freshly built real-pipeline graph, see .superpowers/sdd/task-3-report.md): only
+# question 3 is genuinely all-Cyrillic-token and still gets zero fulltext
+# candidates (vector-only in practice, in either AND or OR mode); questions 1/2/4/5
+# each carry at least one literally-matching identifier token (Q1 "outbox"; Q2
+# "OrderCreated"; Q4 "document"/"management"/"http"; Q5 "kafka"/
+# "documents.indexed") and now get a REAL fulltext leg via the OR-fallback
+# (question 6 always had one under plain AND, no fallback needed).
 #
 # QUESTION 6 (M3 final whole-milestone review, fulltext-coverage fix): added
 # specifically to close the gap above -- an English, identifier-style query (the
@@ -88,15 +97,55 @@
 # No rephrase needed -- unlike question 5, the FIRST wording tried already hit@3
 # (in fact hit@1) in every mode.
 #
-# REAL GATE RESULTS (jina-embeddings-v2-base-code, dim=768, k=3, mode_used=hybrid
-# for all 6 -- see m3-task-8-report.md for questions 1-5's full per-question top-3
-# dump, and .superpowers/sdd/m3-final-fix-report.md for question 6's):
-#   1. hit=True rank=1   2. hit=True rank=2   3. hit=True rank=0
-#   4. hit=True rank=2   5. hit=True rank=0   6. hit=True rank=0
-# Questions 2 and 4 hit at rank 2 (the very last position within k=3) -- a real,
-# occasionally-close-to-the-edge result on real cross-lingual semantic search
-# against a tiny (34-chunk) fixture corpus, left as-is (not curve-fit) since the
-# contract is hit@k, not rank==0; see the report's Concerns section.
+# OR-FALLBACK (M4 T3): store.search_fulltext/store.search_text_chunks
+# (stores/falkordb/store.py) now retry a query whose first (implicit-AND) pass
+# returns zero rows by re-running it with its tokens OR-joined, when the sanitized
+# query has more than one token (see _fulltext_result_set's own docstring for the
+# full mechanism/rationale). Practical effect for THESE golden questions: a mixed
+# RU/EN question now gets real text-leg (fulltext) candidates whenever AT LEAST ONE
+# of its tokens is a literal match somewhere in this English-identifier corpus --
+# the text leg is no longer unconditionally dead for every mixed-language question
+# the way the FULLTEXT-COVERAGE DISCLOSURE above (M3-era, pre-T3) describes. A
+# genuinely ALL-Cyrillic question (every token non-matching) is unaffected -- OR of
+# all-misses is still a miss, so it stays vector-only exactly as before.
+#
+# M4 T3 GATE RE-RUN FINDING (delta, reported per this task's brief; reviewed and
+# ACCEPTED by the coordinator -- the plan's "questions 1-5 are pure-Cyrillic"
+# premise was simply false, and the fallback legitimately revived the text leg):
+# re-running this gate after the OR-fallback above (full detail:
+# .superpowers/sdd/task-3-report.md) found that questions 1, 2, 4, and 5 each
+# actually contain at least one token that DOES literally match this corpus (the
+# per-question token list lives in CURRENT TRUTH, disclosure section above) --
+# live-verified via store.search_text_chunks; only question 3 is genuinely
+# all-Cyrillic-token. Consequently the OR-fallback now injects real text-leg
+# candidates into hybrid RRF fusion for questions 1/2/4/5, not just question 6 as
+# the M3-era disclosure anticipated. hit@3 remains 6/6 (gate still green, no
+# pass/fail regression) but per-question hybrid RANKS shifted versus the M3-close
+# baseline (now the History line in the REAL GATE RESULTS block below): question 1
+# rank 1->2, question 2 rank 2->1, question 4 rank 2->0; questions 3, 5, 6
+# unchanged -- a net improvement, with the one worsening (question 1) still
+# comfortably inside k=3. Per the coordinator's decision (honest-gates path:
+# golden documentation reflects measured reality; the hit@3 threshold itself is
+# untouched), the block below now LEADS with the current measured snapshot and
+# demotes the M3-close numbers to a History line.
+#
+# REAL GATE RESULTS (2026-07-17, M4 T3 -- CURRENT snapshot, measured with the
+# OR-fallback active, i.e. as of the commit introducing it, "feat(m4): fulltext
+# OR-fallback for mixed-language queries"; jina-embeddings-v2-base-code, dim=768,
+# k=3, mode_used=hybrid for all 6; full run detail + per-question fulltext-hit
+# table: .superpowers/sdd/task-3-report.md):
+#   1. hit=True rank=2   2. hit=True rank=1   3. hit=True rank=0
+#   4. hit=True rank=0   5. hit=True rank=0   6. hit=True rank=0
+# hit@3 = 6/6. Question 1 hits at rank 2 (the very last position within k=3) -- a
+# real, occasionally-close-to-the-edge result of fusing cross-lingual semantic
+# search with the newly-alive fulltext leg over a tiny (34-chunk) fixture corpus,
+# left as-is (not curve-fit) since the contract is hit@k, not rank==0.
+# History (M3-close, PRE-OR-fallback -- the ranks all M3-era reports reference; see
+# m3-task-8-report.md for questions 1-5's full per-question top-3 dump, and
+# .superpowers/sdd/m3-final-fix-report.md for question 6's):
+#   1. rank=1   2. rank=2   3. rank=0   4. rank=2   5. rank=0   6. rank=0
+# (all hit=True; questions 2 and 4 sat at rank 2, the edge of k=3, back then --
+# both since lifted by the text leg, see the GATE RE-RUN FINDING above.)
 version: 1
 questions:
   - question: "где создаётся заказ и пишется событие в outbox"
