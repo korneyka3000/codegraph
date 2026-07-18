@@ -114,6 +114,29 @@ def _old_shaped_analyze_fake(recorded: list[dict] | None = None):
     return fn
 
 
+def _degraded_full_analyze_fake(recorded: list[dict] | None = None):
+    """Like `_old_shaped_analyze_fake`, but ALSO does the one real staging side effect
+    `_analyze_spy`/`_old_shaped_analyze_fake` never bother with: `staging.add_files`
+    for this service's actual on-disk scan. Needed specifically for
+    `test_index_after_degraded_run_does_not_pin_skip_eligibility` below -- that test's
+    SECOND call (`--incremental`) needs `staging.files_for_service` to already reflect
+    the real tree so its own fresh `service_delta` comes back genuinely empty
+    (unchanged tree), keeping the test sensitive to the fingerprint-sentinel bug
+    ALONE. Without this, `staging.files_for_service` would stay empty after call 1
+    (the plain fakes never write it), every file would show up "added" in call 2's
+    delta regardless of the fingerprint, and the skip branch would correctly never
+    fire even on the UNFIXED code -- a false-negative test that can't fail. Reports
+    `degraded=True` (mode="full") -- the scip-unavailable-this-run scenario M4 final
+    review IMPORTANT-1 is about."""
+    def fn(svc, staging, cache_dir, runner=None, active_idioms=frozenset(), idioms=None):
+        if recorded is not None:
+            recorded.append({"svc": svc.name})
+        scanned, _ = scan_service(svc.path, svc.exclude)
+        staging.add_files(svc.name, scanned)
+        return dict(_DEGRADED_FULL_REPORT)
+    return fn
+
+
 def _chunk_embed_spy(recorded: list):
     def fn(cfg, staging, embedder, changed_files=None):
         recorded.append(changed_files)
@@ -164,6 +187,9 @@ _SKIPPED_REPORT = {**_FULL_REPORT, "mode": "skipped"}
 _INCREMENTAL_REPORT = {
     **_FULL_REPORT, "mode": "incremental", "stale_files": 1,
     "stale_relpaths": ("app/main.py",),
+}
+_DEGRADED_FULL_REPORT = {
+    **_FULL_REPORT, "degraded": True, "reason": "scip-python unavailable (npx ENOENT)",
 }
 
 
@@ -358,3 +384,48 @@ def test_incremental_non_skip_writes_fresh_fingerprint(tmp_path, monkeypatch):
     staging = Staging(root / ".codegraph" / "staging.db")
     assert staging.get_meta("svc_fingerprint:svc0") == expected_fp
     staging.close()
+
+
+# -- degraded run must not pin skip-eligibility (M4 final review, IMPORTANT-1) --
+
+
+def test_index_after_degraded_run_does_not_pin_skip_eligibility(tmp_path, monkeypatch):
+    """A plain `index` run whose analyze report comes back `degraded=True` (scip
+    unavailable this run -> heuristic fallback, resolution="heuristic"/confidence=0.6)
+    must NOT store the real config fingerprint -- doing so would let the very NEXT
+    `--incremental` run see fingerprint_ok=True plus an empty on-disk delta and take
+    the "skipped" branch, pinning those heuristic results forever even after
+    scip-python is repaired. Two real CLI invocations against the SAME staging.db and
+    an UNCHANGED tree: first a plain `index` (degraded fake analyze), then `index
+    --incremental` (a clean fake analyze, asserting on what it RECEIVED) -- the second
+    call must bypass the skip-eligible branch entirely, exactly like a genuine
+    fingerprint mismatch (see test_incremental_fingerprint_mismatch_forces_full_with_
+    mismatch_reason above, same assertion shape)."""
+    root = _write_workspace(tmp_path)
+
+    # 1. plain `index`, no --incremental -- fake analyze reports degraded=True (and
+    # stages the real file snapshot, see _degraded_full_analyze_fake's own docstring
+    # for why that matters here).
+    _patch_common(monkeypatch, _degraded_full_analyze_fake(), _chunk_embed_spy([]))
+    result = runner.invoke(app, ["index", str(root)])
+    assert result.exit_code == 0, result.output
+
+    staging = Staging(root / ".codegraph" / "staging.db")
+    assert staging.get_meta("svc_fingerprint:svc0") == ""  # sentinel, NOT the real fp
+    staging.close()
+
+    # 2. `index --incremental`, same staging.db, tree still unchanged -- if the
+    # degraded run's real fingerprint had been (wrongly) persisted instead, this would
+    # see fingerprint_ok=True + an empty delta and skip.
+    recorded: list[dict] = []
+    analyze_fn = _analyze_spy({"svc0": _FULL_REPORT}, recorded)
+    _patch_common(monkeypatch, analyze_fn, _chunk_embed_spy([]))
+
+    result = runner.invoke(app, ["index", str(root), "--incremental"])
+    assert result.exit_code == 0, result.output
+
+    assert recorded[0]["incremental"] is False  # bypasses the skip-eligible branch
+    assert recorded[0]["fingerprint_ok"] is False
+
+    report = json.loads((root / ".codegraph" / "report.json").read_text())
+    assert report["services"][0]["mode"] == "full"

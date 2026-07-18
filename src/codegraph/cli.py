@@ -240,6 +240,25 @@ def _svc_fingerprint_key(name: str) -> str:
     return f"svc_fingerprint:{name}"
 
 
+def _fp_to_persist(report: dict, fp: str) -> str:
+    """The value `_analyze_services` should persist under `_svc_fingerprint_key` for a
+    just-produced report: `fp` (the freshly computed `config_fingerprint`) for a clean
+    report, or `""` for a DEGRADED one (M4 final review, IMPORTANT-1 -- scip
+    unavailable this run, `analyze_service`/`_analyze_full` fell back to heuristic
+    defs/refs/edges, resolution="heuristic"/confidence=0.6). Persisting the REAL `fp`
+    for a degraded report would let a LATER `--incremental` run see fingerprint_ok=True
+    together with an empty on-disk `service_delta` and take the "skipped" branch
+    (`_skip_report` hardcodes `degraded=False` unconditionally) -- pinning those
+    heuristic results forever, even once scip-python is repaired, and silently
+    misreporting them as non-degraded from that point on. `""` can never equal a real
+    fingerprint (`config_fingerprint` always returns a 64-char sha256 hex digest), so
+    a later run's `stored_fp == fp` comparison always fails -- forcing "full" (via the
+    "fingerprint mismatch"/"first run" reason logic below) and genuinely retrying scip,
+    which is the only way a degraded service can ever self-heal back into a
+    fingerprint-eligible state."""
+    return "" if report.get("degraded") else fp
+
+
 def _analyze_services(
     cfg: WorkspaceConfig,
     staging: Staging,
@@ -257,9 +276,12 @@ def _analyze_services(
     (per-service call shape/count/order, exceptions) is byte-identical to pre-M4 --
     `analyze_service` is called with the SAME two kwargs as always, nothing more. The
     ONE additive side effect (Global Constraint, M4 plan) is that the JUST-computed
-    config fingerprint is written to staging AFTER each call, so a LATER
-    `--incremental` run has a real baseline instead of unconditionally treating every
-    service as "first run". `changed_files` is always `{}` in this mode -- callers
+    config fingerprint is written to staging AFTER each call (via `_fp_to_persist` --
+    an empty `""` sentinel instead of the real fingerprint when the report came back
+    degraded, M4 final review IMPORTANT-1, see that function's own docstring), so a
+    LATER `--incremental` run has a real baseline instead of unconditionally treating
+    every service as "first run" -- and a scip outage this run can never get pinned as
+    a skip-eligible baseline. `changed_files` is always `{}` in this mode -- callers
     that care (only `index()`, gated on its own `incremental` flag) must pass `None`
     to `run_chunk_embed` themselves rather than trust this return value, since `{}`
     (a non-None, merely EMPTY dict) means something completely different to
@@ -294,7 +316,18 @@ def _analyze_services(
          means the stored fingerprint already matches (fp_ok was True and nothing
          changed) by construction, so re-writing it would be a no-op; skipped purely
          to keep the skip path's "ZERO staging writes" contract honest end to end,
-         not for correctness.
+         not for correctness. The value written is `_fp_to_persist(report, fp)`, not
+         unconditionally `fp` -- `_skip_report` hardcodes `degraded=False` so
+         "skipped" itself can never carry a degraded report, but "full" CAN (either
+         half of case 3 above: its own "NOT fp_ok" branch, or its "fp_ok" branch's
+         OWN scip-degrades-mid-flight fallback to mode="full"): writing the real `fp`
+         for THAT degraded report would let the NEXT --incremental run see
+         fingerprint_ok=True plus an empty delta and take the skip branch, pinning
+         heuristic (resolution="heuristic", confidence=0.6) results forever even once
+         scip recovers (M4 final review, IMPORTANT-1). `_fp_to_persist` writes `""`
+         instead for a degraded report -- never equal to a real fingerprint, so the
+         next run's `fp_ok` always fails, forcing "full" (retrying scip) until a
+         clean run finally succeeds.
       5. `changed_files[svc.name]`, keyed off `report["mode"]` (regardless of which
          branch above produced it): "skipped" -> key absent entirely (not an empty
          set -- see `run_chunk_embed`'s own module docstring: an ABSENT key skips its
@@ -318,7 +351,7 @@ def _analyze_services(
                 svc, staging, cache_dir, active_idioms=active_idioms, idioms=idioms,
             )
             fp = config_fingerprint(svc, idioms, active_idioms)
-            staging.set_meta(_svc_fingerprint_key(svc.name), fp)
+            staging.set_meta(_svc_fingerprint_key(svc.name), _fp_to_persist(report, fp))
             per_service.append(report)
             continue
 
@@ -349,7 +382,7 @@ def _analyze_services(
 
         mode = report.get("mode")
         if mode != "skipped":
-            staging.set_meta(_svc_fingerprint_key(svc.name), fp)
+            staging.set_meta(_svc_fingerprint_key(svc.name), _fp_to_persist(report, fp))
         if mode == "incremental":
             changed_files[svc.name] = set(report["stale_relpaths"])
         elif mode == "full":

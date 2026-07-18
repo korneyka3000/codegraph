@@ -143,8 +143,15 @@ def _staging_dump(staging: Staging) -> dict:
     re-index's own cleanup silently; a dropped `via_channel` would conflate two
     parallel channels' NEXT_SEGMENT edges). `chunks` -- every column EXCEPT the
     `embedding` BLOB itself, per the brief's own dump contract; `input_hash`/
-    `embed_model` ARE included (both NULL-but-present under `--no-embed`, so trivially
-    equal either side, but compared anyway for completeness)."""
+    `embed_model` ARE included (M4 final review, MINOR-4 correction: NOT "both
+    NULL-but-present under --no-embed" -- only `embed_model` is (no embedder ever ran
+    to set it, trivially equal either side). `input_hash` is populated regardless --
+    `fill_headers_all` computes and writes it unconditionally for every staged chunk
+    whether or not an embedder ran this call, see `chunk_embed.py`'s own module
+    docstring -- included here precisely BECAUSE it's populated: a non-NULL
+    `input_hash` is what makes this dump actually cover the exact embedder INPUT
+    (augmented text + header) a real embed pass would have hashed, not merely two
+    sides that are trivially equal for being equally empty)."""
     db = staging._db  # noqa: SLF001 -- test-only max-rigor introspection, see docstring above.
 
     nodes = sorted(

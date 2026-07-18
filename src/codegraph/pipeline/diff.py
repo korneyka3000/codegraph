@@ -34,6 +34,21 @@ EXCLUDED from the fingerprint payload: relocating a service's checkout to a new
 filesystem path (a workspace move, a fresh clone elsewhere) is not a config change
 and must not force a full re-analyze on its own.
 
+`svc.python` sits right next to `svc.path` in `ServiceConfig` (config/models.py) --
+both are "where do I find this service" fields -- yet is deliberately the OPPOSITE
+case, and IS INCLUDED in the payload (M4 final review, MINOR-2). `svc.path` only
+affects WHERE files are read from, never WHAT resolving them produces; `svc.python`
+(a relative venv override resolved under `svc.path` -- see `pipeline/analyze.py`'s
+`_venv_for`: `svc.path / svc.python` if set, else `svc.path / ".venv"` if that
+exists, else no venv at all) changes WHICH interpreter and installed package set
+scip-python resolves imports/refs against. Switching a service's venv can change
+defs/refs/edges for byte-identical source files -- a dependency pinned to a
+different version (or simply present in one venv and absent in the other) resolves
+differently -- so a skip (or a narrowly-scoped incremental re-analyze) after a venv
+switch would silently keep serving results resolved against the OLD venv. This is
+exactly why one of these two adjacent "where" fields is excluded and the other
+included: `svc.path` never changes resolution behavior, `svc.python` does.
+
 Both `exclude` (a plain list, insertion order is meaningful in YAML but not
 semantically) and `active_idioms` (a frozenset, inherently unordered and, for str
 members, order-dependent on the interpreter's per-process hash seed) are sorted
@@ -129,18 +144,21 @@ def config_fingerprint(
 ) -> str:
     """sha256 hex digest of the canonical JSON payload `{"exclude": sorted(svc.
     exclude), "idioms": idioms.model_dump(mode="json"), "active":
-    sorted(active_idioms), "schema": SCHEMA_VERSION}` (`json.dumps(...,
-    sort_keys=True)`). `idioms` is the caller's EFFECTIVE per-service idioms (e.g.
-    `config.loader.effective_idioms(cfg, svc)` -- service idioms merged with active
-    builtins), not `svc.idioms` alone -- callers decide which idiom view makes a
-    result untrustworthy; this function just hashes whatever it's handed. See this
-    module's own docstring for why `svc.path` is excluded and why `exclude`/
-    `active_idioms` are sorted first."""
+    sorted(active_idioms), "schema": SCHEMA_VERSION, "python": str(svc.python) if
+    svc.python is not None else None}` (`json.dumps(..., sort_keys=True)`). `idioms`
+    is the caller's EFFECTIVE per-service idioms (e.g. `config.loader.
+    effective_idioms(cfg, svc)` -- service idioms merged with active builtins), not
+    `svc.idioms` alone -- callers decide which idiom view makes a result
+    untrustworthy; this function just hashes whatever it's handed. See this module's
+    own docstring for why `svc.path` is excluded, why `svc.python` -- despite being
+    the same "where is this service" flavor of field -- is included instead, and why
+    `exclude`/`active_idioms` are sorted first."""
     payload = {
         "exclude": sorted(svc.exclude),
         "idioms": idioms.model_dump(mode="json"),
         "active": sorted(active_idioms),
         "schema": SCHEMA_VERSION,
+        "python": str(svc.python) if svc.python is not None else None,
     }
     canonical = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(canonical.encode()).hexdigest()

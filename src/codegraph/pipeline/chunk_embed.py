@@ -470,12 +470,25 @@ def run(
 
     # "" (not a missing key) for the no-embedder case -- pipeline.load._embed_meta
     # reads "" back as None, same as absent, but writing it explicitly here CLEARS any
-    # embed_model/dim a PRIOR run left behind. Every `codegraph index` run re-chunks
-    # EVERY configured service from scratch (this run's chunking loop above just did
-    # exactly that), so if THIS run has no embedder, no chunk in the whole workspace
-    # has a live embedding right now -- Meta must not keep advertising a stale model/
-    # dim that no longer matches any actual Chunk.embedding in the graph about to be
-    # loaded.
+    # embed_model/dim a PRIOR run left behind. True for a full run (changed_files is
+    # None): every service's ENTIRE chunk loop reruns from scratch, so if THIS run has
+    # no embedder, no chunk in the whole workspace ends up with a live embedding, and
+    # Meta must not keep advertising a stale model/dim that no longer matches anything
+    # in the graph about to be loaded. FALSE under `--incremental --no-embed` (M4
+    # final review, MINOR-3 -- this comment previously claimed it unconditionally):
+    # `changed_files` scopes the chunk loop above to only the services/files that
+    # actually changed this run (see this function's own M4 T6 docstring section) --
+    # an UNTOUCHED service's chunks are left completely alone and can still carry live
+    # embedding vectors from an EARLIER run that DID have an embedder, even while this
+    # run's embedder is None and writes "" here regardless. So Meta can
+    # under-advertise in that specific flag combination (claim "no embeddings
+    # anywhere" while some untouched chunk genuinely still has one) -- the safer
+    # direction to be wrong in for now: a consumer that trusts Meta and skips vector
+    # search entirely still returns correct, merely incomplete, results, whereas the
+    # reverse (advertising a model/dim some chunk's real vector doesn't match) would
+    # not be -- which is why this write stays unconditional here rather than being
+    # made changed_files-aware too. What Meta SHOULD report for `--incremental
+    # --no-embed` specifically is a flag-combo semantics decision deferred to M5.
     staging.set_meta("embed_model", model_meta)
     staging.set_meta("embed_dim", dim_meta)
     return {

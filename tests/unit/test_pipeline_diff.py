@@ -1,6 +1,8 @@
 """pipeline.diff: per-service scan-vs-staged file delta (added/changed/deleted/
 unchanged, sorted regardless of input order; ServiceDelta.empty) + config_fingerprint
-sensitivity (idioms/excludes/schema change it, svc.path does not)."""
+sensitivity (idioms/excludes/schema/python change it, svc.path does not -- M4 final
+review MINOR-2 added `python`: unlike `path`, it changes resolution behavior, see
+pipeline/diff.py's own module docstring)."""
 
 from __future__ import annotations
 
@@ -142,7 +144,21 @@ def test_config_fingerprint_changes_when_active_idioms_edited():
     assert fp_before != fp_after
 
 
+def test_config_fingerprint_changes_when_python_edited():
+    # M4 final review MINOR-2: svc.python (unlike svc.path) changes resolution
+    # behavior (a different venv can see a different installed package set), so it
+    # must flip the fingerprint -- a venv switch must force a full re-analyze rather
+    # than being silently skipped/incrementally re-analyzed against stale results.
+    idioms, active = ServiceIdioms(), frozenset()
+    fp_before = config_fingerprint(_svc(python=None), idioms, active)
+    fp_after = config_fingerprint(_svc(python="venv-3.11"), idioms, active)
+    assert fp_before != fp_after
+
+
 def test_config_fingerprint_unchanged_when_only_path_differs():
+    # svc.python left at its default (None) on both sides here -- see
+    # test_config_fingerprint_changes_when_python_edited just above for that
+    # adjacent-but-opposite-sensitivity field's own test.
     idioms, active = _idioms(), frozenset({"fastapi"})
     fp_a = config_fingerprint(_svc(path=Path("/repo/orders-api")), idioms, active)
     fp_b = config_fingerprint(_svc(path=Path("/elsewhere/checkout-2")), idioms, active)
@@ -157,10 +173,11 @@ def test_config_fingerprint_same_excludes_different_order_same_fingerprint():
 
 
 def test_config_fingerprint_matches_documented_canonical_json_formula():
-    # Pins the exact contract from the M4 T4 brief: sha256 of
-    # {"exclude": sorted, "idioms": idioms.model_dump(mode="json"), "active": sorted,
-    # "schema": SCHEMA_VERSION}, JSON-dumped with sort_keys=True.
-    svc = _svc(exclude=["tests/**", "scripts/**"])
+    # Pins the exact contract from the M4 T4 brief (M4 final review MINOR-2 added the
+    # "python" key): sha256 of {"exclude": sorted, "idioms": idioms.model_dump(mode=
+    # "json"), "active": sorted, "schema": SCHEMA_VERSION, "python": str(svc.python)
+    # if svc.python is not None else None}, JSON-dumped with sort_keys=True.
+    svc = _svc(exclude=["tests/**", "scripts/**"], python="venv-3.11")
     idioms = _idioms()
     active = frozenset({"temporal", "fastapi"})
     expected_payload = {
@@ -168,6 +185,7 @@ def test_config_fingerprint_matches_documented_canonical_json_formula():
         "idioms": idioms.model_dump(mode="json"),
         "active": sorted(active),
         "schema": SCHEMA_VERSION,
+        "python": str(svc.python) if svc.python is not None else None,
     }
     expected = hashlib.sha256(
         json.dumps(expected_payload, sort_keys=True).encode()
