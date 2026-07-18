@@ -6,6 +6,7 @@ MERGE с multi-label)."""
 from __future__ import annotations
 
 import hashlib
+import itertools
 import struct
 
 import pytest
@@ -16,6 +17,7 @@ from codegraph.core.schema import EdgeRec, NodeRec
 from codegraph.pipeline.load import (
     _chunk_node_batches,
     _chunk_props,
+    _dedup_edges,
     _edge_row,
     _key_props_for,
     _labels_for_kind,
@@ -294,3 +296,118 @@ def test_chunk_node_batches_dim_none_routes_stale_embedding_to_without_vector(tm
     assert without_vector[0]["id"] == "c#c0"
     assert "embedding" not in without_vector[0]
     assert "embed_model" not in without_vector[0]["props"]
+
+
+# -- M5 T4: _dedup_edges -- deterministic winner-per-group collapse of a shared
+# edge's now-possibly-multiple per-origin staged rows (SCHEMA_VERSION 6, closes the
+# M4-T7 residual gap -- see core/schema.py's own SCHEMA_VERSION history entry and
+# stores/staging.py's upsert_edges docstring) into exactly one EdgeRec per
+# (src,dst,type,via_channel) group, called by load_graph over
+# staging.iter_edges_with_origin() BEFORE any edge is ever batched to FalkorDB.
+# Winner selection: highest-priority resolution (trace_validated > static > dynamic
+# > heuristic), then highest confidence, then lexicographically-first origin --
+# fully deterministic, independent of input order (pinned exhaustively below).
+
+
+def test_dedup_edges_single_row_group_passthrough():
+    e = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="static", confidence=1.0,
+                extractor="kafka")
+    assert _dedup_edges([(e, "svc-a")]) == [e]
+
+
+def test_dedup_edges_empty_input_returns_empty_list():
+    assert _dedup_edges([]) == []
+
+
+def test_dedup_edges_prefers_higher_resolution_rank_over_confidence():
+    static_edge = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="static",
+                           confidence=0.5, extractor="kafka")
+    heuristic_edge = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="heuristic",
+                              confidence=0.9, extractor="kafka")
+    out = _dedup_edges([(heuristic_edge, "svc-b"), (static_edge, "svc-a")])
+    assert out == [static_edge]  # resolution rank beats confidence
+
+
+def test_dedup_edges_dynamic_ranks_between_static_and_heuristic():
+    dynamic = EdgeRec(src="a", dst="b", type="CALLS", resolution="dynamic", confidence=0.5,
+                       extractor="linking")
+    heuristic = EdgeRec(src="a", dst="b", type="CALLS", resolution="heuristic", confidence=0.99,
+                         extractor="calls")
+    out = _dedup_edges([(heuristic, "svc-a"), (dynamic, "svc-b")])
+    assert out == [dynamic]  # dynamic beats heuristic despite lower confidence
+
+
+def test_dedup_edges_trace_validated_outranks_static_dynamic_heuristic():
+    """trace_validated is not emitted by any extractor today (see core/schema.py's
+    RESOLUTIONS) but IS a real member of the frozenset, reserved for a future OTel/
+    trace-confirmed edge -- ranked ABOVE static here since it represents STRONGER
+    evidence (a runtime-observed edge, not just a resolved static reference),
+    documented for completeness even though no current caller can ever actually
+    produce a group containing one."""
+    trace = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="trace_validated",
+                     confidence=0.5, extractor="otel")
+    static = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="static", confidence=1.0,
+                      extractor="kafka")
+    out = _dedup_edges([(static, "svc-a"), (trace, "svc-b")])
+    assert out == [trace]
+
+
+def test_dedup_edges_prefers_higher_confidence_within_same_resolution():
+    low = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="static", confidence=0.6,
+                  extractor="kafka")
+    high = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="static", confidence=0.95,
+                   extractor="kafka")
+    out = _dedup_edges([(low, "svc-a"), (high, "svc-b")])
+    assert out == [high]
+
+
+def test_dedup_edges_prefers_lexicographically_first_origin_as_final_tiebreak():
+    e_z = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="static", confidence=1.0,
+                  extractor="kafka", evidence_file="z.py")
+    e_a = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="static", confidence=1.0,
+                  extractor="kafka", evidence_file="a.py")
+    out = _dedup_edges([(e_z, "zzz-service"), (e_a, "aaa-service")])
+    assert out == [e_a]
+
+
+def test_dedup_edges_is_deterministic_regardless_of_input_order():
+    """Exhaustive check over every permutation of a 3-row group (mirrors the
+    brief's own "детерминизм при перестановке порядка" requirement) -- the winner
+    (e2, resolution=static) must come out identical no matter which order staging
+    happens to yield the group's rows in."""
+    e1 = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="heuristic", confidence=0.6,
+                 extractor="kafka", evidence_file="1.py")
+    e2 = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="static", confidence=1.0,
+                 extractor="kafka", evidence_file="2.py")
+    e3 = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="dynamic", confidence=0.9,
+                 extractor="kafka", evidence_file="3.py")
+    group = [(e1, "svc-c"), (e2, "svc-a"), (e3, "svc-b")]
+    winners = {
+        tuple(e.evidence_file for e in _dedup_edges(list(perm)))
+        for perm in itertools.permutations(group)
+    }
+    assert winners == {("2.py",)}
+
+
+def test_dedup_edges_groups_by_via_channel_too_not_just_src_dst_type():
+    """Two edges sharing (src,dst,type) but with DIFFERENT via_channel_id must NOT
+    be collapsed together -- via_channel is part of the group key, mirroring
+    staging's own PK (see core/schema.py's SCHEMA_VERSION "2 -> 3" history)."""
+    e1 = EdgeRec(src="a", dst="b", type="NEXT_SEGMENT", resolution="derived", confidence=0.9,
+                 extractor="linking", props={"via_channel_id": "chan:kafka_topic:orders"})
+    e2 = EdgeRec(src="a", dst="b", type="NEXT_SEGMENT", resolution="derived", confidence=0.72,
+                 extractor="linking", props={"via_channel_id": "chan:kafka_topic:shipping"})
+    out = _dedup_edges([(e1, ""), (e2, "")])
+    assert len(out) == 2
+    assert {e.props["via_channel_id"] for e in out} == {
+        "chan:kafka_topic:orders", "chan:kafka_topic:shipping",
+    }
+
+
+def test_dedup_edges_multiple_independent_groups_each_get_their_own_winner():
+    e_ab = EdgeRec(src="a", dst="b", type="CONTAINS", resolution="static", confidence=1.0,
+                   extractor="kafka")
+    e_cd = EdgeRec(src="c", dst="d", type="CONTAINS", resolution="static", confidence=1.0,
+                   extractor="kafka")
+    out = _dedup_edges([(e_ab, "svc-a"), (e_cd, "svc-b")])
+    assert {(e.src, e.dst) for e in out} == {("a", "b"), ("c", "d")}

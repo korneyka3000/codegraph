@@ -122,8 +122,8 @@ CREATE TABLE IF NOT EXISTS edges(
   src TEXT, dst TEXT, type TEXT, via_channel TEXT NOT NULL DEFAULT '',
   resolution TEXT, confidence REAL,
   extractor TEXT, evidence_file TEXT, evidence_line INTEGER, props TEXT,
-  origin_service TEXT,
-  PRIMARY KEY(src, dst, type, via_channel));
+  origin_service TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(src, dst, type, via_channel, origin_service));
 CREATE INDEX IF NOT EXISTS idx_edges_origin ON edges(origin_service);
 CREATE TABLE IF NOT EXISTS claims(
   service TEXT, relpath TEXT, kind TEXT, payload_json TEXT,
@@ -498,64 +498,54 @@ class Staging:
         (http_routes.link/segments.derive/processes.materialize/workspace._apply_
         temporal_start_marks) передаёт None (дефолт) -- их рёбра не принадлежат ни
         одному ОДНОМУ сервису, а чистятся целиком через clear_workspace_layer().
-        Хранится СЫРЫМ (без валидации/дедукции) в edges.origin_service, независимо
-        от e.src/e.dst -- именно поэтому она чинит проблему, которую ss (см. ниже)
-        не могла решить: ss/ds выводятся ИЗ endpoint-префикса (None для chan:/proc:),
-        а origin_service -- явный факт "кто это записал", который для chan:-src рёбер
+        Хранится в edges.origin_service (без валидации/дедукции), независимо от
+        e.src/e.dst -- именно поэтому она чинит проблему, которую ss (см. ниже) не
+        могла решить: ss/ds выводятся ИЗ endpoint-префикса (None для chan:/proc:), а
+        origin_service -- явный факт "кто это записал", который для chan:-src рёбер
         (HANDLES, kafka CONTAINS) настоящий сервис-эмиттер ВСЕГДА имеет, даже когда
         endpoint сам по себе этого не выражает. `begin_service` теперь чистит
-        edges.origin_service, а не производный ss (см. её докстринг).
+        edges.origin_service, а не производный ss (см. её докстринг). `None`
+        нормализуется в `''` перед записью (PK-колонка не может быть NULL -- см.
+        core/schema.py SCHEMA_VERSION история "5 -> 6"); публичный параметр остаётся
+        `str | None` ради обратной совместимости каждого существующего вызывающего.
 
-        M4 T7 (discovered live by the incremental-equivalence gate,
-        tests/eval/test_incremental_gate.py): TWO DIFFERENT services can legitimately
-        assert the IDENTICAL (src,dst,type,via_channel) edge -- e.g. kafka_ext's
-        producer branch (this service SENDS to topic X, event Y) and its consumer
-        branch (a DIFFERENT service's dispatch_dict registers a handler for topic X,
-        event Y) each independently derive the SAME `CONTAINS chan:kafka_topic:X ->
-        chan:event_type:Y` edge from their own service's idiom config. Plain
-        last-write-wins (a bare `INSERT OR REPLACE`, this method's pre-M4-T7 body)
-        made the "winner" depend purely on `cfg.services` iteration order -- stable
-        under a FULL reindex (every service reprocessed every run, same order) but
-        NOT under `--incremental` (a SKIPPED sibling's earlier-written row could be
-        silently overwritten by a DIFFERENT, reprocessed service's fresh write, or
-        vice versa, depending purely on which subset of services happens to run this
-        time) -- breaking the milestone's own dump-equivalence invariant (live-
-        reproduced: `--incremental` after an unrelated one-line edit disagreed with a
-        full reindex of the identical tree on exactly this edge's evidence_file/
-        origin_service). Fixed below via `INSERT ... ON CONFLICT ... DO UPDATE ...
-        WHERE`: a write to a PK already owned by a DIFFERENT, non-null
-        origin_service is a no-op (SQLite's own documented UPSERT behavior when a DO
-        UPDATE's WHERE clause is false -- the existing row is left untouched, no
-        error) -- so whichever service is FIRST in `cfg.services` order to ever claim
-        a given shared PK keeps it for good (as long as it keeps asserting it),
-        REGARDLESS of which subset of services actually runs in a later pass. A
-        service refreshing its OWN previously-written row (origin_service matches)
-        still gets full REPLACE semantics -- the guard only ever blocks a genuinely
-        DIFFERENT owner, never self-overwrite; a row with no owner yet
-        (origin_service IS NULL, e.g. S7/linking-derived) can still be claimed by
-        anyone, matching the pre-fix behavior for that case exactly (see
-        tests/unit/test_staging.py's dedicated tests for these branches, including
-        the mirror-ordering one pinning that the WHERE clause is symmetric --
-        whichever origin writes first wins, not one hardcoded service). Note the
-        loser's write is discarded WHOLESALE: every non-key column it carried
-        (resolution/confidence/extractor/evidence_file/evidence_line/props), not
-        just the ownership fields -- the same all-columns-at-once shape the old
-        blind REPLACE had, only now the outcome is deterministic instead of
-        order-dependent.
+        M5 T4 (SCHEMA_VERSION 6, closes the M4 T7 residual gap for good):
+        `origin_service` now joins the PRIMARY KEY (src, dst, type, via_channel,
+        origin_service) -- so this is now an honest, unconditional `INSERT OR
+        REPLACE`, exactly like every other upsert method in this class. TWO
+        DIFFERENT services asserting the IDENTICAL (src,dst,type,via_channel) edge
+        (e.g. kafka_ext's producer branch in one service and its consumer branch's
+        dispatch_dict in another, each independently deriving the SAME `CONTAINS
+        chan:kafka_topic:X -> chan:event_type:Y` edge from their own idiom config)
+        simply get TWO SEPARATE rows now, one per origin -- both coexist,
+        unconditionally, regardless of write order or which subset of services runs
+        in a given `codegraph index` pass. A service re-upserting its OWN
+        previously-written row (identical origin_service too) still gets full
+        REPLACE semantics, same as always -- only the PK tuple, now one column
+        wider, decides row identity.
 
-        KNOWN RESIDUAL GAP (M4 T7, deliberately not closed here -- needs a schema
-        change): if the CURRENT owner of a shared PK stops emitting that edge (e.g.
-        its producer/consumer registration is deleted from source) in a run where
-        the OTHER, still-asserting service is `--incremental`-SKIPPED, the owner's
-        own delete_file_layer/begin_service correctly clears the row -- and nothing
-        re-inserts it, because the sibling that still legitimately asserts it was
-        never reprocessed. The edge then wrongly stays absent until the sibling's
-        next non-skip run (and, mirror-wise, a full reindex of the same tree WOULD
-        have it -- a dump-equivalence divergence). Fully closing this requires
-        per-origin edge rows (origin_service joins the PK, both assertions coexist,
-        deletion becomes exact) -- a real SCHEMA_VERSION bump, tracked in the M4
-        backlog (.superpowers/sdd/progress.md, "M4-T7 backlog carry"), out of scope
-        for the conflict-resolution fix above."""
+        This closes M4 T7's own documented residual gap: that fix made a shared
+        PK's "winner" deterministic (first writer, permanently) but explicitly left
+        open the case where the CURRENT owner stops emitting the edge while the
+        OTHER, still-asserting service is `--incremental`-SKIPPED -- the owner's own
+        delete_file_layer/begin_service correctly cleared ITS row, and nothing
+        re-inserted it, so the edge wrongly vanished until the sibling's next
+        non-skip run. With per-origin rows, deleting one origin's row NEVER touches
+        a sibling origin's row for the identical key (see begin_service/
+        delete_file_layer's own docstrings -- their origin_service-scoped DELETEs
+        needed no change at all, they were already exact) -- a strictly STRONGER
+        invariant than "first writer wins", not a weakening of it.
+
+        The graph itself must still end up with exactly ONE edge per shared PK,
+        deterministically: that responsibility now lives in `pipeline/load.py`
+        (`_dedup_edges`, run over `Staging.iter_edges_with_origin()` before ever
+        batching to FalkorDB), not here -- see that function's own docstring for the
+        tie-break rules (priority resolution, then confidence, then
+        lexicographically-first origin). `Staging.iter_edges()` itself is
+        deliberately left returning raw, undeduplicated rows (see
+        `iter_edges_with_origin`'s own docstring for why every one of its OTHER
+        consumers is unaffected by that)."""
+        origin = origin_service or ""
         prepared = []
         for e in rows:
             ss, ds = _id_service(e.src), _id_service(e.dst)
@@ -582,16 +572,9 @@ class Staging:
             via_channel = e.props.get("via_channel_id", "")
             prepared.append((e.src, e.dst, e.type, via_channel, e.resolution, e.confidence,
                              e.extractor, e.evidence_file, e.evidence_line,
-                             json.dumps(e.props), origin_service))
+                             json.dumps(e.props), origin))
         self._db.executemany(
-            "INSERT INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(src, dst, type, via_channel) DO UPDATE SET "
-            "resolution=excluded.resolution, confidence=excluded.confidence, "
-            "extractor=excluded.extractor, evidence_file=excluded.evidence_file, "
-            "evidence_line=excluded.evidence_line, props=excluded.props, "
-            "origin_service=excluded.origin_service "
-            "WHERE edges.origin_service IS excluded.origin_service "
-            "OR edges.origin_service IS NULL",
+            "INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             prepared,
         )
         self._db.commit()
@@ -654,42 +637,59 @@ class Staging:
         return len(orphan_ids)
 
     def update_edge_props(self, src: str, dst: str, type: str, merge: dict) -> bool:  # noqa: A002
-        """Json-merge поверх существующих props ребра (src,dst,type) -- shallow
-        `{**old, **merge}`, merge побеждает при коллизии ключей. No-op (возвращает
-        False), если такого ребра нет; True при успешном обновлении.
+        """Json-merge поверх существующих props КАЖДОЙ строки-ребра (src,dst,type) --
+        shallow `{**old, **merge}` НЕЗАВИСИМО на строку, merge побеждает при
+        коллизии ключей. No-op (возвращает False), если такого ребра нет вовсе; True
+        при успешном обновлении хотя бы одной строки.
 
         type=="NEXT_SEGMENT" -- InvariantError, не молчаливая порча данных: этот метод
         ключуется по (src,dst,type), a NE via_channel, в отличие от РЕАЛЬНОГО PK рёбер
-        (src,dst,type,via_channel -- M3 T1, см. core/schema.py SCHEMA_VERSION история
-        "2 -> 3"). Начиная с parallel-channel фикса linking/segments.py.derive, у
-        NEXT_SEGMENT легитимно бывает НЕСКОЛЬКО строк с одинаковым (src,dst,type),
-        различающихся только via_channel -- SELECT ниже без ORDER BY взял бы props
-        ПРОИЗВОЛЬНОЙ из них, а последующий UPDATE (тот же WHERE, без via_channel)
-        переписал бы props ОБЕИХ строк идентичным (одним) результатом слияния --
-        тихая порча данных, не просто "обновили не ту строку". Единственный реальный
-        вызыватель (linking/workspace.py, temporal-start пометка) всегда передаёт
-        type="CALLS", так что guard ничего ему не стоит."""
+        (src,dst,type,via_channel,origin_service -- M3 T1 + M5 T4, см. core/schema.py
+        SCHEMA_VERSION история "2 -> 3"/"5 -> 6"). Начиная с parallel-channel фикса
+        linking/segments.py.derive, у NEXT_SEGMENT легитимно бывает НЕСКОЛЬКО строк с
+        одинаковым (src,dst,type), различающихся ТОЛЬКО via_channel -- обновление всех
+        строк группы (см. ниже) переписало бы props ОБЕИХ строк одним и тем же merge,
+        стерев то, что у них РАЗНОЕ по смыслу (via_channel-специфичные props). Guard
+        остаётся ровно тем же, чем был. Единственный реальный вызыватель
+        (linking/workspace.py, temporal-start пометка) всегда передаёт type="CALLS",
+        так что guard ничего ему не стоит.
+
+        M5 T4 (SCHEMA_VERSION 6): origin_service присоединился к PK рёбер, так что
+        голый (src,dst,type)-ключ теперь МОЖЕТ законно матчить БОЛЬШЕ ОДНОЙ строки --
+        одну на каждый origin, ровно та же природа неоднозначности, от которой уже
+        защищает guard выше, только по другой оси (origin, не via_channel). Для
+        CALLS (единственный реальный тип-получатель) via_channel всегда '' (CALLS
+        никогда не несёт via_channel_id в props), так что здесь она не даёт НИКАКОЙ
+        новой неоднозначности -- различаться между строками группы может ТОЛЬКО
+        origin_service. Пометка temporal-start принадлежит паре (src,dst) семантически
+        (см. workspace.py._apply_temporal_start_marks), а не тому, чей origin первым
+        записал свою CALLS-строку -- поэтому merge применяется К КАЖДОЙ строке группы
+        независимо (каждая сохраняет СВОИ собственные исходные props, кроме
+        смёрженных ключей), а не только к первой найденной."""
         if type == "NEXT_SEGMENT":
             raise InvariantError(
                 "update_edge_props does not support type='NEXT_SEGMENT': this method's "
                 "(src,dst,type) key does not distinguish via_channel, but NEXT_SEGMENT's "
-                "real primary key is (src,dst,type,via_channel) and can legitimately hold "
-                "more than one row per (src,dst) pair (see core/schema.py SCHEMA_VERSION "
-                "history '2 -> 3') -- updating by (src,dst,type) alone would silently "
-                "overwrite every matching row's props with one arbitrary merge result"
+                "real primary key is (src,dst,type,via_channel,origin_service) and can "
+                "legitimately hold more than one row per (src,dst) pair (see "
+                "core/schema.py SCHEMA_VERSION history '2 -> 3') -- updating by "
+                "(src,dst,type) alone would silently overwrite every matching row's "
+                "props with one arbitrary merge result"
             )
-        row = self._db.execute(
-            "SELECT props FROM edges WHERE src=? AND dst=? AND type=?",
+        rows = self._db.execute(
+            "SELECT origin_service, props FROM edges WHERE src=? AND dst=? AND type=?",
             (src, dst, type),
-        ).fetchone()
-        if row is None:
+        ).fetchall()
+        if not rows:
             return False
-        props = json.loads(row[0])
-        props.update(merge)
-        self._db.execute(
-            "UPDATE edges SET props=? WHERE src=? AND dst=? AND type=?",
-            (json.dumps(props), src, dst, type),
-        )
+        for origin_service, props_json in rows:
+            props = json.loads(props_json)
+            props.update(merge)
+            self._db.execute(
+                "UPDATE edges SET props=? WHERE src=? AND dst=? AND type=? "
+                "AND origin_service=?",
+                (json.dumps(props), src, dst, type, origin_service),
+            )
         self._db.commit()
         return True
 
@@ -1092,6 +1092,13 @@ class Staging:
                           props=json.loads(props), roles=roles)
 
     def iter_edges(self) -> Iterator[EdgeRec]:
+        """RAW, undeduplicated rows -- one per (src,dst,type,via_channel,
+        origin_service) PK tuple. Since M5 T4 (SCHEMA_VERSION 6), a shared edge
+        (today, only a chan:-to-chan: CONTAINS pair -- see `upsert_edges`' own
+        docstring) can legitimately surface here as MORE THAN ONE row, one per
+        origin that asserts it -- this method deliberately does NOT collapse them
+        (see `iter_edges_with_origin`'s own docstring for why that's safe for every
+        consumer of THIS method, and for where the real collapsing happens)."""
         cur = self._db.execute(
             "SELECT src, dst, type, resolution, confidence, extractor, "
             "evidence_file, evidence_line, props FROM edges")
@@ -1099,6 +1106,48 @@ class Staging:
             yield EdgeRec(src=src, dst=dst, type=type_, resolution=res,
                           confidence=conf, extractor=ext, evidence_file=ef,
                           evidence_line=el, props=json.loads(props))
+
+    def iter_edges_with_origin(self) -> Iterator[tuple[EdgeRec, str]]:
+        """Like `iter_edges` (same raw, undeduplicated rows), but additionally
+        yields each row's `origin_service` alongside its `EdgeRec` -- the ONE piece
+        of information `iter_edges` itself never surfaced (see its own tests'
+        `# noqa: SLF001` raw-SQL workarounds) and the ONE thing `pipeline/load.py`
+        needs that no other `iter_edges` consumer does: its own `_dedup_edges`
+        breaks a shared edge's now-possibly-multiple per-origin rows down to one,
+        deterministically, and the tie-break's last rule is "lexicographically-first
+        origin_service" (see `_dedup_edges`' own docstring) -- there is no way to
+        implement that rule without origin_service travelling alongside each row.
+
+        This is a SEPARATE method rather than a change to `iter_edges` itself (which
+        would have meant adding an `origin_service` field to `EdgeRec` -- a
+        general-purpose IR type constructed at dozens of call sites across every
+        extractor, none of which have any use for it) on purpose: every other
+        `iter_edges` consumer (`linking/segments.py`'s `derive`, `linking/
+        processes.py`, `chunking/augment.py`, `evalx/edges_eval.py`, `evalx/
+        calls_eval.py`) has no use for origin_service and is unaffected by a shared
+        edge's now-possibly-multiple rows in the first place -- PRODUCES/CONSUMES/
+        HANDLES all pin one endpoint to a single sym:-prefixed, single-service id
+        (so two different origins can never assert the identical (src,dst,type) for
+        those types at all), and CONTAINS specifically -- the one type that CAN be
+        shared -- either collapses into an identical result on its own
+        (`segments.derive`'s own `derived` dict keys on the pairing OUTCOME, so a
+        duplicate `contains_pairs` entry just re-derives the same edge a second
+        time) or is never looked up by a chan:-prefixed id at all (`chunking/
+        augment.py`'s `contains_children`/`contains_parent` are only ever consulted
+        by a code SYMBOL's own id when climbing/aggregating its structural CONTAINS
+        neighborhood) or is already folded into a `set` (`evalx`'s comparison
+        tuples) -- see this task's own report for the full per-consumer argument.
+        `iter_edges()` itself is therefore left completely unchanged."""
+        cur = self._db.execute(
+            "SELECT src, dst, type, resolution, confidence, extractor, "
+            "evidence_file, evidence_line, props, origin_service FROM edges")
+        for (src, dst, type_, res, conf, ext, ef, el, props, origin) in cur:
+            yield (
+                EdgeRec(src=src, dst=dst, type=type_, resolution=res,
+                        confidence=conf, extractor=ext, evidence_file=ef,
+                        evidence_line=el, props=json.loads(props)),
+                origin,
+            )
 
     def iter_chunks(self) -> Iterator[ChunkRow]:
         """For load (T6): every staged chunk, across all services."""

@@ -23,6 +23,19 @@ known_ids собирается ПОКА обходим все узлы (один
 должен отражать ПОЛНЫЙ набор узлов графа, не только уже записанную лейбл-группу
 (иначе ребро между двумя ещё не сгруппированными узлами дропалось бы ложно).
 
+M5 T4 (SCHEMA_VERSION 6, closes the M4-T7 "shared edge" residual gap -- see
+core/schema.py's own history entry and stores/staging.py's upsert_edges docstring):
+staging can now legitimately hold MULTIPLE rows for the identical
+(src,dst,type,via_channel) key -- one per origin service that independently
+asserts it (e.g. a kafka producer's and a consumer's own idiom config both
+independently deriving the same CONTAINS topic->event edge). `load_graph` reads
+edges via `staging.iter_edges_with_origin()` (not the plain `iter_edges()` every
+OTHER staging consumer still uses) and runs them through `_dedup_edges` -- which
+collapses each such group down to exactly ONE deterministic winner -- BEFORE any
+edge is grouped by type or ever batched to FalkorDB, so the loaded graph always
+ends up with exactly one edge per shared PK, regardless of how many origins assert
+it. See `_dedup_edges`' own docstring for the exact tie-break rules.
+
 Свойства узлов/рёбер: None-значения ВЫРЕЗАНЫ из props целиком, не переданы как
 null. Живой пробой (см. отчёт m1b-task-5) подтверждено: FalkorDB `SET n += {k:
 null}` для НИКОГДА не существовавшего свойства -- no-op (ключ не появляется);
@@ -90,7 +103,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from codegraph.core.errors import InvariantError
 from codegraph.core.schema import SCHEMA_VERSION, EdgeRec, NodeRec
@@ -186,6 +199,80 @@ def _edge_row(e: EdgeRec) -> dict:
     for key in _key_props_for(e.type):
         row[key] = e.props.get(key, "")
     return row
+
+
+# M5 T4 (SCHEMA_VERSION 6): resolution priority for _dedup_edges' winner-per-group
+# selection -- trace_validated (not emitted by any extractor today, see core/
+# schema.py's RESOLUTIONS -- reserved for a future OTel/trace-confirmed edge) ranks
+# ABOVE static since it represents STRONGER evidence (a runtime-observed edge, not
+# just a resolved static reference); static > dynamic > heuristic is the M5 plan's
+# own literal 3-tier order -- the only three resolutions any current extractor
+# actually emits (see linking/segments.py's own "no current extractor puts
+# dynamic/trace_validated on PRODUCES/CONSUMES/CALLS_HTTP/HANDLES" note; "dynamic"
+# IS used elsewhere, by linking/workspace.py's temporal-start marking on CALLS,
+# just never on one of those four specific boundary types).
+_RESOLUTION_RANK: dict[str, int] = {
+    "trace_validated": 3,
+    "static": 2,
+    "dynamic": 1,
+    "heuristic": 0,
+}
+
+
+def _dedup_edges(rows: Iterable[tuple[EdgeRec, str]]) -> list[EdgeRec]:
+    """M5 T4 (SCHEMA_VERSION 6, closes the M4-T7 "shared edge" residual gap for
+    real -- see core/schema.py's own SCHEMA_VERSION history entry and
+    stores/staging.py's upsert_edges docstring): groups `rows` -- (EdgeRec,
+    origin_service) pairs straight off `staging.iter_edges_with_origin()` -- by
+    (src,dst,type,via_channel) [via_channel derived the exact same way
+    Staging.upsert_edges derives its own PK column: `props.get("via_channel_id",
+    "")`] and returns exactly ONE EdgeRec per group.
+
+    Staging can now legitimately hold MULTIPLE rows for the identical
+    (src,dst,type,via_channel) key -- one per origin service that independently
+    asserts it (today, only ever a chan:-to-chan: CONTAINS topic->event pair, e.g.
+    both a kafka producer's AND a consumer's own idiom config independently
+    deriving the same containment edge -- see this task's own report for why every
+    OTHER edge type structurally can't have this happen: PRODUCES/CONSUMES/HANDLES
+    all pin one endpoint to a single sym:-prefixed, single-service id) -- but the
+    loaded GRAPH must still end up with exactly one edge there, deterministically,
+    regardless of how many origins assert it or what order staging happens to
+    yield their rows in (a live SQLite table scan has no guaranteed order this
+    function may rely on).
+
+    Winner selection, applied in order (each rule only breaks ties the previous one
+    left standing):
+      1. highest-priority `resolution` -- see `_RESOLUTION_RANK` above.
+      2. highest `confidence` (ties within the same resolution tier).
+      3. lexicographically-FIRST `origin_service` ('' -- an origin-less, S7/
+         linking-derived row -- sorts before every real service name; this rule
+         alone still makes the pick well-defined even in that edge case).
+    Fully deterministic and independent of input order -- pinned exhaustively (all
+    permutations of a 3-row group) by
+    test_dedup_edges_is_deterministic_regardless_of_input_order.
+
+    A single-row group (the overwhelming majority of edges -- every type except a
+    chan:-to-chan: CONTAINS pair) is returned unchanged, no comparison needed."""
+    groups: dict[tuple[str, str, str, str], list[tuple[EdgeRec, str]]] = {}
+    for e, origin in rows:
+        key = (e.src, e.dst, e.type, e.props.get("via_channel_id", ""))
+        groups.setdefault(key, []).append((e, origin))
+
+    winners: list[EdgeRec] = []
+    for group in groups.values():
+        if len(group) == 1:
+            winners.append(group[0][0])
+            continue
+        edge, _origin = min(
+            group,
+            key=lambda pair: (
+                -_RESOLUTION_RANK.get(pair[0].resolution, -1),
+                -pair[0].confidence,
+                pair[1],
+            ),
+        )
+        winners.append(edge)
+    return winners
 
 
 # -- M3 T6: Chunk nodes + Meta node (see module docstring for why this is a separate
@@ -417,10 +504,11 @@ def load_graph(
         nodes_written += meta_written
         nodes_written_by_label[":".join(_META_LABELS)] = meta_written
 
-    # -- 2. edges: сгруппировать по type; known_ids уже ПОЛНЫЙ (весь проход nodes
-    # выше завершён до этой точки) --
+    # -- 2. edges: dedup shared-edge groups (M5 T4 -- see _dedup_edges' own
+    # docstring and the module docstring's own M5 T4 paragraph) THEN group by type;
+    # known_ids уже ПОЛНЫЙ (весь проход nodes выше завершён до этой точки) --
     edges_by_type: dict[str, list[dict]] = defaultdict(list)
-    for e in staging.iter_edges():
+    for e in _dedup_edges(staging.iter_edges_with_origin()):
         edges_by_type[e.type].append(_edge_row(e))
 
     edges_written = 0

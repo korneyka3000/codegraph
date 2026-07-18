@@ -99,7 +99,83 @@ from codegraph.core import ids
 #     legitimately have a non-NULL `input_hash` and a still-NULL `embedding` (freshly
 #     chunked, headers filled, not embedded yet), which that CHECK's NULL-together
 #     invariant says nothing about.
-SCHEMA_VERSION = 5
+#   5 -> 6 (M5 T4, closes the M4-T7 "shared edge" residual gap for real): edges'
+#     PRIMARY KEY widens ONE MORE column, to (src, dst, type, via_channel,
+#     origin_service) -- and `origin_service` becomes `TEXT NOT NULL DEFAULT ''`
+#     (previously nullable; NULL, meaning "no owner" -- S7/linking-derived batches,
+#     see Staging.upsert_edges' own docstring -- is now represented as the empty
+#     string instead, since a PRIMARY KEY column can never be NULL in SQLite). This
+#     is the SAME kind of PK-widening migration as 2 -> 3 above (via_channel joining
+#     the PK) -- SQLite cannot ALTER a PRIMARY KEY in place, so there is, again, no
+#     data-preserving upgrade path: `CREATE TABLE IF NOT EXISTS` against an
+#     already-existing v5 `edges` table is a pure no-op (it does NOT retroactively
+#     widen that table's PK, no matter how the DDL string changed), so an unguarded
+#     old file would silently keep the OLD, narrower PK forever -- reopening one now
+#     is a LOUD failure (`Staging._check_schema_version_before_ddl` raises
+#     InvariantError) exactly like every other entry in this history.
+#
+#     WHY: M4 T7 (see the pre-this-bump `Staging.upsert_edges` docstring, still
+#     legible in git history) discovered that two DIFFERENT services can
+#     legitimately assert the IDENTICAL (src, dst, type, via_channel) edge -- e.g.
+#     kafka_ext.py's producer branch (THIS service sends to topic X, event Y) and a
+#     DIFFERENT service's consumer branch (its own dispatch_dict registers a
+#     handler for topic X, event Y) each independently derive the SAME `CONTAINS
+#     chan:kafka_topic:X -> chan:event_type:Y` edge from their own service's idiom
+#     config. M4 T7 fixed the resulting non-determinism (which "winner" a plain
+#     `INSERT OR REPLACE` picked depended on `cfg.services` iteration order, stable
+#     under a full reindex but NOT under `--incremental`) by making the FIRST
+#     writer's row win, permanently, via a conflict-aware UPSERT -- but explicitly
+#     documented a residual gap it deliberately left open, needing a real schema
+#     change to close: if the CURRENT owner of a shared PK stops emitting that edge
+#     (e.g. its producer/consumer registration is deleted from source) in a run
+#     where the OTHER, still-asserting service is `--incremental`-SKIPPED, the
+#     owner's own delete_file_layer/begin_service correctly clears its row -- and
+#     nothing re-inserts it, because the sibling that still legitimately asserts it
+#     was never reprocessed. The edge then wrongly vanishes until the sibling's next
+#     non-skip run (a dump-equivalence divergence against a full reindex of the same
+#     tree, which WOULD still have it).
+#
+#     FIX: origin_service joining the PK means each emitting service now owns its
+#     OWN row for a shared edge, unconditionally -- both origins' assertions coexist
+#     as two separate rows, and deleting one origin's row (its own begin_service or
+#     delete_file_layer, scoped by origin_service exactly as before -- see those
+#     methods' own docstrings, unchanged in semantics) never touches a sibling
+#     origin's row for the identical (src, dst, type, via_channel) key. This is a
+#     STRICTLY STRONGER invariant than M4 T7's "first writer wins" (no origin's
+#     assertion is ever silently discarded any more, not even temporarily) -- not a
+#     weakening of it. `Staging.upsert_edges` goes back to a plain, honest `INSERT
+#     OR REPLACE` per the new (wider) PK -- the M4 T7 conflict-aware `ON CONFLICT ...
+#     DO UPDATE ... WHERE` guard, and its own KNOWN RESIDUAL GAP paragraph, are both
+#     removed outright (superseded, not layered on top of).
+#
+#     The graph itself must still end up with exactly ONE edge for a shared PK,
+#     deterministically, regardless of how many origins assert it: that is now
+#     `pipeline/load.py`'s job, not staging's -- `load_graph` groups staged edges by
+#     (src, dst, type, via_channel) and picks a single deterministic winner per group
+#     (priority resolution static > dynamic > heuristic, then max confidence, then
+#     lexicographically-first origin_service) BEFORE ever batching to FalkorDB -- see
+#     that module's own `_dedup_edges` docstring for the exact tie-break rules.
+#     `Staging.iter_edges()` itself is deliberately left alone (still yields raw,
+#     undeduplicated rows, exactly as before) -- every one of its OTHER consumers
+#     (linking/segments.py's `derive`, linking/processes.py, chunking/augment.py,
+#     evalx/edges_eval.py, evalx/calls_eval.py) either only ever cares about edge
+#     TYPES a shared PK can't arise for in practice (PRODUCES/CONSUMES/HANDLES all
+#     have a sym:-prefixed, single-service-owned endpoint; only a chan:-to-chan:
+#     CONTAINS edge has no such anchor), or already collapses duplicates innocuously
+#     on its own (segments.py's own `derived` dict keys on the pairing OUTCOME, so a
+#     duplicate `contains_pairs` entry just re-derives an identical result; the
+#     evalx modules build plain `set`s of comparison tuples) -- see this task's own
+#     report for the full per-consumer argument.
+#
+#     `Staging.update_edge_props` (the ONE other place a bare (src, dst, type) key
+#     was ever assumed to identify at most one row -- linking/workspace.py's
+#     temporal-start marking, the sole real caller) is updated to apply its merge to
+#     EVERY matching row, across every origin, independently -- the temporal-start
+#     tag belongs to the (src, dst) PAIR semantically (see that call site's own
+#     docstring), not to whichever origin happened to write its CALLS row first. Its
+#     pre-existing NEXT_SEGMENT guard (via_channel ambiguity, unrelated to this bump)
+#     is untouched.
+SCHEMA_VERSION = 6
 NODE_KINDS = frozenset({
     "Service", "Module", "Class", "Function", "Channel", "BusinessProcess",
 })

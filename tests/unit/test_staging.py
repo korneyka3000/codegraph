@@ -74,26 +74,36 @@ def test_edge_replace_on_pk(tmp_path):
     assert len(edges) == 1 and edges[0].props["callsite_count"] == 3
 
 
-# -- M4 T7: cross-origin_service PK collision -- discovered live by the incremental-
-# equivalence gate (tests/eval/test_incremental_gate.py). Two DIFFERENT services can
-# legitimately assert the IDENTICAL (src,dst,type,via_channel) edge -- e.g. a kafka
-# producer's and a consumer's independently-derived CONTAINS topic->event edge (both
+# -- M4 T7 (superseded by M5 T4 below): cross-origin_service PK collision --
+# discovered live by the incremental-equivalence gate (tests/eval/
+# test_incremental_gate.py). Two DIFFERENT services can legitimately assert the
+# IDENTICAL (src,dst,type,via_channel) edge -- e.g. a kafka producer's and a
+# consumer's independently-derived CONTAINS topic->event edge (both
 # extractors/kafka_ext.py's own producer and consumer branches derive the same
-# chan:kafka_topic:X -> chan:event_type:Y pair from their OWN service's idiom config).
-# Plain last-write-wins (the pre-this-task `INSERT OR REPLACE`) made the "winner"
-# depend purely on `cfg.services` iteration order -- stable under a FULL reindex
-# (every service reprocessed, every run, same order) but NOT under `--incremental`
-# (a skipped sibling's earlier-written row can be silently overwritten by a DIFFERENT,
-# reprocessed service's fresh write, or vice versa -- whichever happens to run this
-# time), breaking the milestone's own dump-equivalence invariant. Fix: a write to a
-# PK already OWNED by a DIFFERENT, non-null origin_service is a no-op (the existing
-# assertion survives untouched) -- stable regardless of which subset of services
-# actually runs in a given `codegraph index` pass, since whichever service is FIRST
-# in `cfg.services` order to ever claim a given shared PK keeps it for good (as long
-# as it keeps asserting it).
+# chan:kafka_topic:X -> chan:event_type:Y pair from their OWN service's idiom
+# config). M4 T7 made the "winner" of such a collision deterministic (first writer,
+# regardless of `cfg.services` order) but left a documented residual gap: an
+# `--incremental` run where the FIRST writer stops asserting the edge while the
+# SECOND, skipped sibling never gets a chance to (re)claim it loses the edge
+# entirely, even though the sibling still legitimately asserts it.
+#
+# M5 T4 closes this for good: `origin_service` now joins the PRIMARY KEY
+# (SCHEMA_VERSION 5 -> 6, see core/schema.py's history entry) -- both origins' rows
+# now coexist, unconditionally, as two SEPARATE rows. This is a STRICTLY STRONGER
+# invariant than M4 T7's "first writer wins" (no origin's assertion is ever
+# silently discarded any more), not a weakening of it -- the tests below replace
+# M4 T7's old first-writer-wins mirror-ordering pair with the new coexistence
+# contract. `pipeline/load.py` (see test_pipeline_load_labels.py) is what
+# deterministically collapses a shared edge's multiple staged rows back down to
+# ONE graph edge at load time -- staging itself no longer tries to pick a winner.
 
 
-def test_upsert_edges_cross_origin_service_pk_collision_preserves_first_writer(tmp_path):
+def test_upsert_edges_different_origins_coexist_as_separate_rows_write_order_a_then_b(
+    tmp_path,
+):
+    """Two different origins writing the IDENTICAL (src,dst,type,via_channel) key --
+    both rows must survive as two distinct `edges` rows (origin now joins the PK),
+    regardless of write order (mirrored below by the b-then-a variant)."""
     st = Staging(tmp_path / "s.db")
     e_a = EdgeRec("chan:kafka_topic:t", "chan:event_type:e", "CONTAINS", "static", 1.0,
                   "kafka", evidence_file="a.py", evidence_line=1)
@@ -104,22 +114,24 @@ def test_upsert_edges_cross_origin_service_pk_collision_preserves_first_writer(t
     st.upsert_edges([e_b], origin_service="svc-b")
 
     edges = list(st.iter_edges())
-    assert len(edges) == 1
-    assert edges[0].evidence_file == "a.py"  # first writer's assertion survives untouched
-    row = st._db.execute(  # noqa: SLF001 -- origin_service isn't surfaced by iter_edges()
-        "SELECT origin_service FROM edges WHERE src=? AND dst=? AND type=?",
-        (e_a.src, e_a.dst, e_a.type),
-    ).fetchone()
-    assert row[0] == "svc-a"
+    assert len(edges) == 2
+    assert {e.evidence_file for e in edges} == {"a.py", "b.py"}
+    origins = {
+        row[0] for row in st._db.execute(  # noqa: SLF001 -- origin_service isn't surfaced by iter_edges()
+            "SELECT origin_service FROM edges WHERE src=? AND dst=? AND type=?",
+            (e_a.src, e_a.dst, e_a.type),
+        )
+    }
+    assert origins == {"svc-a", "svc-b"}
 
 
-def test_upsert_edges_cross_origin_service_pk_collision_mirror_order_first_writer_wins(tmp_path):
-    """Mirror of the test above with the write ORDER swapped (svc-b first): svc-b's
-    row must survive svc-a's later conflicting write. Pins that the guard's WHERE
-    clause is genuinely SYMMETRIC ("whichever origin writes first wins") rather than
-    accidentally favoring one hardcoded service/ordering -- without this, a
-    regression that, say, compared against a fixed service name (or inverted the IS
-    comparison) could still pass the one-ordering test above."""
+def test_upsert_edges_different_origins_coexist_as_separate_rows_write_order_b_then_a(
+    tmp_path,
+):
+    """Mirror of the test above with the write ORDER swapped -- pins that
+    coexistence is genuinely symmetric, not an artifact of which origin happened to
+    write first (the property the OLD first-writer-wins mirror-ordering pair used to
+    pin about the opposite, weaker M4 T7 behavior)."""
     st = Staging(tmp_path / "s.db")
     e_b = EdgeRec("chan:kafka_topic:t", "chan:event_type:e", "CONTAINS", "static", 1.0,
                   "kafka", evidence_file="b.py", evidence_line=2)
@@ -130,20 +142,15 @@ def test_upsert_edges_cross_origin_service_pk_collision_mirror_order_first_write
     st.upsert_edges([e_a], origin_service="svc-a")
 
     edges = list(st.iter_edges())
-    assert len(edges) == 1
-    assert edges[0].evidence_file == "b.py"  # first writer (svc-b this time) still wins
-    row = st._db.execute(  # noqa: SLF001 -- origin_service isn't surfaced by iter_edges()
-        "SELECT origin_service FROM edges WHERE src=? AND dst=? AND type=?",
-        (e_b.src, e_b.dst, e_b.type),
-    ).fetchone()
-    assert row[0] == "svc-b"
+    assert len(edges) == 2
+    assert {e.evidence_file for e in edges} == {"a.py", "b.py"}
 
 
 def test_upsert_edges_same_origin_service_re_upsert_still_replaces(tmp_path):
-    """The new cross-origin guard must never block a service from refreshing its OWN
-    row (e.g. a re-run after that file's content changed) -- full REPLACE semantics
-    still apply whenever the incoming write's origin_service matches the row's
-    current owner."""
+    """Unlike two DIFFERENT origins (which now coexist, see above), re-upserting at
+    the IDENTICAL full PK -- including the SAME origin_service -- must still REPLACE
+    in place, not add a second row: full REPLACE semantics apply whenever every PK
+    column (including origin) matches exactly."""
     st = Staging(tmp_path / "s.db")
     e1 = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "CALLS", "static", 1.0,
                  "calls", evidence_file="a.py", evidence_line=1)
@@ -160,22 +167,29 @@ def test_upsert_edges_same_origin_service_re_upsert_still_replaces(tmp_path):
     assert edges[0].evidence_line == 5
 
 
-def test_upsert_edges_null_origin_row_can_be_claimed_by_a_real_origin(tmp_path):
-    """A row with no origin_service yet (S7/linking-derived, e.g. PART_OF_PROCESS)
-    can still be refreshed at the identical PK -- the new guard only ever blocks a
-    REAL, DIFFERENT origin_service, never an absent (null) one."""
+def test_upsert_edges_origin_less_row_and_real_origin_row_coexist_as_separate_rows(
+    tmp_path,
+):
+    """M5 T4 behavior change (was `test_upsert_edges_null_origin_row_can_be_claimed_
+    by_a_real_origin`: an origin-less write used to REPLACE in place at the shared
+    PK, back when origin_service was a plain column rather than part of it). Now
+    that origin_service ('' -- the NULL->'' convention, see core/schema.py's
+    SCHEMA_VERSION "5 -> 6" history) genuinely joins the PK, an origin-less (S7/
+    linking-derived) row and a real-origin row for the SAME (src,dst,type,
+    via_channel) are two DIFFERENT PK tuples -- they coexist, exactly like two real,
+    different origins do above."""
     st = Staging(tmp_path / "s.db")
     e1 = EdgeRec("proc:p", "sym:a:`m`/f().", "PART_OF_PROCESS", "derived", 1.0,
                  "linking", evidence_file="a.py")
-    st.upsert_edges([e1])  # origin_service=None (default)
+    st.upsert_edges([e1])  # origin_service=None (default) -> stored as ''
 
     e2 = EdgeRec("proc:p", "sym:a:`m`/f().", "PART_OF_PROCESS", "derived", 1.0,
                  "linking", evidence_file="a.py", evidence_line=9)
     st.upsert_edges([e2], origin_service="svc-a")
 
     edges = list(st.iter_edges())
-    assert len(edges) == 1
-    assert edges[0].evidence_line == 9
+    assert len(edges) == 2
+    assert {e.evidence_line for e in edges} == {None, 9}
 
 
 def test_module_set(tmp_path):
@@ -322,6 +336,47 @@ def test_v4_pre_m4_database_raises_invariant_error_not_operational_error(tmp_pat
         "embedded_hash TEXT, "
         "CHECK ((embedding IS NULL) = (embed_model IS NULL) "
         "AND (embedding IS NULL) = (embedded_hash IS NULL)))"
+    )
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(InvariantError, match="recreate") as exc_info:
+        Staging(path)
+    assert not isinstance(exc_info.value, sqlite3.OperationalError)
+
+
+def test_v5_pre_m5_t4_database_raises_invariant_error_not_operational_error(tmp_path):
+    """M5 T4's own 5 -> 6 bump (core/schema.py's SCHEMA_VERSION "5 -> 6" history
+    entry): a v5-shaped staging.db (pre-M5-T4: edges' PRIMARY KEY is (src, dst,
+    type, via_channel) -- origin_service is NOT part of it, and is nullable) must
+    fail with the loud, actionable InvariantError at Staging() construction -- via
+    the version-check-BEFORE-DDL path -- rather than silently keeping the OLD,
+    too-narrow PK (`CREATE TABLE IF NOT EXISTS` is a no-op against an
+    already-existing table of the same name, regardless of how its own DDL differs
+    -- SQLite cannot ALTER a PRIMARY KEY in place, the same "no migration, just
+    recreate" reasoning as the 2 -> 3 via_channel PK widening).
+
+    Unlike the v3/v4 bumps above, an unguarded old file here would NOT raise a raw
+    OperationalError at all -- every column `upsert_edges` writes already existed
+    since v2, so the old INSERT would simply succeed and silently misbehave (two
+    different origins asserting the identical shared edge would collide on the OLD
+    4-column PK and clobber each other, reproducing the exact M4 T7 residual gap
+    this task closes) instead of crashing. That makes the loud version-check even
+    MORE load-bearing here than for a column-addition bump, not less -- there is no
+    natural OperationalError tripwire to fall back on if this check were ever
+    accidentally skipped."""
+    path = tmp_path / "v5.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    raw.execute("INSERT INTO meta VALUES ('schema_version', '5')")
+    # the v5-era edges table shape (M3 T1's DDL -- via_channel joined the PK, but
+    # origin_service did not, and is still nullable).
+    raw.execute(
+        "CREATE TABLE edges(src TEXT, dst TEXT, type TEXT, "
+        "via_channel TEXT NOT NULL DEFAULT '', resolution TEXT, confidence REAL, "
+        "extractor TEXT, evidence_file TEXT, evidence_line INTEGER, props TEXT, "
+        "origin_service TEXT, "
+        "PRIMARY KEY(src, dst, type, via_channel))"
     )
     raw.commit()
     raw.close()
@@ -591,6 +646,39 @@ def test_begin_service_deletes_regular_sym_src_edge_tagged_with_origin_service(t
     assert list(st.iter_edges()) == []
 
 
+# -- M5 T4: begin_service scoping over a SHARED edge's per-origin rows -- the
+# headline correctness fix, proven directly at the staging level (the gate-level
+# proof lives in tests/eval/test_incremental_gate.py's own residual-gap case).
+
+
+def test_begin_service_of_one_origin_leaves_the_sibling_origins_shared_row_intact(
+    tmp_path,
+):
+    """A shared edge's per-origin rows are deleted/kept INDEPENDENTLY -- one
+    origin's own begin_service (a full re-analyze; delete_file_layer, M4 T5's
+    incremental sibling, follows the identical origin_service-scoped deletion
+    contract) only ever removes ITS OWN row, never a sibling origin's row for the
+    identical (src,dst,type,via_channel) key. This is exactly what closes the M4 T7
+    residual gap: the OLD single-row-per-PK scheme had only ONE row to lose here,
+    no matter which origin "owned" it -- deleting the owner's row (correctly, on
+    its own re-index) left NOTHING behind for the sibling to inherit, even though
+    the sibling still legitimately asserts the same edge."""
+    st = Staging(tmp_path / "s.db")
+    e_a = EdgeRec("chan:kafka_topic:t", "chan:event_type:e", "CONTAINS", "static", 1.0,
+                  "kafka", evidence_file="a.py", evidence_line=1)
+    st.upsert_edges([e_a], origin_service="svc-a")
+    e_b = EdgeRec("chan:kafka_topic:t", "chan:event_type:e", "CONTAINS", "static", 1.0,
+                  "kafka", evidence_file="b.py", evidence_line=2)
+    st.upsert_edges([e_b], origin_service="svc-b")
+
+    # svc-a stops asserting the edge (e.g. re-index finds no matching call site).
+    st.begin_service("svc-a")
+
+    edges = list(st.iter_edges())
+    assert len(edges) == 1
+    assert edges[0].evidence_file == "b.py"  # svc-b's own row survives untouched
+
+
 # -- M2: claims --
 
 
@@ -754,6 +842,35 @@ def test_update_edge_props_rejects_next_segment_type(tmp_path):
     st = Staging(tmp_path / "s.db")
     with pytest.raises(InvariantError):
         st.update_edge_props("sym:a:x", "sym:b:y", "NEXT_SEGMENT", {"k": "v"})
+
+
+# -- M5 T4: update_edge_props now updates EVERY row of the (src,dst,type) group,
+# not just one -- origin_service joining the PK means a (src,dst,type) key can now
+# legitimately match more than one row (one per origin), the exact same kind of
+# ambiguity the NEXT_SEGMENT guard above already polices for via_channel. The
+# temporal-start mark belongs to the (src,dst) PAIR semantically (see
+# linking/workspace.py's _apply_temporal_start_marks docstring), not to whichever
+# origin happened to write its own CALLS row first -- so every matching row gets
+# the merge, independently, each keeping its OWN pre-existing props otherwise
+# untouched.
+
+
+def test_update_edge_props_updates_every_row_of_the_group_across_origins(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    e_a = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "CALLS", "static", 1.0, "calls",
+                  props={"from": "a"})
+    e_b = EdgeRec("sym:a:`m`/f().", "sym:a:`m`/g().", "CALLS", "dynamic", 0.9, "linking",
+                  props={"from": "b"})
+    st.upsert_edges([e_a], origin_service="svc-a")
+    st.upsert_edges([e_b], origin_service="svc-b")
+    assert len(list(st.iter_edges())) == 2  # sanity: both origins really did coexist
+
+    ok = st.update_edge_props(e_a.src, e_a.dst, "CALLS", {"mechanism": "temporal_start"})
+    assert ok is True
+
+    by_from = {e.props["from"]: e.props for e in st.iter_edges()}
+    assert by_from["a"] == {"from": "a", "mechanism": "temporal_start"}
+    assert by_from["b"] == {"from": "b", "mechanism": "temporal_start"}
 
 
 # -- M3 T3: chunks (chunking.splitter.ChunkRec staged for T4/T6) --

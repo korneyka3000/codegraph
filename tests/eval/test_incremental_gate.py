@@ -33,6 +33,7 @@ import yaml
 from typer.testing import CliRunner
 
 from codegraph.cli import app
+from codegraph.core import ids
 from codegraph.stores.falkordb.store import FalkorStore
 from codegraph.stores.staging import Staging
 
@@ -262,6 +263,66 @@ def _delete_and_add_file(kyc_worker_dir: Path) -> None:
     )
 
 
+# -- M5 T4: residual-gap edits (closes the M4-T7 KNOWN RESIDUAL GAP for real --
+# per-origin shared-edge rows, SCHEMA_VERSION 6, see core/schema.py's own history
+# entry and stores/staging.py's upsert_edges docstring). Both edits below are
+# plain, targeted CALL-SITE removals -- pure incremental FILE edits, never an
+# idiom/config change (which would flip that service's fingerprint and force a
+# FULL re-analyze instead, see pipeline/analyze.py's own module docstring).
+
+
+def _remove_orders_api_producer_call_site(orders_api_dir: Path) -> None:
+    """Removes the ONE call site orders-api's own `outbox` producer idiom
+    (fixtures/workspace.yaml: event_type_from={arg: 0}, topic={const:
+    "orders.events"}) matches -- `OrderService.place`'s `outbox.add_event(
+    "OrderCreated", ...)` call in app/services/order.py. After this, orders-api's
+    own re-extraction of this file no longer emits its PRODUCES(place ->
+    event_type:OrderCreated) edge NOR its own row of the shared
+    CONTAINS(kafka_topic:orders.events -> event_type:OrderCreated) edge -- while
+    kyc-worker's INDEPENDENTLY-derived row for the IDENTICAL CONTAINS edge (from
+    its own dispatch_dict consumer idiom, app/consumers/orders.py) is left
+    completely untouched, exactly the M4-T7 residual-gap scenario."""
+    order_service = orders_api_dir / "app" / "services" / "order.py"
+    original = order_service.read_text()
+    edited = original.replace(
+        '        outbox = OutboxRepository(self._db)\n'
+        '        await outbox.add_event(\n'
+        '            "OrderCreated",\n'
+        '            {"order_id": order.id, "customer_id": order.customer_id},\n'
+        '        )\n',
+        "",
+    )
+    assert edited != original  # sanity: the replace actually matched something
+    order_service.write_text(edited)
+
+
+def _remove_kyc_worker_consumer_registration(kyc_worker_dir: Path) -> None:
+    """Removes kyc-worker's ONE dispatch_dict registration call site
+    (`register_handlers({"OrderCreated": handle_order_created})`,
+    app/consumers/orders.py) -- the call its own `dispatch-map` consumer idiom
+    matches. After both this AND `_remove_orders_api_producer_call_site` above have
+    run, NEITHER service asserts the shared CONTAINS edge any more -- it must
+    vanish from staging AND the graph entirely."""
+    consumers_orders = kyc_worker_dir / "app" / "consumers" / "orders.py"
+    original = consumers_orders.read_text()
+    edited = original.replace(
+        'register_handlers({"OrderCreated": handle_order_created})\n', "",
+    )
+    assert edited != original
+    consumers_orders.write_text(edited)
+
+
+def _contains_pairs_with_origin(dump: dict) -> dict[tuple[str, str], set[str]]:
+    """(src,dst) -> {origin_service, ...} for every staged CONTAINS row -- local
+    helper for the residual-gap assertions below, built off `_staging_dump`'s own
+    edge tuple shape (src,dst,type,via,res,conf,ext,ef,el,props,origin)."""
+    out: dict[tuple[str, str], set[str]] = {}
+    for src, dst, type_, *_rest, origin in dump["edges"]:
+        if type_ == "CONTAINS":
+            out.setdefault((src, dst), set()).add(origin)
+    return out
+
+
 # ============================================================================
 # -- the gate --
 # ============================================================================
@@ -415,6 +476,181 @@ def test_incremental_dump_equivalence_and_perf(tmp_path, falkordb_cfg, record_pr
         assert t_incremental_edit < 0.5 * t_full_cold_edited, (
             f"perf gate failed: t_incremental={t_incremental_edit:.2f}s is not < 50% "
             f"of t_full_cold={t_full_cold_edited:.2f}s (ratio={ratio:.1%})"
+        )
+    finally:
+        for name in graph_names:
+            FalkorStore(falkordb_cfg, name).delete_graph()
+            FalkorStore(falkordb_cfg, f"{name}__build").delete_graph()
+
+
+# ============================================================================
+# -- M5 T4: residual-gap sub-case (closes the M4-T7 KNOWN RESIDUAL GAP for real,
+# per-origin shared-edge rows, SCHEMA_VERSION 6 -- see core/schema.py's own
+# history entry and stores/staging.py's upsert_edges docstring) --
+# ============================================================================
+
+RESIDUAL_GAP_GRAPH_NAME = "__m5_t4_residual_gap_gate__"
+ORDERS_TOPIC = ids.chan_kafka("orders.events")
+ORDER_CREATED_EVENT = ids.chan_event("OrderCreated")
+
+
+@pytest.mark.skipif(shutil.which("npx") is None, reason="npx not available")
+def test_residual_gap_shared_edge_survives_sibling_removal_then_vanishes_when_both_stop(
+    tmp_path, falkordb_cfg, record_property,
+):
+    """M4-T7's own KNOWN RESIDUAL GAP scenario, reproduced live through the REAL
+    CLI and closed for good by this task's per-origin edge rows: kafka CONTAINS
+    (chan:kafka_topic:orders.events -> chan:event_type:OrderCreated) is asserted by
+    BOTH orders-api (its `outbox` producer idiom, app/services/order.py) AND
+    kyc-worker (its `dispatch-map` consumer idiom, app/consumers/orders.py) --
+    independently, each from its own idiom config (see fixtures/workspace.yaml).
+
+      1. Full index (all 3 fixtures) -> the CONTAINS edge is present in the graph;
+         staging holds ONE row per origin (both "orders-api" and "kyc-worker").
+      2. Remove ONLY orders-api's producing CALL SITE (a plain incremental file
+         edit, not an idiom/config change) -> `--incremental` (kyc-worker is
+         SKIPPED, never reprocessed) -> the CONTAINS edge MUST SURVIVE, because
+         kyc-worker's own row was never touched by orders-api's re-index. Under
+         the PRE-M5-T4 single-row scheme this is exactly the bug M4 T7 left open:
+         whichever origin "owned" the one shared row, losing it on a re-index left
+         nothing behind for the still-asserting sibling to inherit. Dump-
+         equivalence against a fresh full reindex of the identically-edited tree
+         must still hold.
+      3. THEN also remove kyc-worker's consumer registration -> `--incremental`
+         (orders-api now SKIPPED in turn) -> the edge is finally gone, since
+         NEITHER service asserts it any more. Dump-equivalence against a fresh
+         full reindex of the now-doubly-edited tree must still hold.
+    """
+    service_dirs = _copy_services(tmp_path / "src")
+    ws_path = _write_workspace_yaml(tmp_path / "main", service_dirs, RESIDUAL_GAP_GRAPH_NAME)
+
+    graph_names: set[str] = set()
+
+    def _store(name: str) -> FalkorStore:
+        graph_names.add(name)
+        return FalkorStore(falkordb_cfg, name)
+
+    try:
+        # ==================================================================
+        # 1. Full index -> the shared CONTAINS edge exists, one row per origin.
+        # ==================================================================
+        _invoke_index(ws_path)
+        report_a = _load_report(ws_path)
+        _assert_not_degraded(report_a)
+        assert all(s["mode"] == "full" for s in report_a["services"])
+
+        dump_a, _ = _snapshot(ws_path)
+        contains_a = _contains_pairs_with_origin(dump_a)
+        assert (ORDERS_TOPIC, ORDER_CREATED_EVENT) in contains_a, (
+            "fixture precondition: orders-api + kyc-worker must both assert the "
+            f"shared CONTAINS edge before either is edited; staged CONTAINS pairs: "
+            f"{sorted(contains_a)}"
+        )
+        assert contains_a[(ORDERS_TOPIC, ORDER_CREATED_EVENT)] == {"orders-api", "kyc-worker"}, (
+            "fixture precondition: expected a per-origin row from BOTH services, got "
+            f"{contains_a[(ORDERS_TOPIC, ORDER_CREATED_EVENT)]}"
+        )
+
+        graph_a = _graph_dump(_store(RESIDUAL_GAP_GRAPH_NAME))
+        assert (ORDERS_TOPIC, "CONTAINS", ORDER_CREATED_EVENT) in graph_a["edge_triples"]
+
+        # ==================================================================
+        # 2. orders-api stops asserting the edge (file edit, not config) ->
+        # --incremental (kyc-worker skipped) -> the edge MUST survive via
+        # kyc-worker's own row. Dump-equivalence vs a fresh full reindex of the
+        # SAME edited tree.
+        # ==================================================================
+        _remove_orders_api_producer_call_site(service_dirs["orders-api"])
+
+        _invoke_index(ws_path, incremental=True)
+        report_b = _load_report(ws_path)
+        _assert_not_degraded(report_b)
+        modes_b = {s["service"]: s["mode"] for s in report_b["services"]}
+        assert modes_b["orders-api"] == "incremental"
+        assert modes_b["kyc-worker"] == "skipped"
+        assert modes_b["document-management"] == "skipped"
+
+        dump_b, _ = _snapshot(ws_path)
+        contains_b = _contains_pairs_with_origin(dump_b)
+        assert (ORDERS_TOPIC, ORDER_CREATED_EVENT) in contains_b, (
+            "RESIDUAL GAP REGRESSION: the shared CONTAINS edge vanished after "
+            "orders-api's own re-index, even though kyc-worker (skipped this run) "
+            f"still legitimately asserts it. staged CONTAINS pairs: {sorted(contains_b)}"
+        )
+        assert contains_b[(ORDERS_TOPIC, ORDER_CREATED_EVENT)] == {"kyc-worker"}, (
+            "expected only kyc-worker's own row to survive, got "
+            f"{contains_b[(ORDERS_TOPIC, ORDER_CREATED_EVENT)]}"
+        )
+
+        graph_b = _graph_dump(_store(RESIDUAL_GAP_GRAPH_NAME))
+        assert (ORDERS_TOPIC, "CONTAINS", ORDER_CREATED_EVENT) in graph_b["edge_triples"], (
+            "RESIDUAL GAP REGRESSION (FalkorDB): the shared CONTAINS edge is missing "
+            "from the loaded graph even though kyc-worker still asserts it in staging"
+        )
+
+        full_c_name = f"{RESIDUAL_GAP_GRAPH_NAME}__full_c"
+        ws_c = _write_workspace_yaml(tmp_path / "full_check_1", service_dirs, full_c_name)
+        _invoke_index(ws_c)
+        report_c = _load_report(ws_c)
+        _assert_not_degraded(report_c)
+        assert all(s["mode"] == "full" for s in report_c["services"])
+
+        dump_c, _ = _snapshot(ws_c)
+        graph_c = _graph_dump(_store(full_c_name))
+
+        assert dump_b == dump_c, (
+            "SUPREME INVARIANT violated (residual-gap stage 1): --incremental "
+            f"staging state != full reindex of the same edited tree.\n{_dump_diff(dump_b, dump_c)}"
+        )
+        assert graph_b == graph_c, (
+            "SUPREME INVARIANT violated (residual-gap stage 1, FalkorDB): "
+            f"{_dump_diff(graph_b, graph_c)}"
+        )
+
+        # ==================================================================
+        # 3. kyc-worker ALSO stops asserting the edge -> --incremental
+        # (orders-api now skipped in turn) -> the edge is finally gone entirely.
+        # Dump-equivalence vs a fresh full reindex of the now-doubly-edited tree.
+        # ==================================================================
+        _remove_kyc_worker_consumer_registration(service_dirs["kyc-worker"])
+
+        _invoke_index(ws_path, incremental=True)
+        report_d = _load_report(ws_path)
+        _assert_not_degraded(report_d)
+        modes_d = {s["service"]: s["mode"] for s in report_d["services"]}
+        assert modes_d["kyc-worker"] == "incremental"
+        assert modes_d["orders-api"] == "skipped"
+        assert modes_d["document-management"] == "skipped"
+
+        dump_d, _ = _snapshot(ws_path)
+        contains_d = _contains_pairs_with_origin(dump_d)
+        assert (ORDERS_TOPIC, ORDER_CREATED_EVENT) not in contains_d, (
+            "the shared CONTAINS edge survived even though NEITHER service asserts "
+            f"it any more; staged CONTAINS pairs: {sorted(contains_d)}"
+        )
+
+        graph_d = _graph_dump(_store(RESIDUAL_GAP_GRAPH_NAME))
+        assert (ORDERS_TOPIC, "CONTAINS", ORDER_CREATED_EVENT) not in graph_d["edge_triples"], (
+            "the shared CONTAINS edge survived in the loaded graph even though "
+            "neither service asserts it any more"
+        )
+
+        full_e_name = f"{RESIDUAL_GAP_GRAPH_NAME}__full_e"
+        ws_e = _write_workspace_yaml(tmp_path / "full_check_2", service_dirs, full_e_name)
+        _invoke_index(ws_e)
+        report_e = _load_report(ws_e)
+        _assert_not_degraded(report_e)
+
+        dump_e, _ = _snapshot(ws_e)
+        graph_e = _graph_dump(_store(full_e_name))
+
+        assert dump_d == dump_e, (
+            "SUPREME INVARIANT violated (residual-gap stage 2): "
+            f"{_dump_diff(dump_d, dump_e)}"
+        )
+        assert graph_d == graph_e, (
+            "SUPREME INVARIANT violated (residual-gap stage 2, FalkorDB): "
+            f"{_dump_diff(graph_d, graph_e)}"
         )
     finally:
         for name in graph_names:
