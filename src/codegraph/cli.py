@@ -626,6 +626,12 @@ def _trace_tree(result: dict) -> Tree:
             seg_line += " [yellow](truncated)[/]"
         seg_node = root.add(seg_line)
         for step in seg.get("steps", []):
+            collapsed = step.get("collapsed")
+            if collapsed is not None:
+                # M5 T5: a synthetic marker (query/traverse.py's _compact_steps) --
+                # no real edge_type/node to render, just the hidden count.
+                seg_node.add(f"⋯ {collapsed} внутренних вызовов")
+                continue
             seg_node.add(
                 f"{escape(str(step.get('edge_type', '')))} -> "
                 f"{escape(_node_label(step.get('node', {})))}"
@@ -638,6 +644,17 @@ def _trace_tree(result: dict) -> Tree:
     return root
 
 
+def _segment_collapsed_total(seg: dict) -> int:
+    """Sum of every collapsed-marker step's own count within one segment (M5 T5) --
+    a segment can carry more than one such marker (e.g. a role-bearing step splits
+    one long run into two, see query/traverse.py's _compact_steps), each with its
+    own count. 0 for a segment with no markers at all (compact=False, or every run
+    was short enough to survive uncollapsed)."""
+    return sum(
+        step["collapsed"] for step in seg.get("steps", []) if step.get("collapsed") is not None
+    )
+
+
 def _trace_mermaid(result: dict) -> str:
     """flowchart TD: один узел на сегмент (`S{i}["service: entry"]`), одна стрелка
     на next_entry_id (`S{i} -->|channel| S{j}`) -- next_entry_ids, не указывающие
@@ -645,7 +662,14 @@ def _trace_mermaid(result: dict) -> str:
     молча пропускаются (тот сегмент просто не появится как узел стрелки).
     `"`/`|` внутри меток заменяются -- эти символы ломают mermaid-синтаксис узла/
     метки ребра; смоук-уровень экранирования (валиден для рендера, не
-    исчерпывающий)."""
+    исчерпывающий).
+
+    M5 T5: mermaid has no per-step nodes (unlike the text tree, it only ever
+    renders one node per SEGMENT -- steps/exits within a segment aren't drawn at
+    all), so a collapsed run has nowhere of its own to attach to; its count is
+    folded into that segment's OWN label instead (kept simple per this task's
+    brief) -- 0 collapsed steps (the common case: short segments, or --full)
+    leaves the label exactly as before."""
     segments = result.get("segments", [])
     entry_to_index = {
         seg["entry"]["id"]: i
@@ -655,6 +679,9 @@ def _trace_mermaid(result: dict) -> str:
     lines = ["flowchart TD"]
     for i, seg in enumerate(segments):
         label = f"{seg.get('service', '')}: {_node_label(seg.get('entry', {}))}"
+        collapsed_total = _segment_collapsed_total(seg)
+        if collapsed_total:
+            label += f" (⋯{collapsed_total})"
         lines.append(f'    S{i}["{label.replace(chr(34), chr(39))}"]')
     for i, seg in enumerate(segments):
         for ex in seg.get("exits", []):
@@ -672,6 +699,15 @@ def trace(
     target: Path | None = typer.Argument(None),  # noqa: B008 -- typer marker call, idiomatic
     graph: str | None = typer.Option(None, "--graph"),
     output_format: str = typer.Option("text", "--format"),
+    full: bool = typer.Option(
+        False, "--full",
+        help=(
+            "Отключить компактный режим (M5 T5): показать КАЖДЫЙ шаг сегмента "
+            "без схлопывания длинных линейных цепочек в «⋯ N внутренних "
+            "вызовов». По умолчанию сегменты длиннее 15 шагов схлопываются -- "
+            "роли/ветвления/exit-шаги никогда не схлопываются."
+        ),
+    ),
 ) -> None:
     """Трассировка бизнес-процесса от selector (route-форма "<service>:<METHOD>
     <path>" или qualified "<service>:<dotted.name>", как в cfg.processes -- см.
@@ -707,7 +743,7 @@ def trace(
         console.print(f"[red]{escape(resolved['error'])}[/]")
         raise typer.Exit(1)
 
-    result = gq.trace_process(resolved["node_id"])
+    result = gq.trace_process(resolved["node_id"], compact=not full)
     if "error" in result:
         console.print(f"[red]{escape(result['error'])}[/]")
         raise typer.Exit(1)

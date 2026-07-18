@@ -29,8 +29,10 @@ left for traverse.py to special-case per channel kind.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any
+
+from codegraph.core.schema import ROLE_KINDS
 
 NodeOut = dict[str, Any]
 
@@ -74,11 +76,21 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
     `_resolve_exits` below. Cycle-safe: a node is only ever enqueued for expansion
     once (matches query.api.GraphQuery.expand_neighbors' own visited-set pattern),
     though a repeat hop INTO an already-visited node is still recorded as a step
-    (it's a real edge in the graph, just not a new place to keep walking from)."""
+    (it's a real edge in the graph, just not a new place to keep walking from).
+
+    M5 T5: also returns `step_parents` (parallel to `steps` -- the id of the node
+    each step's edge was walked FROM) and `exit_producer_ids` (the flat union of
+    every node id that produced at least one of this segment's own exits) -- pure
+    bookkeeping alongside the two places that already record this information
+    (`steps.append`/`exit_producers.setdefault`), consumed by `_compact_steps`
+    post-processing in `trace_process` below. Nothing about the walk itself
+    (order, cycle/depth/branch handling) changes."""
     steps: list[dict] = []
+    step_parents: list[str] = []
     confidences: list[float] = []
     exit_channel_nodes: dict[str, NodeOut] = {}
     exit_producers: dict[str, set[str]] = {}
+    exit_producer_ids: set[str] = set()
     truncated = False
 
     visited = {entry_id}
@@ -117,6 +129,7 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
                 if neighbor_id is not None:
                     exit_channel_nodes[neighbor_id] = neighbor
                     exit_producers.setdefault(neighbor_id, set()).add(node_id)
+                    exit_producer_ids.add(node_id)
                 continue
 
             steps.append(
@@ -127,12 +140,20 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
                     "direction": "out",
                 }
             )
+            step_parents.append(node_id)
             if neighbor_id is not None and neighbor_id not in visited:
                 visited.add(neighbor_id)
                 frontier.append((neighbor_id, depth + 1))
 
     exits = _resolve_exits(store, exit_channel_nodes, exit_producers, min_confidence, confidences)
-    return {"steps": steps, "exits": exits, "truncated": truncated, "confidences": confidences}
+    return {
+        "steps": steps,
+        "step_parents": step_parents,
+        "exit_producer_ids": exit_producer_ids,
+        "exits": exits,
+        "truncated": truncated,
+        "confidences": confidences,
+    }
 
 
 def _resolve_exits(
@@ -173,11 +194,104 @@ def _resolve_exits(
     return exits
 
 
+# M5 T5 (pilot §7.3 -- a single-service repo's trace dumps a flat, undifferentiated
+# segment, 80 steps on the real pilot corpus): compact-mode post-processing over an
+# ALREADY-BUILT segment's steps, applied in trace_process below -- _walk_segment's
+# own BFS logic (order, cycle/depth/branch handling) is untouched by any of this.
+_COMPACT_STEP_GATE = 15  # segment-level gate: _compact_steps is a strict no-op
+# (returns the SAME list object) at or under this count -- fixture-scale segments
+# (M2 gate's golden traces, every unit-test store in this module) never exceed it,
+# so their output stays byte-identical whether compact=True (the new default) or not.
+_COMPACT_RUN_HEAD = 3
+_COMPACT_RUN_TAIL = 2
+# A run only gets replaced by a `{"collapsed": N}` marker once it is longer than
+# HEAD+TAIL: collapsing a run of HEAD+TAIL or fewer would show >= as many entries
+# as leaving it alone (head + 1 marker + tail > the run itself), never fewer.
+
+
+def _compact_steps(
+    steps: list[dict],
+    step_parents: Sequence[str | None],
+    exit_producer_ids: Collection[str],
+) -> list[dict]:
+    """Collapse maximal consecutive (in `steps`' own BFS-discovery order -- see the
+    NOTE below) runs of "boring" steps once the segment has more than
+    _COMPACT_STEP_GATE steps: each qualifying run keeps its first
+    _COMPACT_RUN_HEAD and last _COMPACT_RUN_TAIL steps, with a single
+    `{"collapsed": N}` marker (N = the run's own hidden interior length) in between.
+
+    A step is "boring" (collapsible) unless its node:
+      - carries one of core.schema.ROLE_KINDS (RouteHandler/MessageConsumer/
+        MessageProducer/TemporalWorkflow/TemporalActivity) -- collapsing a
+        role-bearing hop would hide exactly the service/channel-boundary-shaped
+        step a reader most needs to see;
+      - has more than one OUTGOING step within this SAME segment (`step_parents`,
+        parallel to `steps` -- see _walk_segment) -- a node that itself calls >1
+        further step here is a fan-out/branch point, never safe to fold into an
+        ellipsis;
+      - produced at least one of this segment's own exits (`exit_producer_ids`,
+        also from _walk_segment) -- PRODUCES/CALLS_HTTP transitions are the
+        cross-channel handoff points the whole trace exists to show.
+    A protected ("interesting") step is never moved, reordered, or altered -- it
+    always interrupts (flushes) whatever run was accumulating around it, and is
+    then appended to the output as-is.
+
+    NOTE (BFS-order caveat, a deliberate simplification -- see this task's report):
+    `steps` is BFS DISCOVERY order, not necessarily a single caller->callee chain's
+    own sequential order once real branching is involved (siblings at the same BFS
+    depth land next to each other in the list, interleaved with any OTHER sibling
+    chain's own next hop) -- collapsing therefore groups "whatever this segment's
+    walk visited next that also happened to be boring", not strictly "everything
+    downstream of one specific caller". This matches the feature's own motivating
+    shape (pilot §7.3's single-service flat call spine, substantially linear) and
+    degrades gracefully -- still correct (nothing dropped, protected steps never
+    touched), just a coarser grouping -- on a genuinely bushy segment."""
+    if len(steps) <= _COMPACT_STEP_GATE:
+        return steps
+
+    outgoing_count: dict[str, int] = {}
+    for parent_id in step_parents:
+        if parent_id is not None:
+            outgoing_count[parent_id] = outgoing_count.get(parent_id, 0) + 1
+
+    def _protected(step: dict) -> bool:
+        node = step.get("node") or {}
+        node_id = node.get("id")
+        if any(r in ROLE_KINDS for r in (node.get("roles") or ())):
+            return True
+        if node_id is None:
+            return False
+        return outgoing_count.get(node_id, 0) > 1 or node_id in exit_producer_ids
+
+    result: list[dict] = []
+    run: list[dict] = []
+
+    def _flush_run() -> None:
+        if len(run) > _COMPACT_RUN_HEAD + _COMPACT_RUN_TAIL:
+            interior = len(run) - _COMPACT_RUN_HEAD - _COMPACT_RUN_TAIL
+            result.extend(run[:_COMPACT_RUN_HEAD])
+            result.append({"collapsed": interior})
+            result.extend(run[-_COMPACT_RUN_TAIL:])
+        else:
+            result.extend(run)
+        run.clear()
+
+    for step in steps:
+        if _protected(step):
+            _flush_run()
+            result.append(step)
+        else:
+            run.append(step)
+    _flush_run()
+    return result
+
+
 def trace_process(
     store: Any,
     entrypoint_id: str,
     max_segments: int,
     min_confidence: float,
+    compact: bool = True,
 ) -> dict:
     """Downstream-only (M2) multi-segment trace from entrypoint_id. Segment-level
     BFS: visited_entries prevents both re-visiting a segment and infinite process
@@ -186,7 +300,13 @@ def trace_process(
     hit). Aggregate confidence is the minimum confidence over every edge actually
     walked (steps + NEXT_SEGMENT transitions) -- a chain is only as trustworthy as
     its weakest link; 1.0 if the trace contains no edges at all (single node, no
-    steps/exits -- nothing to doubt)."""
+    steps/exits -- nothing to doubt).
+
+    compact (M5 T5, default True): post-process each segment's steps through
+    _compact_steps above -- collapses long boring runs (see its own docstring),
+    a no-op for any segment at or under _COMPACT_STEP_GATE steps. compact=False
+    (CLI `--full`, MCP callers who pass it explicitly) restores the pre-M5 always-
+    full behavior."""
     if not store.get_nodes([entrypoint_id]):
         return {"error": f"entrypoint not found: {entrypoint_id}"}
 
@@ -204,11 +324,14 @@ def trace_process(
         entry_node = entry_nodes[0]
 
         walked = _walk_segment(store, entry_id, min_confidence)
+        steps = walked["steps"]
+        if compact:
+            steps = _compact_steps(steps, walked["step_parents"], walked["exit_producer_ids"])
         segments.append(
             {
                 "service": entry_node.get("service", ""),
                 "entry": entry_node,
-                "steps": walked["steps"],
+                "steps": steps,
                 "exits": walked["exits"],
                 "truncated": walked["truncated"],
             }

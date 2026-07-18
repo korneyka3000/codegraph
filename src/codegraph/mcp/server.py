@@ -159,6 +159,7 @@ def build_server(
         max_segments: int = 12,
         min_confidence: float = 0.3,
         include_source: bool = False,
+        compact: bool = True,
     ) -> dict:
         """Трассировка бизнес-процесса от entrypoint_id вниз по цепочке вызовов и
         каналов (downstream-only в M2 -- direction="upstream" -> error dict, не
@@ -167,10 +168,14 @@ def build_server(
         минимум по всем пройденным рёбрам (шагам и меж-сегментным переходам),
         отфильтрованным по min_confidence. include_source=true подмешивает исходный
         текст (get_source) в каждый узел трассы, best-effort (узлы без источника --
-        напр. Channel -- остаются без "source", не ошибка)."""
+        напр. Channel -- остаются без "source", не ошибка). compact=true (по
+        умолчанию, M5 T5) схлопывает длинные линейные хвосты внутри сегмента
+        (>15 шагов, см. query/traverse.py _compact_steps) в
+        {"collapsed": N}-маркеры -- роли/ветвления/exit-шаги никогда не
+        схлопываются; compact=false возвращает каждый шаг без исключений."""
         return gq.trace_process(
             entrypoint_id, direction=direction, max_segments=max_segments,
-            min_confidence=min_confidence, include_source=include_source,
+            min_confidence=min_confidence, include_source=include_source, compact=compact,
         )
 
     @mcp.tool

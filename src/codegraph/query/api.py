@@ -301,6 +301,7 @@ class GraphQuery:
         max_segments: int = 12,
         min_confidence: float = 0.3,
         include_source: bool = False,
+        compact: bool = True,
     ) -> dict:
         """M2: downstream only -- direction="upstream" is a deliberate deferral
         (query.traverse.trace_process only implements the out-edge/downstream walk;
@@ -309,7 +310,13 @@ class GraphQuery:
         returns a structured error like any other invalid/unsupported input here,
         never an exception. Both invalid-direction and upstream-not-supported are
         checked BEFORE store_factory() (same amendment-1-adjacent principle as
-        expand_neighbors' direction check -- no store needed to reject either)."""
+        expand_neighbors' direction check -- no store needed to reject either).
+
+        compact (M5 T5, default True): threaded straight through to
+        query.traverse.trace_process -- collapses long boring runs in any segment
+        over 15 steps (pilot §7.3), a no-op for shorter segments either way. MCP's
+        own trace_process tool and CLI's `trace --full` are this parameter's two
+        real callers (see mcp/server.py / cli.py)."""
         if direction not in _VALID_TRACE_DIRECTIONS:
             return {"error": f"invalid direction: {direction!r}"}
         if direction == "upstream":
@@ -317,7 +324,9 @@ class GraphQuery:
         max_segments = max(_MAX_SEGMENTS_MIN, min(_MAX_SEGMENTS_MAX, max_segments))
         try:
             store = self.store_factory()
-            result = traverse.trace_process(store, entrypoint_id, max_segments, min_confidence)
+            result = traverse.trace_process(
+                store, entrypoint_id, max_segments, min_confidence, compact=compact
+            )
         except (StoreError, StoreUnavailable) as e:
             return {"error": f"falkordb unreachable: {e}"}
         if "error" in result or not include_source:

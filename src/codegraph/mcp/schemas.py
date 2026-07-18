@@ -119,18 +119,30 @@ class TraceProcessInput(BaseModel):
     max_segments: int = 12  # клампится в GraphQuery к [1,20]
     min_confidence: float = 0.3
     include_source: bool = False
+    compact: bool = True  # M5 T5 (pilot §7.3): collapse long boring runs (>15
+    # steps/segment) in query.traverse.trace_process's post-processing; callers
+    # who want the pre-M5 always-full dump pass compact=False (CLI: `trace --full`).
 
 
 class TraceStep(BaseModel):
     """Один intra-сегмент переход (CALLS/DEPENDS_ON/INVOKES_ACTIVITY; CALLS с
     props["mechanism"]=="temporal_start" -- тот же edge_type, просто с этим
     доп. props-ключом, см. query/traverse.py). direction всегда "out" в M2
-    (downstream-only walk)."""
+    (downstream-only walk).
 
-    edge_type: str
-    props: dict
-    node: dict
-    direction: Literal["out"]
+    M5 T5 (additive): `collapsed` -- None on every REAL step (unchanged from
+    before this field existed). trace_process(compact=True, the new default)
+    replaces a long boring run's interior with a single SYNTHETIC marker step
+    carrying ONLY `collapsed` (the count of hidden interior steps) -- edge_type/
+    props/node/direction all fall back to their defaults on a marker (never real
+    edge data); consumers should treat `collapsed is not None` as "this is a
+    marker, not a real step" (see query/traverse.py's _compact_steps)."""
+
+    edge_type: str = ""
+    props: dict = Field(default_factory=dict)
+    node: dict = Field(default_factory=dict)
+    direction: Literal["out"] = "out"
+    collapsed: int | None = None
 
 
 class TraceExit(BaseModel):

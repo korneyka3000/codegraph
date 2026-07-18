@@ -508,7 +508,7 @@ def test_trace_process_delegates_to_traverse_with_clamped_max_segments(monkeypat
 
     calls = []
 
-    def fake_trace_process(store, entrypoint_id, max_segments, min_confidence):
+    def fake_trace_process(store, entrypoint_id, max_segments, min_confidence, compact=True):
         calls.append((entrypoint_id, max_segments, min_confidence))
         return {"segments": [], "confidence": 1.0, "truncated": False}
 
@@ -526,8 +526,10 @@ def test_trace_process_clamps_max_segments_minimum_to_1(monkeypatch):
     calls = []
     monkeypatch.setattr(
         api_mod.traverse, "trace_process",
-        lambda store, entrypoint_id, max_segments, min_confidence: calls.append(max_segments)
-        or {"segments": [], "confidence": 1.0, "truncated": False},
+        lambda store, entrypoint_id, max_segments, min_confidence, compact=True: (
+            calls.append(max_segments)
+            or {"segments": [], "confidence": 1.0, "truncated": False}
+        ),
     )
     store = FakeStore()
     q = GraphQuery(_factory(store), {})
@@ -568,7 +570,7 @@ def test_trace_process_propagates_traverse_error_dict_unchanged(monkeypatch):
 
     monkeypatch.setattr(
         api_mod.traverse, "trace_process",
-        lambda store, entrypoint_id, max_segments, min_confidence: {
+        lambda store, entrypoint_id, max_segments, min_confidence, compact=True: {
             "error": "entrypoint not found: e1"
         },
     )
@@ -583,7 +585,7 @@ def test_trace_process_include_source_attaches_source_to_reachable_nodes_only(
 ):
     import codegraph.query.api as api_mod
 
-    def fake_trace_process(store, entrypoint_id, max_segments, min_confidence):
+    def fake_trace_process(store, entrypoint_id, max_segments, min_confidence, compact=True):
         return {
             "segments": [{
                 "service": "svc", "entry": {"id": "e1"},
@@ -624,7 +626,7 @@ def test_trace_process_include_source_false_by_default_does_not_call_get_source(
 
     monkeypatch.setattr(
         api_mod.traverse, "trace_process",
-        lambda store, entrypoint_id, max_segments, min_confidence: {
+        lambda store, entrypoint_id, max_segments, min_confidence, compact=True: {
             "segments": [{
                 "service": "svc", "entry": {"id": "e1"},
                 "steps": [], "exits": [], "truncated": False,
@@ -636,6 +638,46 @@ def test_trace_process_include_source_false_by_default_does_not_call_get_source(
     q = GraphQuery(_factory(store), {})
     result = q.trace_process("e1")
     assert "source" not in result["segments"][0]["entry"]
+
+
+# -- M5 T5: compact passthrough --
+
+
+def test_trace_process_compact_defaults_true_and_is_passed_through(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+
+    # No default on `compact` here, deliberately: if GraphQuery.trace_process
+    # forgot to pass it at all, this fake would raise TypeError (missing
+    # required argument) rather than silently reporting a default -- the test
+    # must prove GraphQuery explicitly passed compact=True, not just that SOME
+    # value ended up true by coincidence.
+    def fake_trace_process(store, entrypoint_id, max_segments, min_confidence, compact):
+        calls.append(compact)
+        return {"segments": [], "confidence": 1.0, "truncated": False}
+
+    monkeypatch.setattr(api_mod.traverse, "trace_process", fake_trace_process)
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    q.trace_process("e1")
+    assert calls == [True]
+
+
+def test_trace_process_compact_false_is_passed_through(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+
+    def fake_trace_process(store, entrypoint_id, max_segments, min_confidence, compact):
+        calls.append(compact)
+        return {"segments": [], "confidence": 1.0, "truncated": False}
+
+    monkeypatch.setattr(api_mod.traverse, "trace_process", fake_trace_process)
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    q.trace_process("e1", compact=False)
+    assert calls == [False]
 
 
 # -- M2 T8: find_paths --

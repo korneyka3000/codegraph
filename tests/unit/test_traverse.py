@@ -17,6 +17,9 @@ module docstring)."""
 
 from __future__ import annotations
 
+import pytest
+
+from codegraph.core import schema
 from codegraph.query import traverse
 
 
@@ -426,6 +429,204 @@ def test_trace_process_is_deterministic_across_repeated_calls():
     first = traverse.trace_process(store, "create_order", max_segments=12, min_confidence=0.3)
     second = traverse.trace_process(store, "create_order", max_segments=12, min_confidence=0.3)
     assert first == second
+
+
+# ============================ M5 T5: compact ==============================
+# pilot §7.3: a single-service repo's trace dumps a flat, undifferentiated
+# segment (the real pilot saw 80 steps) -- trace_process(compact=True, the new
+# default) post-processes an ALREADY-BUILT segment's steps (BFS walk itself is
+# untouched): a segment with MORE than 15 steps gets its maximal runs of
+# "boring" (role-free/non-branching/non-exit-producing) CONSECUTIVE steps
+# collapsed to their first 3 + a `{"collapsed": N}` marker + their last 2.
+#
+# `_compact_steps` is tested DIRECTLY (not only through trace_process) on
+# hand-built ("synthetic", per the brief's own Step 1 wording) steps/parents --
+# _walk_segment's own pre-existing _SEGMENT_MAX_DEPTH=15 cap makes a genuine
+# SINGLE-PATH chain longer than 15 hops structurally unreachable through a real
+# BFS walk (any one root-to-leaf path is capped at 15 hops = 15 steps), so the
+# brief's own "40 линейных шагов" scenario can only be exercised by hand-
+# building the (steps, step_parents) pair the walk would have produced, exactly
+# as if 40 hops nothing lay downstream of a 15-deep cap -- see
+# test_trace_process_compact_* below for the real-walk wiring/gate proof
+# instead (using a branching topology that legitimately exceeds 15 TOTAL steps
+# without any single path exceeding the depth cap).
+
+
+def _step(node_id: str, roles: list[str] | None = None) -> dict:
+    node = {"id": node_id, "name": node_id}
+    if roles:
+        node["roles"] = roles
+    return {"edge_type": "CALLS", "props": {}, "node": node, "direction": "out"}
+
+
+def _chain_steps(
+    ids_: list[str], roles_by_id: dict[str, list[str]] | None = None
+) -> tuple[list[dict], list[str]]:
+    """A synthetic (steps, step_parents) pair for a straight chain: each id's step
+    is CALLS-reached from the PREVIOUS id (or "entry" for the first) -- every node
+    has exactly one outgoing step within the segment (never a branch point) unless
+    the test itself appends more."""
+    roles_by_id = roles_by_id or {}
+    steps = [_step(i, roles=roles_by_id.get(i)) for i in ids_]
+    parents = ["entry", *ids_[:-1]]
+    return steps, parents
+
+
+# -- _compact_steps: gate boundary (<=15 untouched, byte-identical) --
+
+
+def test_compact_steps_segment_at_gate_boundary_15_is_returned_unchanged():
+    steps, parents = _chain_steps([f"n{i}" for i in range(1, 16)])  # exactly 15
+    result = traverse._compact_steps(steps, parents, set())
+    assert result is steps  # no-op short-circuit -- same list object, not a copy
+
+
+def test_compact_steps_segment_of_10_is_untouched():
+    steps, parents = _chain_steps([f"n{i}" for i in range(1, 11)])
+    result = traverse._compact_steps(steps, parents, set())
+    assert result is steps
+    assert [s["node"]["id"] for s in result] == [f"n{i}" for i in range(1, 11)]
+
+
+# -- _compact_steps: collapsing a long boring run --
+
+
+def test_compact_steps_40_linear_steps_collapse_to_head_marker_tail():
+    ids_ = [f"n{i}" for i in range(1, 41)]
+    steps, parents = _chain_steps(ids_)
+    result = traverse._compact_steps(steps, parents, set())
+    assert len(result) == 6  # 3 head + 1 marker + 2 tail
+    assert [s["node"]["id"] for s in result[:3]] == ["n1", "n2", "n3"]
+    assert result[3] == {"collapsed": 35}  # 40 - 3 - 2
+    assert [s["node"]["id"] for s in result[-2:]] == ["n39", "n40"]
+
+
+def test_compact_steps_16_steps_just_above_gate_collapses():
+    ids_ = [f"n{i}" for i in range(1, 17)]
+    steps, parents = _chain_steps(ids_)
+    result = traverse._compact_steps(steps, parents, set())
+    assert len(result) == 6
+    assert result[3] == {"collapsed": 11}  # 16 - 3 - 2
+
+
+def test_compact_steps_run_of_exactly_head_plus_tail_is_left_as_is():
+    # a run of HEAD(3)+TAIL(2)=5 or fewer: collapsing would show >= as many
+    # entries as leaving it alone (3 + marker + 2 = 6 > 5) -- never collapsed,
+    # even though the SEGMENT total (20) is well past the >15 gate.
+    ids_ = [f"n{i}" for i in range(1, 21)]
+    steps, parents = _chain_steps(ids_)
+    # r1 splits the 20-chain into a leading run of 5 (n1..n5) and a trailing run
+    # of 14 (n6..n19) -- the leading run must survive verbatim.
+    roles_by_id = {"n6": ["RouteHandler"]}
+    steps, parents = _chain_steps(ids_, roles_by_id=roles_by_id)
+    result = traverse._compact_steps(steps, parents, set())
+    assert [s["node"]["id"] for s in result[:5]] == ["n1", "n2", "n3", "n4", "n5"]
+    assert "collapsed" not in result[4]
+    assert result[5]["node"]["id"] == "n6"  # the role step, untouched, right after
+
+
+# -- _compact_steps: role-bearing step breaks the run in two --
+
+
+def test_compact_steps_role_bearing_step_in_the_middle_breaks_the_collapse():
+    ids_ = [f"n{i}" for i in range(1, 41)]
+    steps, parents = _chain_steps(ids_, roles_by_id={"n20": ["MessageConsumer"]})
+    result = traverse._compact_steps(steps, parents, set())
+    markers = [s["collapsed"] for s in result if "collapsed" in s]
+    assert markers == [14, 15]  # run n1..n19 (19 -> interior 14), n21..n40 (20 -> interior 15)
+    role_step = next(s for s in result if s.get("node", {}).get("id") == "n20")
+    assert role_step["node"]["roles"] == ["MessageConsumer"]
+    assert "collapsed" not in role_step
+
+
+@pytest.mark.parametrize("role", sorted(schema.ROLE_KINDS))
+def test_compact_steps_every_canonical_role_kind_is_protected(role):
+    # core.schema.ROLE_KINDS is exactly the brief's own enumerated role list
+    # (RouteHandler/MessageConsumer/MessageProducer/TemporalWorkflow/
+    # TemporalActivity) -- reused here, not re-typed, so the two can't drift.
+    ids_ = [f"n{i}" for i in range(1, 41)]
+    steps, parents = _chain_steps(ids_, roles_by_id={"n20": [role]})
+    result = traverse._compact_steps(steps, parents, set())
+    protected = next(s for s in result if s.get("node", {}).get("id") == "n20")
+    assert "collapsed" not in protected
+
+
+# -- _compact_steps: a branch point (>1 outgoing step in this segment) never collapses --
+
+
+def test_compact_steps_branching_step_never_collapses():
+    ids_ = [f"n{i}" for i in range(1, 41)]
+    steps, parents = _chain_steps(ids_)
+    steps.append(_step("branch-leaf"))
+    parents.append("n20")  # n20 now has TWO outgoing steps here (n21 AND branch-leaf)
+    result = traverse._compact_steps(steps, parents, set())
+    n20_hits = [s for s in result if s.get("node", {}).get("id") == "n20"]
+    assert len(n20_hits) == 1
+    assert "collapsed" not in n20_hits[0]
+
+
+# -- _compact_steps: an exit-producing step never collapses --
+
+
+def test_compact_steps_exit_producer_step_never_collapses():
+    ids_ = [f"n{i}" for i in range(1, 41)]
+    steps, parents = _chain_steps(ids_)
+    result = traverse._compact_steps(steps, parents, {"n20"})
+    n20_hits = [s for s in result if s.get("node", {}).get("id") == "n20"]
+    assert len(n20_hits) == 1
+    assert "collapsed" not in n20_hits[0]
+
+
+# -- trace_process wiring: compact defaults True, --full-equivalent disables it,
+# gated on a REAL BFS walk (branching topology, no single path over 15 hops) --
+
+
+def _wide_chain_store(prefixes: list[str], depth: int) -> FakeStore:
+    """entry branches into len(prefixes) SEPARATE linear chains, each exactly
+    `depth` hops (<= _SEGMENT_MAX_DEPTH, so no single root-to-leaf path is itself
+    depth-capped) -- the only store topology that can legitimately make a
+    SEGMENT's total step count exceed 15 through the real walk (see this test
+    module's own section docstring above)."""
+    store = FakeStore()
+    store.add_node("entry", service="s", kind="Function")
+    for prefix in prefixes:
+        prev = "entry"
+        for i in range(1, depth + 1):
+            node_id = f"{prefix}{i}"
+            store.add_node(node_id, service="s", kind="Function")
+            store.add_edge(prev, "CALLS", node_id)
+            prev = node_id
+    return store
+
+
+def test_trace_process_compact_defaults_true_and_collapses_a_real_over_threshold_walk():
+    store = _wide_chain_store(["a", "b"], 15)  # 2 * 15 = 30 steps total
+    result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+    seg = result["segments"][0]
+    assert len(seg["steps"]) < 30
+    markers = [s["collapsed"] for s in seg["steps"] if "collapsed" in s]
+    assert markers  # at least one collapse happened
+    visible = len([s for s in seg["steps"] if "collapsed" not in s])
+    assert sum(markers) + visible == 30  # every original step accounted for
+
+
+def test_trace_process_compact_false_disables_collapsing_over_threshold():
+    store = _wide_chain_store(["a", "b"], 15)
+    result = traverse.trace_process(
+        store, "entry", max_segments=12, min_confidence=0.3, compact=False
+    )
+    seg = result["segments"][0]
+    assert len(seg["steps"]) == 30
+    assert all("collapsed" not in s for s in seg["steps"])
+
+
+def test_trace_process_segment_at_or_under_gate_is_byte_identical_regardless_of_compact():
+    store = _wide_chain_store(["a", "b"], 7)  # 14 steps total, <= 15 gate
+    compact_result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+    full_result = traverse.trace_process(
+        store, "entry", max_segments=12, min_confidence=0.3, compact=False
+    )
+    assert compact_result == full_result
 
 
 # ============================== find_paths ==============================

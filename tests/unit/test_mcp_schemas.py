@@ -8,7 +8,14 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from codegraph.mcp.schemas import FindEntrypointOutput, Hop, SearchCodeInput, SearchCodeOutput
+from codegraph.mcp.schemas import (
+    FindEntrypointOutput,
+    Hop,
+    SearchCodeInput,
+    SearchCodeOutput,
+    TraceProcessInput,
+    TraceStep,
+)
 
 
 def test_hop_requires_direction():
@@ -78,3 +85,32 @@ def test_find_entrypoint_output_rejects_vector_as_mode_used():
     # find_entrypoint has no pure "vector" mode -- always hybrid or text (M2 back-compat).
     with pytest.raises(ValidationError):
         FindEntrypointOutput(results=[], mode_used="vector")
+
+
+# -- M5 T5: compact trace segments -- collapsed marker on TraceStep, compact input flag --
+
+
+def test_trace_step_accepts_a_real_step_unchanged():
+    step = TraceStep(edge_type="CALLS", props={}, node={"id": "x"}, direction="out")
+    assert step.edge_type == "CALLS"
+    assert step.node == {"id": "x"}
+    assert step.collapsed is None  # absent on a real step
+
+
+def test_trace_step_accepts_a_collapsed_marker_with_only_that_field():
+    # the exact synthetic marker shape query.traverse._compact_steps produces --
+    # additive: a real step's 4 pre-existing fields all still validate exactly as
+    # before (previous test), this is the NEW accepted shape, not a replacement.
+    step = TraceStep(collapsed=35)
+    assert step.collapsed == 35
+    assert step.node == {}
+    assert step.edge_type == ""
+    assert step.direction == "out"
+
+
+def test_trace_process_input_compact_defaults_true():
+    assert TraceProcessInput(entrypoint_id="e1").compact is True
+
+
+def test_trace_process_input_compact_can_be_set_false():
+    assert TraceProcessInput(entrypoint_id="e1", compact=False).compact is False

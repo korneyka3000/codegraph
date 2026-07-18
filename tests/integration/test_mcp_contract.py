@@ -352,6 +352,19 @@ def test_mcp_contract_trace_process_live_on_three_segment_mini_graph(falkordb_cf
                 assert trace_out.truncated is False
                 assert 0.0 < trace_out.confidence <= 1.0
 
+                # -- M5 T5: compact is a live, accepted tool kwarg -- this mini-graph's
+                # segments are all far short of the 15-step collapse gate, so
+                # compact=False (full/uncollapsed) must be byte-identical to the
+                # compact=True default call above (proves the wire-through works
+                # AND that short segments are genuinely unaffected end to end, not
+                # just at the pure-function/unit layer). --
+                full_res = await c.call_tool(
+                    "trace_process", {"entrypoint_id": create_order.id, "compact": False}
+                )
+                assert full_res.is_error is False
+                full_out = TraceProcessOutput(**full_res.data)  # схема валидна
+                assert full_out == trace_out
+
                 # -- list_processes live: the config-sourced anchor from this graph --
                 lp_res = await c.call_tool("list_processes", {})
                 assert lp_res.is_error is False

@@ -196,7 +196,7 @@ workspace, а не в точечных правках внутри одного 
 | `who_calls(node_id, transitive=false, max_depth=3)` | Кто вызывает узел через `CALLS` — прямо или транзитивно. |
 | `find_paths(from_id, to_id, max_hops=8, edge_types?)` | Путь между двумя узлами (двунаправленный BFS). |
 | `list_processes()` | Все `BusinessProcess`-узлы (из конфига и/или Temporal-воркфлоу). |
-| `trace_process(entrypoint_id, direction="downstream", max_segments=12, min_confidence=0.3, include_source=false)` | Трассировка бизнес-процесса сегментами через `Channel`-границы (то, что показывает `codegraph trace`). |
+| `trace_process(entrypoint_id, direction="downstream", max_segments=12, min_confidence=0.3, include_source=false, compact=true)` | Трассировка бизнес-процесса сегментами через `Channel`-границы (то, что показывает `codegraph trace`). `compact=true` схлопывает длинные линейные хвосты (>15 шагов/сегмент) в `{"collapsed": N}`-маркеры — роли/ветвления/exit-шаги никогда не схлопываются; `compact=false` — каждый шаг без исключений. |
 | `find_entrypoint(query, kinds?, k=5)` | Гибридный поиск точки входа (fulltext по `Sym` + vector по `Chunk`, RRF). |
 | `search_code(query, k=8, service?, mode="hybrid")` | Поиск по коду (`text` / `vector` / `hybrid`). |
 
@@ -213,7 +213,7 @@ workspace, а не в точечных правках внутри одного 
 | `codegraph index [TARGET] [--dry-run] [--graph NAME] [--no-embed] [--incremental]` | Построить граф: scan → resolve → extract → join → link → chunk+embed → load → report. |
 | `codegraph load [TARGET] [--graph NAME]` | Пересобрать граф в FalkorDB из уже посчитанного `staging.db`, без повторного анализа. |
 | `codegraph stats [TARGET] [--graph NAME]` | Узлы по `kind` / рёбра по `type`. |
-| `codegraph trace SELECTOR [TARGET] [--graph NAME] [--format text\|mermaid]` | Трассировка от точки входа (`"<service>:<METHOD> <path>"` либо `"<service>:<dotted.qualified.name>"`). |
+| `codegraph trace SELECTOR [TARGET] [--graph NAME] [--format text\|mermaid] [--full]` | Трассировка от точки входа (`"<service>:<METHOD> <path>"` либо `"<service>:<dotted.qualified.name>"`). По умолчанию сегменты длиннее 15 шагов схлопывают длинные линейные хвосты («⋯ N внутренних вызовов» / mermaid-метка `(⋯N)`) — `--full` отключает схлопывание. |
 | `codegraph serve [TARGET] [--graph NAME]` | MCP-сервер (stdio). |
 | `codegraph eval retrieval [TARGET] [--graph NAME] [--k N] [--questions PATH] [--exact]` | Прогон golden-вопросов (hit@k) через `search_code(mode="hybrid")` — отчёт, не CI-гейт. `--exact` — детерминированный полный скан вместо ANN (см. «Ограничения»). |
 | `codegraph --version` | Версия установленного пакета. |

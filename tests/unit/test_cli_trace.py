@@ -93,13 +93,16 @@ _SUCCESS_RESULT = {
 
 def _fake_graph_query(
     trace_result: dict, resolve_result: dict | None = None, resolve_calls: list | None = None,
-    trace_calls: list | None = None,
+    trace_calls: list | None = None, trace_kwargs: list | None = None,
 ):
     """Fake replacing codegraph.cli.GraphQuery: resolve_selector returns
     `resolve_result` (default: a successful resolve to node id "e1", matching
     `_SUCCESS_RESULT`'s own entry id), trace_process returns `trace_result` unchanged.
     `resolve_calls`/`trace_calls`, if given, record every call's argument (spy) --
-    used to prove trace_process is skipped when resolve_selector errors."""
+    used to prove trace_process is skipped when resolve_selector errors.
+    `trace_kwargs`, if given, records each call's full kwargs dict (M5 T5 --
+    proving `--full` maps to compact=False without also having to touch every
+    OTHER existing `trace_calls`-only caller of this helper)."""
     if resolve_result is None:
         resolve_result = {"node_id": "e1"}
 
@@ -116,6 +119,8 @@ def _fake_graph_query(
         def trace_process(self, entrypoint_id, **kwargs):
             if trace_calls is not None:
                 trace_calls.append(entrypoint_id)
+            if trace_kwargs is not None:
+                trace_kwargs.append(kwargs)
             return trace_result
 
     return _FakeGraphQuery
@@ -214,6 +219,96 @@ def test_trace_mermaid_escapes_quotes_and_pipes_in_labels(tmp_path, monkeypatch)
     assert "S0 -->|Order/Created'x| S1" in result.output  # `|` -> `/`, `"` -> `'` in edge label
     assert 'we"ird' not in result.output  # no raw quote survives anywhere
     assert 'Order|Created"x' not in result.output  # no raw pipe/quote in the edge label
+
+
+# -- M5 T5: compact rendering (collapsed marker steps) + --full CLI flag --
+
+_COLLAPSED_RESULT = {
+    "segments": [
+        {
+            "service": "orders-api",
+            "entry": {"id": "e1", "name": "create_order"},
+            "steps": [
+                {
+                    "edge_type": "CALLS", "props": {},
+                    "node": {"id": "s1", "name": "first_call"}, "direction": "out",
+                },
+                {"collapsed": 35},
+                {
+                    "edge_type": "CALLS", "props": {},
+                    "node": {"id": "s2", "name": "last_call"}, "direction": "out",
+                },
+            ],
+            "exits": [],
+            "truncated": False,
+        },
+    ],
+    "confidence": 1.0,
+    "truncated": False,
+}
+
+
+def test_trace_text_format_renders_collapsed_marker_as_ellipsis_count(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_COLLAPSED_RESULT))
+
+    result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "⋯ 35 внутренних вызовов" in result.output
+    # the real steps flanking the marker still render normally
+    assert "first_call" in result.output
+    assert "last_call" in result.output
+
+
+def test_trace_mermaid_annotates_segment_label_with_collapsed_total(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_COLLAPSED_RESULT))
+
+    result = runner.invoke(
+        app, ["trace", "orders-api:POST /orders", str(root), "--format", "mermaid"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "⋯35" in result.output
+    # mermaid still shows exactly one node per segment (no per-step nodes) --
+    # the collapse total is folded into that SAME segment label, not a new node.
+    assert result.output.count('S0["') == 1
+
+
+def test_trace_mermaid_no_annotation_when_nothing_collapsed(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_SUCCESS_RESULT))
+
+    result = runner.invoke(
+        app, ["trace", "orders-api:POST /orders", str(root), "--format", "mermaid"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "⋯" not in result.output
+
+
+def test_trace_default_passes_compact_true_to_trace_process(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path)
+    trace_kwargs: list = []
+    monkeypatch.setattr(
+        "codegraph.cli.GraphQuery",
+        _fake_graph_query(_SUCCESS_RESULT, trace_kwargs=trace_kwargs),
+    )
+
+    result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
+    assert result.exit_code == 0, result.output
+    assert trace_kwargs[-1].get("compact") is True
+
+
+def test_trace_full_flag_passes_compact_false_to_trace_process(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path)
+    trace_kwargs: list = []
+    monkeypatch.setattr(
+        "codegraph.cli.GraphQuery",
+        _fake_graph_query(_SUCCESS_RESULT, trace_kwargs=trace_kwargs),
+    )
+
+    result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root), "--full"])
+    assert result.exit_code == 0, result.output
+    assert trace_kwargs[-1].get("compact") is False
 
 
 # -- not-found entrypoint (resolve_selector returns an error dict) --
