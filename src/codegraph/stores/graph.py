@@ -80,6 +80,24 @@ class GraphStore(Protocol):
         that specific case)."""
         ...
 
+    def search_vector_chunks_exact(
+        self, vec: list[float], k: int, service: str | None = None
+    ) -> list[tuple[dict, float]]:
+        """M5 T2 (pilot Bug A fix): deterministic full-scan twin of
+        search_vector_chunks -- plain Cypher `vec.cosineDistance` over every Chunk
+        with a non-null embedding, no ANN index involved (`ORDER BY dist ASC, c.id
+        ASC` -- the id tiebreak makes this method byte-reproducible across repeated
+        identical calls, unlike the ANN version's unseeded HNSW rebuild-per-load).
+        Same `[(chunk_props, score), ...]` shape AND score semantics as
+        search_vector_chunks (cosine distance, lower = more similar -- live-verified
+        identical scale/values against FalkorDB's own ANN score, see the
+        implementation's own docstring) -- callers (query.retrieval) can route
+        through either method and stay agnostic to which one produced a given (id,
+        score) pair. Slower than search_vector_chunks on a large graph (no index) --
+        intended for eval/CI determinism (`codegraph eval retrieval --exact`), NOT
+        production/MCP search, which stays ANN-only via search_vector_chunks."""
+        ...
+
     def search_text_chunks(
         self, query: str, k: int, service: str | None = None
     ) -> list[tuple[dict, float]]:

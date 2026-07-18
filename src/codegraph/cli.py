@@ -786,13 +786,33 @@ def eval_retrieval(
             "explicitly to point at one)."
         ),
     ),
+    exact: bool = typer.Option(
+        False, "--exact",
+        help=(
+            "deterministic full-scan cosine distance (vec.cosineDistance) instead of "
+            "FalkorDB's ANN vector index (db.idx.vector.queryNodes/HNSW, which "
+            "rebuilds unseeded on every graph load -- hit@k against it is not "
+            "reproducible run to run, see README «Ограничения»). For CI/"
+            "comparisons between runs; slower than ANN on large graphs. Production/"
+            "MCP search (search_code) is unaffected either way -- this flag only "
+            "changes what THIS eval command does."
+        ),
+    ),
 ) -> None:
     """Прогон golden-вопросов (hit@k) через search_code(mode="hybrid") на УЖЕ
     существующем графе (нужен предварительный `codegraph index`) -- rich-таблица
     question/hit/rank/top-1. Отчёт, не гейт: exit 0 при ЛЮБОМ исходе hit/miss --
     жёсткий гейт для CI живёт в tests/eval/test_m3_gate.py, не здесь. Инфраструктурные
     ошибки (store недоступен, граф не найден, questions-файл не читается) остаются
-    exit 1, как и у остальных команд (stats/load/trace)."""
+    exit 1, как и у остальных команд (stats/load/trace).
+
+    `--exact` (M5 T2, pilot Bug A): routes search_code's vector leg through
+    FalkorStore.search_vector_chunks_exact (full Cypher scan, no ANN index) instead
+    of the default ANN search -- deterministic hit@k across identical runs, at the
+    cost of an O(n) scan instead of HNSW's approximate speed. Use it for CI gates or
+    before/after comparisons where run-to-run vector-ranking noise would otherwise
+    make a hit@k delta meaningless; leave it off for a quick manual check on a large
+    graph, where ANN's speed matters more than exact reproducibility."""
     target_path = target if target is not None else Path.cwd()
     cfg = _load(target_path)
     graph_name = _resolve_graph_name(cfg, graph)
@@ -833,7 +853,9 @@ def eval_retrieval(
         service_paths={svc.name: svc.path for svc in cfg.services},
         embedder_factory=lambda: embedder,
     )
-    results = run_questions(lambda q, kk: gq.search_code(q, k=kk, mode="hybrid"), questions)
+    results = run_questions(
+        lambda q, kk: gq.search_code(q, k=kk, mode="hybrid", exact=exact), questions
+    )
 
     table = Table(title=f"retrieval eval · graph={graph_name}")
     table.add_column("question")

@@ -48,9 +48,9 @@ def _fake_store_cls(*, exists: bool = True, unreachable: bool = False):
 
 
 class _FakeGraphQuery:
-    """Records construction args; `.search_code` echoes back k/mode so a test can
-    prove the CLI wired hybrid-mode search through to `run_questions`' search_fn
-    without needing a real store/embedder."""
+    """Records construction args; `.search_code` echoes back k/mode/exact so a test
+    can prove the CLI wired hybrid-mode (and, M5 T2, --exact) search through to
+    `run_questions`' search_fn without needing a real store/embedder."""
 
     instances: list[_FakeGraphQuery] = []
 
@@ -60,8 +60,8 @@ class _FakeGraphQuery:
         self.embedder_factory = embedder_factory
         _FakeGraphQuery.instances.append(self)
 
-    def search_code(self, query, k=8, service=None, mode="hybrid"):
-        return {"items": [], "mode_used": mode, "_query": query, "_k": k}
+    def search_code(self, query, k=8, service=None, mode="hybrid", exact=False):
+        return {"items": [], "mode_used": mode, "_query": query, "_k": k, "_exact": exact}
 
 
 def _patch_common(monkeypatch, *, store_exists=True, store_unreachable=False):
@@ -334,3 +334,43 @@ def test_eval_retrieval_search_fn_calls_graphquery_search_code_hybrid_mode(monke
     assert set(_FakeGraphQuery.instances[0].service_paths) == {
         "orders-api", "kyc-worker", "document-management",
     }
+
+
+# ======================================================================================
+# -- M5 T2 (pilot Bug A): --exact flag reaches GraphQuery.search_code(exact=...) --
+# ======================================================================================
+
+
+def test_eval_retrieval_exact_flag_passes_true_to_search_code(monkeypatch):
+    _patch_common(monkeypatch)
+    monkeypatch.setattr("codegraph.cli.load_questions", lambda path: _QUESTIONS[:1])
+    captured: dict = {}
+
+    def fake_run_questions(search_fn, questions):
+        captured["result"] = search_fn(questions[0]["question"], questions[0]["k"])
+        return []
+
+    monkeypatch.setattr("codegraph.cli.run_questions", fake_run_questions)
+
+    result = runner.invoke(app, ["eval", "retrieval", str(FIXTURES_WS), "--exact"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["result"]["_exact"] is True
+    assert captured["result"]["mode_used"] == "hybrid"  # --exact doesn't change mode
+
+
+def test_eval_retrieval_without_exact_flag_defaults_to_false(monkeypatch):
+    _patch_common(monkeypatch)
+    monkeypatch.setattr("codegraph.cli.load_questions", lambda path: _QUESTIONS[:1])
+    captured: dict = {}
+
+    def fake_run_questions(search_fn, questions):
+        captured["result"] = search_fn(questions[0]["question"], questions[0]["k"])
+        return []
+
+    monkeypatch.setattr("codegraph.cli.run_questions", fake_run_questions)
+
+    result = runner.invoke(app, ["eval", "retrieval", str(FIXTURES_WS)])
+
+    assert result.exit_code == 0, result.output
+    assert captured["result"]["_exact"] is False

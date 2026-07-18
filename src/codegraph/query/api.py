@@ -399,6 +399,7 @@ class GraphQuery:
         k: int = 8,
         service: str | None = None,
         mode: Literal["hybrid", "vector", "text"] = "hybrid",
+        exact: bool = False,
     ) -> dict:
         """M3 T7, 9-й MCP-инструмент: тонкая обёртка над retrieval.search_code, тот
         же store_factory/embedder/StoreError-паттерн, что find_entrypoint выше.
@@ -406,14 +407,23 @@ class GraphQuery:
         заведомо проваленная проверка не должна платить за подключение к store", что
         у expand_neighbors/trace_process direction (см. модульный докстринг,
         "Ограничения ответов"); retrieval.search_code ПОВТОРНО валидирует mode само
-        (defense in depth для прямых вызывающих retrieval.py в обход GraphQuery)."""
+        (defense in depth для прямых вызывающих retrieval.py в обход GraphQuery).
+
+        `exact` (M5 T2, pilot Bug A): passed straight through to retrieval.search_code
+        -- see its own docstring for what it does (routes the vector leg through the
+        deterministic full-scan store method instead of ANN). Deliberately NOT part
+        of the search_code MCP tool's own signature (mcp/server.py's hand-written
+        wrapper omits it) -- this parameter exists for `codegraph eval retrieval
+        --exact` (cli.py) only; every MCP/agent-facing caller keeps getting ANN."""
         if mode not in _VALID_SEARCH_MODES:
             return {"error": f"invalid search mode: {mode!r}"}
         k = max(_SEARCH_CODE_K_MIN, min(_SEARCH_CODE_K_MAX, k))
         try:
             store = self.store_factory()
             embedder = None if mode == "text" else self._get_embedder()
-            return retrieval.search_code(store, embedder, query, k=k, service=service, mode=mode)
+            return retrieval.search_code(
+                store, embedder, query, k=k, service=service, mode=mode, exact=exact
+            )
         except (StoreError, StoreUnavailable) as e:
             return {"error": f"falkordb unreachable: {e}"}
 

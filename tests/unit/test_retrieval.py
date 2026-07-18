@@ -15,18 +15,21 @@ from codegraph.query import retrieval
 class _FakeStore:
     """Duck-typed GraphStore, только методы retrieval.py реально вызывает: get_nodes
     (Meta-lookup + find_entrypoint's missing-id backfill), search_text_chunks,
-    search_vector_chunks, search_fulltext. Возвращённые списки уже в "best-first"
-    порядке -- ровно то, что реальный FalkorStore гарантирует (ORDER BY score
-    DESC/ASC, см. store.py); retrieval.py доверяет этому порядку, а не сырым score."""
+    search_vector_chunks, search_vector_chunks_exact (M5 T2 -- exact=True routes the
+    vector leg through this method instead), search_fulltext. Возвращённые списки уже
+    в "best-first" порядке -- ровно то, что реальный FalkorStore гарантирует (ORDER BY
+    score DESC/ASC, см. store.py); retrieval.py доверяет этому порядку, а не сырым score."""
 
     def __init__(self) -> None:
         self.meta: dict | None = None
         self.nodes_by_id: dict[str, dict] = {}
         self.text_chunks: list[tuple[dict, float]] = []
         self.vector_chunks: list[tuple[dict, float]] = []
+        self.vector_exact_chunks: list[tuple[dict, float]] = []
         self.sym_fulltext: list[dict] = []
         self.text_calls: list[tuple] = []
         self.vector_calls: list[tuple] = []
+        self.vector_exact_calls: list[tuple] = []
         self.fulltext_calls: list[tuple] = []
         self.get_nodes_calls: list[list[str]] = []
 
@@ -47,6 +50,10 @@ class _FakeStore:
     def search_vector_chunks(self, vec, k, service=None):
         self.vector_calls.append((vec, k, service))
         return self.vector_chunks[:k]
+
+    def search_vector_chunks_exact(self, vec, k, service=None):
+        self.vector_exact_calls.append((vec, k, service))
+        return self.vector_exact_chunks[:k]
 
     def search_fulltext(self, query, k, kinds=None):
         self.fulltext_calls.append((query, k, kinds))
@@ -298,6 +305,65 @@ def test_search_code_hybrid_calls_both_text_and_vector_search():
     retrieval.search_code(store, embedder, "q", k=5, service="svc-a", mode="hybrid")
     assert store.text_calls == [("q", 5, "svc-a")]
     assert store.vector_calls == [(embedder.embed_query("q"), 5, "svc-a")]
+
+
+# -- search_code: exact=True (M5 T2, pilot Bug A) -- vector leg routes through
+# search_vector_chunks_exact instead of the ANN search_vector_chunks; RRF fusion
+# itself is untouched (rrf() only ever sees a ranking of ids either way).
+
+
+def test_search_code_vector_mode_exact_true_calls_exact_method_not_ann():
+    store = _FakeStore()
+    store.meta = _meta("fake-4d")
+    store.vector_exact_chunks = [(_chunk("c1"), 0.0), (_chunk("c2"), 1.0)]
+    embedder = FakeEmbedder(dim=4, model_id="fake-4d")
+    result = retrieval.search_code(store, embedder, "q", mode="vector", exact=True)
+    assert result["mode_used"] == "vector"
+    assert [i["chunk_id"] for i in result["items"]] == ["c1", "c2"]
+    assert store.vector_calls == []  # ANN method never touched
+    assert store.vector_exact_calls == [(embedder.embed_query("q"), 8, None)]
+
+
+def test_search_code_vector_mode_exact_defaults_to_false_uses_ann_method():
+    store = _FakeStore()
+    store.meta = _meta("fake-4d")
+    store.vector_chunks = [(_chunk("c1"), 0.1)]
+    embedder = FakeEmbedder(dim=4, model_id="fake-4d")
+    result = retrieval.search_code(store, embedder, "q", mode="vector")
+    assert result["items"][0]["chunk_id"] == "c1"
+    assert store.vector_exact_calls == []  # exact method never touched
+
+
+def test_search_code_hybrid_exact_true_routes_vector_leg_through_exact_method():
+    store = _FakeStore()
+    store.meta = _meta("fake-4d")
+    store.text_chunks = [(_chunk("a"), 9.0)]
+    store.vector_exact_chunks = [(_chunk("b"), 0.0)]
+    embedder = FakeEmbedder(dim=4, model_id="fake-4d")
+    result = retrieval.search_code(store, embedder, "q", k=2, mode="hybrid", exact=True)
+    assert result["mode_used"] == "hybrid"
+    assert {i["chunk_id"] for i in result["items"]} == {"a", "b"}
+    assert store.vector_calls == []
+    assert store.vector_exact_calls == [(embedder.embed_query("q"), 2, None)]
+
+
+def test_search_code_text_mode_ignores_exact_flag_never_touches_any_vector_method():
+    store = _FakeStore()
+    store.text_chunks = [(_chunk("c1"), 1.0)]
+    result = retrieval.search_code(store, _PoisonEmbedder(), "q", mode="text", exact=True)
+    assert result["mode_used"] == "text"
+    assert store.vector_calls == []
+    assert store.vector_exact_calls == []
+
+
+def test_search_code_hybrid_no_embedder_exact_true_still_degrades_to_text():
+    # _vector_unusable_reason short-circuits before either vector method is ever
+    # consulted -- exact=True must not change that degradation.
+    store = _FakeStore()
+    store.text_chunks = [(_chunk("c1"), 1.0)]
+    result = retrieval.search_code(store, None, "q", mode="hybrid", exact=True)
+    assert result["mode_used"] == "text"
+    assert store.vector_exact_calls == []
 
 
 # -- find_entrypoint v2 --

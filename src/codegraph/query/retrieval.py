@@ -148,6 +148,7 @@ def search_code(
     k: int = 8,
     service: str | None = None,
     mode: str = "hybrid",
+    exact: bool = False,
 ) -> dict:
     """text -- всегда доступна (fulltext по Chunk(text, context_header), sanitize --
     см. store.search_text_chunks). vector/hybrid нуждаются в usable embedder (см.
@@ -158,6 +159,18 @@ def search_code(
     масштаб очков независимо от режима; сырые оценки text (RediSearch relevance,
     больше -- лучше) и vector (cosine-дистанция, МЕНЬШЕ -- лучше, см.
     store.search_vector_chunks) иначе несовместимы по знаку/масштабу между режимами).
+
+    `exact` (M5 T2, pilot Bug A -- no-op unless mode is "vector"/"hybrid" AND a
+    vector search actually runs): routes the vector leg through
+    `store.search_vector_chunks_exact` (deterministic full Cypher scan, no ANN index)
+    instead of `store.search_vector_chunks` (ANN, unseeded HNSW rebuild per graph
+    load -- ranking not reproducible across identical runs, see that method's own
+    docstring). RRF fusion itself is unaffected either way -- `rrf()` only ever sees
+    a plain ranking of ids, never the raw store scores (see `vector_ranking` below);
+    only WHICH store method produced that ranking changes. Not exposed via the
+    search_code MCP tool (mcp/server.py's own hand-written wrapper omits it on
+    purpose) -- production/agent-facing search stays ANN-only; `--exact` is a
+    `codegraph eval retrieval` CLI-only knob for deterministic CI hit@k (cli.py).
 
     Результат: `{"items": [...], "mode_used": "text"|"vector"|"hybrid"}` при успехе,
     `{"error": "..."}` при невалидном mode или недоступном векторе для mode="vector"."""
@@ -174,8 +187,10 @@ def search_code(
         return _text_only_search_code(store, query, k, service)  # hybrid: silent degrade
 
     # reason is None только когда embedder не None (см. _vector_unusable_reason) --
-    # можно безопасно звать embedder.embed_query ниже.
-    vector_hits = store.search_vector_chunks(embedder.embed_query(query), k, service)
+    # можно безопасно звать embedder.embed_query ниже. exact selects WHICH store
+    # method runs the vector leg -- see this function's own docstring.
+    vector_search = store.search_vector_chunks_exact if exact else store.search_vector_chunks
+    vector_hits = vector_search(embedder.embed_query(query), k, service)
     vector_ranking = [props["id"] for props, _score in vector_hits]
     props_by_id = {props["id"]: props for props, _score in vector_hits}
 

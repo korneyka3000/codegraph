@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pytest
 
+from codegraph.embedding.fake import FakeEmbedder
 from codegraph.stores.falkordb.batch import upsert_nodes
 from codegraph.stores.falkordb.connection import connect
 from codegraph.stores.falkordb.ddl import ensure_schema
@@ -244,6 +245,200 @@ def test_search_vector_chunks_returns_empty_list_not_exception_without_an_index(
     try:
         store.ensure_schema(dim=None)
         assert store.search_vector_chunks([0.1, 0.2, 0.3, 0.4], k=5) == []
+    finally:
+        store._g.delete()
+
+
+# -- M5 T2: store.search_vector_chunks_exact -- deterministic full-scan twin of
+# search_vector_chunks (pilot Bug A: FalkorDB's ANN vector index, db.idx.vector.
+# queryNodes/HNSW, rebuilds unseeded on every graph load -- hit@k measured against it
+# is not reproducible across identical eval runs, see docs/superpowers/reports/
+# 2026-07-18-m4-pilot.md §4.1). This method is a plain Cypher scan (vec.cosineDistance,
+# no index involved at all) used only by `codegraph eval retrieval --exact` --
+# production/MCP search stays ANN (search_vector_chunks above, untouched).
+
+VECTOR_EXACT_ORDER_GRAPH = "__codegraph_vector_exact_order__"
+
+
+def test_search_vector_chunks_exact_orders_nearest_first_by_cosine_distance(falkordb_cfg):
+    """Mirrors test_search_vector_chunks_orders_nearest_first_by_cosine_distance above
+    -- same near/far vectors, same expected ordering -- proving the full-scan method
+    computes cosine distance correctly, independent of the determinism/self-retrieval
+    tests below."""
+    store = FalkorStore(falkordb_cfg, VECTOR_EXACT_ORDER_GRAPH)
+    try:
+        store.ensure_schema(dim=4)
+        store._g.query(
+            "MERGE (c:Chunk {id: 'near'}) SET c.service = 'svc-a', c.embedding = vecf32($v)",
+            {"v": [0.9, 0.05, 0.05, 0.0]},
+        )
+        store._g.query(
+            "MERGE (c:Chunk {id: 'far'}) SET c.service = 'svc-a', c.embedding = vecf32($v)",
+            {"v": [0.0, 1.0, 0.0, 0.0]},
+        )
+
+        results = store.search_vector_chunks_exact([1.0, 0.0, 0.0, 0.0], k=2)
+        assert [props["id"] for props, _score in results] == ["near", "far"]
+        # score ASC (nearest first), same convention as the ANN method.
+        assert results[0][1] < results[1][1]
+    finally:
+        store._g.delete()
+
+
+def test_search_vector_chunks_exact_service_filter_needs_no_overfetch(falkordb_cfg):
+    """Mirrors test_search_vector_chunks_service_filter_overfetches_and_trims_to_k --
+    same scenario (a wrong-service chunk closer than one of the two real matches) --
+    but the exact method needs no over-fetch multiplier at all: `LIMIT $k` runs in
+    Cypher strictly AFTER `WHERE ... AND c.service = $service` evaluates over every
+    matching row (a plain scan, not a KNN procedure call that truncates to k BEFORE
+    any WHERE can run -- see search_vector_chunks_exact's own docstring)."""
+    store = FalkorStore(falkordb_cfg, VECTOR_EXACT_ORDER_GRAPH)
+    try:
+        store.ensure_schema(dim=4)
+        for cid, svc, vec in (
+            ("a1", "svc-a", [1.0, 0.0, 0.0, 0.0]),
+            ("a2", "svc-a", [0.9, 0.1, 0.0, 0.0]),
+            ("b1", "svc-b", [0.95, 0.05, 0.0, 0.0]),  # closer than a2, but wrong service
+        ):
+            store._g.query(
+                "MERGE (c:Chunk {id: $id}) SET c.service = $svc, c.embedding = vecf32($v)",
+                {"id": cid, "svc": svc, "v": vec},
+            )
+
+        results = store.search_vector_chunks_exact([1.0, 0.0, 0.0, 0.0], k=2, service="svc-a")
+        assert {props["id"] for props, _score in results} == {"a1", "a2"}
+        assert len(results) == 2
+    finally:
+        store._g.delete()
+
+
+VECTOR_EXACT_NULL_GRAPH = "__codegraph_vector_exact_null__"
+
+
+def test_search_vector_chunks_exact_excludes_chunks_with_no_embedding(falkordb_cfg):
+    """A Chunk without ANY embedding (e.g. embedder skipped for this one chunk) must
+    be excluded by `WHERE c.embedding IS NOT NULL`, not make `vec.cosineDistance`
+    blow up on a null argument -- the WHERE guard runs BEFORE that function is ever
+    evaluated on a given row, so it never sees one."""
+    store = FalkorStore(falkordb_cfg, VECTOR_EXACT_NULL_GRAPH)
+    try:
+        store.ensure_schema(dim=4)
+        store.upsert_nodes(("Chunk",), [{"id": "no-embedding", "props": {"service": "svc"}}])
+        store._g.query(
+            "MERGE (c:Chunk {id: 'has-embedding'}) SET c.service = 'svc', "
+            "c.embedding = vecf32($v)",
+            {"v": [1.0, 0.0, 0.0, 0.0]},
+        )
+
+        results = store.search_vector_chunks_exact([1.0, 0.0, 0.0, 0.0], k=5)
+        assert [props["id"] for props, _score in results] == ["has-embedding"]
+    finally:
+        store._g.delete()
+
+
+VECTOR_EXACT_DEGRADED_GRAPH = "__codegraph_vector_exact_degraded__"
+
+
+def test_search_vector_chunks_exact_returns_empty_list_on_degraded_graph(falkordb_cfg):
+    """Mirrors test_search_vector_chunks_returns_empty_list_not_exception_without_an_index
+    above -- a graph with no embedder ever run (ensure_schema(dim=None), so no Chunk
+    carries a non-null embedding). Unlike the ANN method, this needs no try/except at
+    all: a plain MATCH+WHERE that matches zero rows is not an error in Cypher, just []
+    -- there is no vector INDEX for this method to be missing in the first place."""
+    store = FalkorStore(falkordb_cfg, VECTOR_EXACT_DEGRADED_GRAPH)
+    try:
+        store.ensure_schema(dim=None)
+        assert store.search_vector_chunks_exact([0.1, 0.2, 0.3, 0.4], k=5) == []
+    finally:
+        store._g.delete()
+
+
+VECTOR_EXACT_DETERMINISM_GRAPH = "__codegraph_vector_exact_determinism__"
+
+
+def test_search_vector_chunks_exact_is_byte_identical_across_repeated_calls(falkordb_cfg):
+    """Core brief requirement (pilot Bug A): enough chunks (20) that an ANN ranking
+    COULD plausibly reorder between calls (not asserted here -- asserting ANN
+    instability would itself be a flaky test by construction) -- the exact method
+    must return the EXACT same (id, score) pairs, in the EXACT same order, on two
+    back-to-back calls with the identical query vector."""
+    store = FalkorStore(falkordb_cfg, VECTOR_EXACT_DETERMINISM_GRAPH)
+    try:
+        store.ensure_schema(dim=4)
+        embedder = FakeEmbedder(dim=4)
+        rows = [
+            {
+                "id": f"chunk:{i}", "props": {"service": "svc"},
+                "embedding": embedder.embed_query(f"chunk-{i}"),
+            }
+            for i in range(20)
+        ]
+        store.upsert_nodes(("Chunk",), rows, vector_props=("embedding",))
+
+        query_vec = embedder.embed_query("chunk-0")
+        first = store.search_vector_chunks_exact(query_vec, k=10)
+        second = store.search_vector_chunks_exact(query_vec, k=10)
+
+        assert first == second
+        assert [p["id"] for p, _s in first] == [p["id"] for p, _s in second]
+        assert [s for _p, s in first] == [s for _p, s in second]
+    finally:
+        store._g.delete()
+
+
+VECTOR_EXACT_SELF_GRAPH = "__codegraph_vector_exact_self__"
+
+
+def test_search_vector_chunks_exact_self_retrieval_ranks_own_chunk_first(falkordb_cfg):
+    """Brief's second Step-1 requirement: querying with a chunk's own stored vector
+    must rank that exact chunk at position 0 with dist == 0.0 (the cosine-distance
+    global minimum) -- a basic correctness sanity check, not just "some deterministic
+    order"."""
+    store = FalkorStore(falkordb_cfg, VECTOR_EXACT_SELF_GRAPH)
+    try:
+        store.ensure_schema(dim=4)
+        embedder = FakeEmbedder(dim=4)
+        rows = [
+            {
+                "id": f"chunk:{i}", "props": {"service": "svc"},
+                "embedding": embedder.embed_query(f"chunk-{i}"),
+            }
+            for i in range(10)
+        ]
+        store.upsert_nodes(("Chunk",), rows, vector_props=("embedding",))
+
+        target_vec = embedder.embed_query("chunk-5")
+        results = store.search_vector_chunks_exact(target_vec, k=5)
+
+        assert results[0][0]["id"] == "chunk:5"
+        assert results[0][1] == pytest.approx(0.0, abs=1e-6)
+    finally:
+        store._g.delete()
+
+
+VECTOR_EXACT_TIEBREAK_GRAPH = "__codegraph_vector_exact_tiebreak__"
+
+
+def test_search_vector_chunks_exact_ties_broken_by_id_ascending(falkordb_cfg):
+    """`ORDER BY dist ASC, c.id ASC` -- the id tiebreak is REQUIRED for determinism
+    when two (or more) chunks land at the EXACT same distance from the query vector
+    (plausible on a small/synthetic eval fixture -- the whole point of "exact" is a
+    byte-identical result across repeated calls, which an unspecified tie order would
+    silently violate). Three chunks share the IDENTICAL embedding here (dist == 0.0
+    for all three against that same query vector) -- only the id ASC tiebreak can
+    produce a deterministic order among them."""
+    store = FalkorStore(falkordb_cfg, VECTOR_EXACT_TIEBREAK_GRAPH)
+    try:
+        store.ensure_schema(dim=4)
+        tied_vec = [1.0, 0.0, 0.0, 0.0]
+        for cid in ("zzz", "aaa", "mmm"):
+            store._g.query(
+                "MERGE (c:Chunk {id: $id}) SET c.service = 'svc', c.embedding = vecf32($v)",
+                {"id": cid, "v": tied_vec},
+            )
+
+        results = store.search_vector_chunks_exact(tied_vec, k=3)
+        assert [props["id"] for props, _score in results] == ["aaa", "mmm", "zzz"]
     finally:
         store._g.delete()
 

@@ -215,7 +215,7 @@ workspace, а не в точечных правках внутри одного 
 | `codegraph stats [TARGET] [--graph NAME]` | Узлы по `kind` / рёбра по `type`. |
 | `codegraph trace SELECTOR [TARGET] [--graph NAME] [--format text\|mermaid]` | Трассировка от точки входа (`"<service>:<METHOD> <path>"` либо `"<service>:<dotted.qualified.name>"`). |
 | `codegraph serve [TARGET] [--graph NAME]` | MCP-сервер (stdio). |
-| `codegraph eval retrieval [TARGET] [--graph NAME] [--k N] [--questions PATH]` | Прогон golden-вопросов (hit@k) через `search_code(mode="hybrid")` — отчёт, не CI-гейт. |
+| `codegraph eval retrieval [TARGET] [--graph NAME] [--k N] [--questions PATH] [--exact]` | Прогон golden-вопросов (hit@k) через `search_code(mode="hybrid")` — отчёт, не CI-гейт. `--exact` — детерминированный полный скан вместо ANN (см. «Ограничения»). |
 | `codegraph --version` | Версия установленного пакета. |
 
 ## Ограничения
@@ -233,6 +233,15 @@ workspace, а не в точечных правках внутри одного 
   буквально встречается в корпусе. Чисто-кириллический запрос без ни одного
   совпадающего токена остаётся целиком на векторном поиске — `mode="hybrid"` в
   этом случае фактически равен `mode="vector"`.
+- **`hit@k` нестабилен между идентичными прогонами `codegraph eval retrieval`.**
+  FalkorDB's ANN-индекс для векторного поиска (`db.idx.vector.queryNodes`, HNSW)
+  пересобирается несидированным при каждой загрузке графа, так что векторная нога
+  ранжирования может отличаться от прогона к прогону на одном и том же графе (см.
+  [пилот-отчёт](docs/superpowers/reports/2026-07-18-m4-pilot.md) §4.1). Продакшен-
+  поиск (`search_code`/MCP) остаётся ANN как есть; `codegraph eval retrieval
+  --exact` даёт полный детерминированный скан (`vec.cosineDistance`, без индекса) —
+  используйте его для CI-гейтов и сравнений между прогонами; на больших графах он
+  медленнее ANN.
 - **`scip-python` не файл-инкрементален** (см. «Инкрементальный индекс» выше) —
   внутри изменённого сервиса SCIP перегоняется целиком; выигрыш `--incremental`
   на правке одного файла масштабо-зависим (фикстуры: ≈30–40% полного прогона;

@@ -354,6 +354,69 @@ class FalkorStore:
             return []
         return [(node.properties, score) for node, score in res.result_set][:k]
 
+    def search_vector_chunks_exact(
+        self, vec: list[float], k: int, service: str | None = None
+    ) -> list[tuple[dict, float]]:
+        """M5 T2 (pilot Bug A fix): deterministic full-scan twin of
+        search_vector_chunks -- `MATCH (c:Chunk) WHERE c.embedding IS NOT NULL [AND
+        c.service = $service] RETURN c, vec.cosineDistance(c.embedding, vecf32($vec))
+        AS dist ORDER BY dist ASC, c.id ASC LIMIT $k`, no ANN index (`db.idx.vector.
+        queryNodes`, HNSW) involved at all. Motivation: that index rebuilds unseeded
+        on every graph load (live-confirmed by the M4 pilot, docs/superpowers/reports/
+        2026-07-18-m4-pilot.md §4.1) -- hit@k measured against it is NOT reproducible
+        across identical eval runs. This method trades ANN's speed for an O(n) scan
+        any CI/comparison run can afford at eval scale; production/MCP search is
+        untouched and stays on search_vector_chunks (ANN) -- see `codegraph eval
+        retrieval --exact` (cli.py) for the only caller that opts into this.
+
+        score semantics MATCH search_vector_chunks EXACTLY, not merely "the same sign
+        convention" -- live-verified against this same FalkorDB build (v4.18.11):
+        querying `db.idx.vector.queryNodes` and `vec.cosineDistance` with the SAME
+        stored vectors and the SAME query vector returns byte-identical numbers (0.0
+        for an identical vector, 1.0 orthogonal, 2.0 opposite -- both apparently
+        compute the standard `1 - cosine_similarity` formula). So `dist` is returned
+        AS-IS here, no `1 - dist` inversion -- inverting it would silently desync
+        exact's score from ANN's for any caller that ever compares the two
+        numerically, and RRF/eval code must stay agnostic to which twin produced a
+        given (id, score) pair (query.retrieval routes through either transparently).
+
+        `ORDER BY dist ASC, c.id ASC`: the id tiebreak is REQUIRED for determinism,
+        not cosmetic -- two chunks at the exact same distance (plausible on a small/
+        synthetic eval fixture, and the whole point of "exact" is a byte-identical
+        result across repeated identical calls) would otherwise order however
+        FalkorDB's own internal tie resolution happens to fall, which is not a
+        documented/guaranteed stable order.
+
+        Unlike search_vector_chunks, no try/except ResponseError dance is needed:
+        this is a plain MATCH+WHERE+ORDER BY+LIMIT over Chunk nodes, not a `CALL
+        db.idx.vector.queryNodes` procedure that requires a vector INDEX to exist --
+        a degraded graph (no embedder has ever run, so no Chunk carries a non-null
+        embedding, or the graph has no Chunk nodes at all) simply matches zero rows
+        and returns `[]` through completely ordinary Cypher semantics (live-verified:
+        MATCH on an entirely absent label, on a graph key that doesn't even exist
+        yet, raises nothing and returns an empty result_set) -- there is no separate
+        "index missing" failure mode to catch here.
+
+        `service`, if given, is a plain `WHERE c.service = $service` alongside the
+        `IS NOT NULL` check -- unlike search_vector_chunks' k*
+        _VECTOR_SERVICE_FILTER_OVERFETCH dance, no over-fetch is needed: `LIMIT $k`
+        runs in Cypher AFTER both WHERE clauses evaluate over every matching row, not
+        as an argument to a KNN procedure that already truncated to k BEFORE the
+        service filter could run (same reasoning as search_text_chunks' own
+        docstring, which over-fetches for the identical reason search_vector_chunks
+        does and NOT for the identical reason this method doesn't need to)."""
+        cypher = "MATCH (c:Chunk) WHERE c.embedding IS NOT NULL"
+        params: dict[str, Any] = {"vec": vec, "k": k}
+        if service:
+            cypher += " AND c.service = $service"
+            params["service"] = service
+        cypher += (
+            " RETURN c, vec.cosineDistance(c.embedding, vecf32($vec)) AS dist "
+            "ORDER BY dist ASC, c.id ASC LIMIT $k"
+        )
+        res = self._g.query(cypher, params)
+        return [(node.properties, dist) for node, dist in res.result_set]
+
     def search_text_chunks(
         self, query: str, k: int, service: str | None = None
     ) -> list[tuple[dict, float]]:

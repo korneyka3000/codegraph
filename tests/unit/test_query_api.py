@@ -946,15 +946,15 @@ def test_search_code_delegates_to_retrieval_with_clamped_k(monkeypatch):
     calls = []
     monkeypatch.setattr(
         api_mod.retrieval, "search_code",
-        lambda store, embedder, query, k, service, mode: calls.append(
-            (query, k, service, mode)
+        lambda store, embedder, query, k, service, mode, exact: calls.append(
+            (query, k, service, mode, exact)
         )
         or {"items": [], "mode_used": mode},
     )
     store = FakeStore()
     q = GraphQuery(_factory(store), {})
     result = q.search_code("create order", k=999, service="svc-a", mode="text")
-    assert calls == [("create order", 20, "svc-a", "text")]  # clamped to 20
+    assert calls == [("create order", 20, "svc-a", "text", False)]  # clamped to 20
     assert result == {"items": [], "mode_used": "text"}
 
 
@@ -964,13 +964,43 @@ def test_search_code_clamps_k_minimum_to_1(monkeypatch):
     calls = []
     monkeypatch.setattr(
         api_mod.retrieval, "search_code",
-        lambda store, embedder, query, k, service, mode: calls.append(k)
+        lambda store, embedder, query, k, service, mode, exact: calls.append(k)
         or {"items": [], "mode_used": "text"},
     )
     store = FakeStore()
     q = GraphQuery(_factory(store), {})
     q.search_code("x", k=0)
     assert calls == [1]
+
+
+def test_search_code_passes_exact_flag_through_to_retrieval(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+    monkeypatch.setattr(
+        api_mod.retrieval, "search_code",
+        lambda store, embedder, query, k, service, mode, exact: calls.append(exact)
+        or {"items": [], "mode_used": mode},
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    q.search_code("x", mode="vector", exact=True)
+    assert calls == [True]
+
+
+def test_search_code_exact_defaults_to_false(monkeypatch):
+    import codegraph.query.api as api_mod
+
+    calls = []
+    monkeypatch.setattr(
+        api_mod.retrieval, "search_code",
+        lambda store, embedder, query, k, service, mode, exact: calls.append(exact)
+        or {"items": [], "mode_used": mode},
+    )
+    store = FakeStore()
+    q = GraphQuery(_factory(store), {})
+    q.search_code("x", mode="vector")
+    assert calls == [False]
 
 
 def test_search_code_invalid_mode_returns_error_before_store_factory_call():
@@ -1010,7 +1040,9 @@ def test_search_code_text_mode_never_constructs_an_embedder(monkeypatch):
 
     monkeypatch.setattr(
         api_mod.retrieval, "search_code",
-        lambda store, embedder, query, k, service, mode: {"items": [], "mode_used": "text"},
+        lambda store, embedder, query, k, service, mode, exact: {
+            "items": [], "mode_used": "text",
+        },
     )
     store = FakeStore()
     q = GraphQuery(_factory(store), {}, embedder_factory=embedder_factory)
@@ -1024,7 +1056,7 @@ def test_search_code_non_text_mode_resolves_embedder_via_factory(monkeypatch):
     seen = []
     monkeypatch.setattr(
         api_mod.retrieval, "search_code",
-        lambda store, embedder, query, k, service, mode: seen.append(embedder)
+        lambda store, embedder, query, k, service, mode, exact: seen.append(embedder)
         or {"items": [], "mode_used": "hybrid"},
     )
     store = FakeStore()
