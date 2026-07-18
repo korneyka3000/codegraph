@@ -7,6 +7,12 @@ version: 1
 graph_name: kyc
 storage: { falkordb: { host: localhost, port: 6379 } }
 embedding: { provider: local, model: jinaai/jina-embeddings-v2-base-code }
+# embedding.query_prefix/passage_prefix (опционально, "" по умолчанию у обеих --
+# no-op): инструкции, которые некоторые local-модели ждут перед текстом, чтобы
+# отличить поисковый запрос от индексируемого пассажа -- напр. канонические
+# intfloat/multilingual-e5-* принимают query_prefix: "query: ", passage_prefix:
+# "passage: " (см. README «Ограничения», рекомендация для русскоязычных команд).
+# Читает только provider: local.
 scip: { timeout_min: 20, node_options: "--max-old-space-size=8192" }
 
 services:
