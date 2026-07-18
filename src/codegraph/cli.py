@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.resources
 import warnings
 from pathlib import Path
@@ -70,8 +71,19 @@ app = typer.Typer(no_args_is_help=True, add_completion=False)
 console = Console()
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        console.print(f"codegraph {importlib.metadata.version('codegraph')}")
+        raise typer.Exit()
+
+
 @app.callback()
-def _callback() -> None:
+def _callback(
+    version: bool = typer.Option(  # noqa: B008 -- typer marker call, idiomatic
+        False, "--version", callback=_version_callback, is_eager=True,
+        help="Показать версию codegraph и выйти.",
+    ),
+) -> None:
     """codegraph: граф знаний кода для Python-микросервисов (CLI-индексатор + MCP-сервер)."""
     # Пустой callback нужен, чтобы Typer не схлопывал единственную команду
     # (doctor) в безымянную корневую — иначе `codegraph doctor` не работает,
@@ -80,6 +92,19 @@ def _callback() -> None:
     # Остаётся навсегда: без него Typer схлопывает единственную команду в
     # безымянную корневую (см. выше), а докстринг здесь — это текст `--help`
     # всего приложения.
+    #
+    # --version: eager option (`is_eager=True`) -- Typer/Click обрабатывает eager-
+    # параметры ДО валидации остальных опций/аргументов, включая required SELECTOR
+    # у `trace` -- поэтому `codegraph --version` (без под-команды) и `codegraph
+    # --version trace` (под-команда указана, но её аргументы не провалидированы и
+    # не важны) оба печатают версию и выходят, не долетая до тела под-команды. Сам
+    # вывод и exit -- в _version_callback (Typer/Click own контракт для option-
+    # callback: обычный return НЕ останавливает обработку — нужен explicit `raise
+    # typer.Exit()`). Источник версии -- importlib.metadata (реально
+    # УСТАНОВЛЕННЫЙ пакет), а не отдельная константа `codegraph.__version__` --
+    # для wheel/editable-инсталляции это ровно то же значение, что покажет `uv pip
+    # show codegraph`, и оно физически не может разъехаться с тем, что реально
+    # установлено (в отличие от независимо поддерживаемой константы).
 
 
 def _render(results, title: str) -> bool:
