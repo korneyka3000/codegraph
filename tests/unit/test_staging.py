@@ -349,6 +349,43 @@ def test_local_def_symbols(tmp_path):
     assert st.local_def_symbols("a", "m.py") == {"local 1"}
 
 
+# -- M5 Task 1 (pilot Bug B): def_symbols -- service-wide (not per-file, unlike
+# local_def_symbols above) set of every symbol with a staged def, consumed by
+# extractors/calls.py's build_calls as the new first-party classification source of
+# truth (existence-of-def, not scip's package tag -- see calls.py's own docstring).
+
+
+def test_def_symbols(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.add_defs("a", [DefRow("m.py", "local 1", 0, 1, 1),
+                      DefRow("m.py", "scip-python python a 0.1 `m`/f().", 5, 6, 1),
+                      DefRow("n.py", "scip-python python a 0.1 `n`/g().", 0, 1, 1)])
+    assert st.def_symbols("a") == {
+        "local 1",
+        "scip-python python a 0.1 `m`/f().",
+        "scip-python python a 0.1 `n`/g().",
+    }
+
+
+def test_def_symbols_scoped_to_service_and_deduped(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    st.begin_service("b")
+    sym_f = "scip-python python a 0.1 `m`/f()."
+    st.add_defs("a", [
+        DefRow("m.py", sym_f, 0, 1, 1),
+        DefRow("n.py", sym_f, 0, 1, 1),  # same symbol, different def site -- DISTINCT-worthy
+    ])
+    st.add_defs("b", [DefRow("m.py", "scip-python python b 0.1 `m`/h().", 0, 1, 1)])
+    assert st.def_symbols("a") == {sym_f}
+
+
+def test_def_symbols_empty_for_unknown_service(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    assert st.def_symbols("nonexistent") == set()
+
+
 # -- M2: NodeRec.roles round-trip + validation --
 
 

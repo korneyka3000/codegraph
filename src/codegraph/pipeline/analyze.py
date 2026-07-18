@@ -216,12 +216,12 @@ def _extract_join_and_stage(
     (`relpaths` == the stale subset only, M4 T5) -- extracted so the two paths can
     never drift apart on this large, delicate chunk of wiring. Always stages a fresh
     Service node (id stable, INSERT OR REPLACE is a no-op) regardless of whether
-    `relpaths` is empty. `def_symbol_lookup`/`ref_symbol_lookup`/`local_defs_for_file`
-    below are built from `staging.module_set`/`def_symbol_at`/`ref_symbol_at`/
-    `local_def_symbols` -- service-wide queries, not scoped to `relpaths` -- so
-    cross-file resolution (a stale file referencing a def in a file NOT in
-    `relpaths`) works correctly as long as the caller already rewrote defs/refs for
-    the whole service (S4) before calling this.
+    `relpaths` is empty. `def_symbol_lookup`/`ref_symbol_lookup`/`local_defs_for_file`/
+    `def_symbols` (M5 Task 1) below are built from `staging.module_set`/
+    `def_symbol_at`/`ref_symbol_at`/`local_def_symbols`/`def_symbols` -- service-wide
+    queries, not scoped to `relpaths` -- so cross-file resolution (a stale file
+    referencing a def in a file NOT in `relpaths`) works correctly as long as the
+    caller already rewrote defs/refs for the whole service (S4) before calling this.
 
     Returns {"nodes": int, "edges": int, "imports_external": int, "join_stats":
     JoinStats} -- everything the caller's own report dict still needs to assemble
@@ -351,9 +351,20 @@ def _extract_join_and_stage(
     def local_defs_for_file(relpath: str) -> set[str]:
         return staging.local_def_symbols(svc.name, relpath)
 
+    # M5 Task 1 (pilot Bug B): def_symbols -- the service-WIDE set every non-local ref
+    # symbol's first-party status is now decided against (see calls.py's own docstring
+    # for why parsed.package == service stopped being a reliable criterion). Hoisted
+    # here the same way local_defs_for_file is -- ONE query per analyze_service call
+    # (full or incremental, each calls _extract_join_and_stage exactly once), not
+    # per-file/per-call-site -- and, load-bearingly, called AFTER S4 (`add_defs`/
+    # `read_scip_into_staging` above, or the degraded fallback's own `add_defs`) has
+    # already written this run's defs: def_symbols must see the FRESH staged defs, not
+    # a stale set from before this analyze call.
+    def_symbols = staging.def_symbols(svc.name)
+
     resolution, confidence = ("heuristic", 0.6) if degraded else ("static", 1.0)
     join_stats = build_calls(
-        svc.name, staging, facts_by_file, def_symbol_lookup,
+        svc.name, staging, facts_by_file, def_symbol_lookup, def_symbols,
         local_defs_for_file=local_defs_for_file,
         resolution=resolution, confidence=confidence,
     )

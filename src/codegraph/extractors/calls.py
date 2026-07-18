@@ -3,12 +3,38 @@
 Per call-site (`CallFact.callee_start_byte`), find the SCIP ref occupying that exact
 byte position (exact dict hit) or, failing that, the ref whose [start_byte, end_byte)
 span contains it (sorted-list bisect fallback — covers small span-conversion drift).
-A global ref symbol from a different package than the current service is external
-(counted, not joined: cross-service edges are forbidden by staging, see
-`Staging.upsert_edges`); a local symbol is first-party — unless `local_defs_for_file`
-is given and the symbol has no def in that same file, in which case it is unresolved
-(pyright degrades unresolved 3rd-party refs to 'local N'). Calls that match no ref at
-all (fully dynamic) are likewise counted unresolved. Matched first-party calls are
+
+First-party vs. external (M5 Task 1 -- pilot Bug B, docs/superpowers/reports/
+2026-07-18-m4-pilot.md §7.2): a non-local ref symbol is first-party iff it has a
+STAGED DEF somewhere in this service's own `scip_defs` (`def_symbols`, hoisted once
+per service by the caller -- see `analyze.py`) -- NOT, as before, iff
+`parsed.package == service`. The package-tag criterion is REMOVED, not supplemented:
+a dual criterion would still wrongly join a third-party symbol whose package happens
+to collide with a first-party one. Root cause: `resolvers/scip/runner.py::ScipRunner.
+run` invokes `scip-python index . --project-name <service> ...`, and `--project-name`
+makes scip-python stamp `package=<service>` on EVERY symbol it fully resolves --
+first-party AND third-party alike, as long as the callee is resolvable at all (which,
+for a service with a real installed venv, includes sqlalchemy/pydantic/fastapi/etc).
+A bare package-tag comparison therefore cannot distinguish "defined in this service"
+from "some library this service's venv happens to have installed" once a real venv is
+in play -- measured on a real repo during the M4 pilot: of 5345 staged CALLS edges,
+only 2916 (54.6%) had a valid dst at load time (`load.py`'s S9); the other 2429
+(45.4%) were third-party calls masquerading as first-party "joined" edges (94% of
+those pointing at obviously third-party prefixes -- sqlalchemy/pydantic/fastapi/
+blockkit/slack_sdk/etc) whose dst node is never staged (defs only ever exist for a
+service's own scanned files), so they were silently dropped at load, with no signal
+in `calls_joined`/`pct_unresolved_calls` that anything was wrong. Def-existence is
+exact and package-name-independent: a def only ever gets staged for a symbol this
+service's own S3/S4 (scip run + reader) actually found a DEFINITION occurrence for,
+regardless of what package string scip-python happened to attach to it.
+
+A local symbol (`local N`) is always first-party -- unless `local_defs_for_file` is
+given and the symbol has no def in that same file, in which case it is unresolved
+(pyright degrades unresolved 3rd-party refs to 'local N', see m1a-task-10-report §2);
+`local_defs_for_file` is a SEPARATE lookup from `def_symbols` (local defs are
+per-file-scoped `scip_defs` rows, `local_def_symbols`, not the service-wide
+`def_symbols` set) and this branch is untouched by this task. Calls that match no ref
+at all (fully dynamic) are likewise counted unresolved. Matched first-party calls are
 aggregated per (src, dst) into one CALLS edge with a callsite_count and evidence from
 the first call site encountered.
 """
@@ -73,6 +99,7 @@ def build_calls(
     staging: Staging,
     facts_by_file: dict[str, FileFacts],
     def_symbol_lookup: Callable[[str, int], str | None],
+    def_symbols: set[str] | Callable[[], set[str]],
     local_defs_for_file: Callable[[str], set[str]] | None = None,
     resolution: str = "static",
     confidence: float = 1.0,
@@ -80,6 +107,11 @@ def build_calls(
     calls_joined = 0
     calls_unresolved = 0
     calls_external = 0
+    # Resolved ONCE regardless of whether the caller passed an already-materialized
+    # set (analyze.py's own hoisted-per-service query, see its module docstring) or a
+    # zero-arg callable (tests' preferred style, mirroring local_defs_for_file's own
+    # lambda pattern) -- never re-queried per file or per call-site either way.
+    def_symbols_set = def_symbols() if callable(def_symbols) else def_symbols
     # (src, dst) -> {"count": int, "file": str, "line": int} — evidence is the FIRST
     # call site encountered for that pair (dict only set once, per key).
     agg: dict[tuple[str, str], dict] = {}
@@ -96,14 +128,23 @@ def build_calls(
                 continue
 
             parsed = parse_symbol(ref.symbol)
-            # ВНИМАНИЕ (M1b): pyright деградирует нерезолвленные 3rd-party в 'local N' — такие
-            # "first-party" локалы без def-occurrence в том же документе на деле unresolved
-            # (см. m1a-task-10-report §2).
-            if (parsed.is_local and local_defs_for_file is not None
-                    and ref.symbol not in local_defs_for_file(relpath)):
-                calls_unresolved += 1
-                continue
-            if not parsed.is_local and parsed.package != service:
+            if parsed.is_local:
+                # ВНИМАНИЕ (M1b): pyright деградирует нерезолвленные 3rd-party в 'local N' —
+                # такие "first-party" локалы без def-occurrence в том же документе на деле
+                # unresolved (см. m1a-task-10-report §2). Unaffected by M5 Task 1 below --
+                # local-ness is decided by SCIP's own symbol shape, not by def_symbols.
+                if (local_defs_for_file is not None
+                        and ref.symbol not in local_defs_for_file(relpath)):
+                    calls_unresolved += 1
+                    continue
+            # M5 Task 1 (pilot Bug B, see module docstring): first-party for a
+            # non-local symbol is decided by EXISTENCE OF A STAGED DEF, not by
+            # `parsed.package == service` -- --project-name makes that comparison
+            # unreliable (it stamps package=service on every resolved symbol,
+            # including third-party library calls resolvable via this service's own
+            # venv). `parsed.package`/`.descriptors` are deliberately not consulted
+            # here at all any more.
+            elif ref.symbol not in def_symbols_set:
                 calls_external += 1
                 continue
 

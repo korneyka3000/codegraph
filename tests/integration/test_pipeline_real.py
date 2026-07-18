@@ -19,9 +19,18 @@ FIXTURE = Path(__file__).parents[2] / "fixtures" / "services" / "document_manage
 
 @pytest.mark.skipif(shutil.which("npx") is None, reason="npx not available")
 def test_analyze_service_real_document_management(tmp_path):
-    # svc.name должно совпадать с --project-name, который ScipRunner передаёт scip-python
-    # (реальный run эмитит пакет "document-management" в SCIP-символах); иначе join
-    # classифицировал бы все global-символы как external (package != service).
+    # svc.name is what ScipRunner.run passes AS --project-name to the real scip-python
+    # subprocess (runner.py: `"--project-name", service_name`) -- the two can never
+    # diverge within analyze_service's own call chain, one Python variable threads
+    # through both. Historically (pre-M5) that mattered for join correctness too: the
+    # OLD first-party criterion compared a resolved symbol's embedded package string
+    # against this exact svc.name, and --project-name is what makes scip-python stamp
+    # that embedded package -- a real mismatch there would have misclassified every
+    # global symbol as external. M5 Task 1 removed that comparison entirely (join now
+    # keys off staged-def existence, package-name-independent, see calls.py's own
+    # docstring for why) -- svc.name no longer needs to "match" anything scip-python
+    # does internally for join correctness, only to be used consistently, which it
+    # always is here.
     svc = ServiceConfig(name="document-management", path=FIXTURE)
     st = Staging(tmp_path / "s.db")
 

@@ -71,6 +71,41 @@ def test_build_report_health_dropped_edges_from_load_stats():
     assert report["health"]["dropped_edges_by_type"] == {"CALLS": 1, "CONTAINS": 0}
 
 
+# -- M5 Task 1 (pilot Bug B): health.staged_calls_with_valid_dst_pct -- CALLS
+# written/(written+dropped) at load, from load_stats' own edges_written_by_type/
+# edges_dropped_by_type (load.py already tracks both; this is pure aggregation, same
+# "no new counting logic" shape as dropped_edges/dropped_edges_by_type above).
+
+
+def test_build_report_health_staged_calls_with_valid_dst_pct():
+    # LOAD_STATS: CALLS written=4, dropped=1 -> 4/(4+1) = 80%
+    report = build_report([SERVICE_OK, SERVICE_DEGRADED], LOAD_STATS)
+    assert report["health"]["staged_calls_with_valid_dst_pct"] == 80.0
+
+
+def test_build_report_staged_calls_with_valid_dst_pct_zero_when_no_calls_staged():
+    load_stats_no_calls = {
+        **LOAD_STATS,
+        "edges_written_by_type": {"CONTAINS": 8},
+        "edges_dropped_by_type": {"CONTAINS": 0},
+    }
+    report = build_report([SERVICE_OK], load_stats_no_calls)
+    assert report["health"]["staged_calls_with_valid_dst_pct"] == 0.0
+
+
+def test_build_report_staged_calls_pct_defaults_when_load_stats_missing_by_type_keys():
+    """A load_stats dict predating this metric (no edges_written_by_type/
+    edges_dropped_by_type at all) must not KeyError; the metric degrades to 0.0, same
+    defensive `.get(..., {})` convention as dropped_edges_by_type's own read just
+    above this in build_report."""
+    pre_m5_load_stats = {
+        "nodes_written": 13, "nodes_written_by_label": {},
+        "edges_written": 12, "edges_dropped_missing_endpoint": 1,
+    }
+    report = build_report([SERVICE_OK], pre_m5_load_stats)
+    assert report["health"]["staged_calls_with_valid_dst_pct"] == 0.0
+
+
 def test_build_report_degraded_services_list():
     report = build_report([SERVICE_OK, SERVICE_DEGRADED], LOAD_STATS)
     assert report["health"]["degraded_services"] == [
@@ -205,6 +240,33 @@ def test_print_report_smoke_shows_health_and_load_summary():
     assert "25.0" in text  # pct_unresolved_calls
     assert "13" in text  # nodes_written
     assert "12" in text  # edges_written
+
+
+# -- M5 Task 1: print_report staged_calls_with_valid_dst_pct (additive to the
+# existing health line, .get()-defaulted -- same backward-compatible-dict precedent
+# as chunking's embedded_fresh/embedded_from_cache, M4 T1) --
+
+
+def test_print_report_smoke_shows_staged_calls_with_valid_dst_pct():
+    report = build_report([SERVICE_OK, SERVICE_DEGRADED], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "80.0" in text  # staged_calls_with_valid_dst_pct (4 written / (4+1))
+
+
+def test_print_report_staged_calls_pct_defaults_when_health_key_absent():
+    """Backward compatibility: a report dict whose health sub-dict predates this
+    metric (e.g. a report.json written by pre-M5 code) must not KeyError --
+    print_report degrades to showing 0.0% rather than crashing, same `.get(key,
+    default)` convention as every other M3/M4 additive report field this module
+    already reads."""
+    report = build_report([SERVICE_OK], LOAD_STATS)
+    del report["health"]["staged_calls_with_valid_dst_pct"]
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise
+    text = console.export_text()
+    assert "0.0%" in text
 
 
 def test_print_report_smoke_shows_degraded_block_when_present():

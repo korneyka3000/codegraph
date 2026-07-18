@@ -24,6 +24,26 @@ def _pct(numerator: int, denominator: int) -> float:
     return 100.0 * numerator / denominator if denominator else 0.0
 
 
+def _staged_calls_valid_dst_pct(load_stats: dict) -> float:
+    """M5 Task 1 (pilot Bug B, docs/superpowers/reports/2026-07-18-m4-pilot.md §10.2
+    recommendation): what fraction of staged CALLS edges actually had a valid dst at
+    load time -- written/(written+dropped), CALLS only. `pct_unresolved_calls` (the
+    pre-existing health metric) counts unresolved/external call-SITES at JOIN time
+    (S6) and was never a measure of first-party call-graph quality on a real repo with
+    third-party deps (see calls.py's own module docstring for why) -- this metric
+    instead measures the very end of the pipeline (S9 load), where a "joined" CALLS
+    edge either lands in the graph or silently vanishes ("missing endpoint", load.py).
+    No new counting logic needed: load.py already tracks both `edges_written_by_type`
+    and `edges_dropped_by_type`, keyed by edge type -- this is pure aggregation, same
+    as `dropped_edges`/`dropped_edges_by_type` just below. `.get(..., {})` on both
+    dicts (not a bare index) so a load_stats shape predating this metric (no
+    edges_written_by_type/edges_dropped_by_type keys at all) degrades to 0.0 via
+    `_pct`'s own zero-denominator convention, rather than KeyError."""
+    written = load_stats.get("edges_written_by_type", {}).get("CALLS", 0)
+    dropped = load_stats.get("edges_dropped_by_type", {}).get("CALLS", 0)
+    return _pct(written, written + dropped)
+
+
 def build_report(
     per_service: list[dict],
     load_stats: dict,
@@ -49,7 +69,10 @@ def build_report(
     chunk_stats передан -- оба независимы друг от друга). "health": pct_unresolved_calls
     = unresolved/(joined+unresolved+external) * 100 (0.0 при нулевом знаменателе --
     сервисы без единого call-сайта, не делить на 0), dropped_edges(+by_type) из
-    load_stats, degraded_services -- список {service, reason} для сервисов с
+    load_stats, staged_calls_with_valid_dst_pct (M5 Task 1, pilot §10.2: CALLS
+    written/(written+dropped) at load -- see `_staged_calls_valid_dst_pct`'s own
+    docstring for why this and pct_unresolved_calls measure two different, both
+    honest, things), degraded_services -- список {service, reason} для сервисов с
     degraded=True (эвристический fallback вместо SCIP, см. analyze.py).
     """
     totals = {field: sum(s.get(field, 0) for s in per_service) for field in _TOTAL_FIELDS}
@@ -67,6 +90,7 @@ def build_report(
             "pct_unresolved_calls": _pct(totals["calls_unresolved"], denom),
             "dropped_edges": load_stats.get("edges_dropped_missing_endpoint", 0),
             "dropped_edges_by_type": dict(load_stats.get("edges_dropped_by_type", {})),
+            "staged_calls_with_valid_dst_pct": _staged_calls_valid_dst_pct(load_stats),
             "degraded_services": degraded_services,
         },
     }
@@ -153,9 +177,17 @@ def print_report(report: dict, console: Console) -> None:
         f" ({', '.join(f'{t}={n}' for t, n in sorted(nonzero_dropped.items()))})"
         if nonzero_dropped else ""
     )
+    # staged_calls_with_valid_dst_pct (M5 Task 1): .get()-defaulted, not a bare
+    # index, unlike pct_unresolved_calls/dropped_edges above -- those are as old as
+    # build_report's own health dict and can be relied on unconditionally, but this
+    # key can be absent from a report dict predating this task (a pre-M5 report.json,
+    # or a hand-built dict in an older test) -- same backward-compatible-dict
+    # precedent as chunking's embedded_fresh/embedded_from_cache (M4 T1).
     console.print(
         f"health: unresolved calls = {health['pct_unresolved_calls']:.1f}%, "
-        f"dropped edges = {health['dropped_edges']}{dropped_detail}"
+        f"dropped edges = {health['dropped_edges']}{dropped_detail}, "
+        f"staged CALLS with valid dst = "
+        f"{health.get('staged_calls_with_valid_dst_pct', 0.0):.1f}%"
     )
 
     degraded_services = health.get("degraded_services", [])

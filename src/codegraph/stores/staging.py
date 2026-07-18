@@ -986,6 +986,30 @@ class Staging:
             (service, relpath))
         return {row[0] for row in cur.fetchall()}
 
+    def def_symbols(self, service: str) -> set[str]:
+        """M5 Task 1 (pilot Bug B, docs/superpowers/reports/2026-07-18-m4-pilot.md
+        §7.2): the FULL, service-wide set of every symbol with a staged def --
+        `extractors/calls.py::build_calls`'s new first-party classification source of
+        truth, replacing a `parsed.package == service` comparison that `scip-python
+        --project-name <service>` makes unreliable (it stamps package=<service> onto
+        every symbol it fully resolves, first-party and third-party alike). Unlike
+        `local_def_symbols` above (per-relpath, LIKE-filtered to 'local %' rows only),
+        this is unscoped by relpath and unfiltered by symbol shape -- every def this
+        service's own S3/S4 (scip run + reader, or the degraded fallback resolver)
+        ever staged, local and global alike, since a `local N` ref's first-party
+        status is decided by the SEPARATE `local_defs_for_file` lookup instead (see
+        build_calls' own docstring) and never consults this set.
+
+        Callers hoist this ONCE per service (analyze.py: after S4 rewrites defs, same
+        pattern as this file's own module docstring recommends for
+        `local_def_symbols`) rather than letting build_calls re-query per file or per
+        call-site -- `DISTINCT` because the same symbol can legitimately have more
+        than one def occurrence (see test_def_symbols_scoped_to_service_and_deduped),
+        and only its PRESENCE, never its count, matters to the caller."""
+        cur = self._db.execute(
+            "SELECT DISTINCT symbol FROM scip_defs WHERE service=?", (service,))
+        return {row[0] for row in cur.fetchall()}
+
     def refs_for_file(self, service: str, relpath: str) -> list[RefRow]:
         cur = self._db.execute(
             "SELECT relpath, symbol, start_byte, end_byte, start_line, roles "

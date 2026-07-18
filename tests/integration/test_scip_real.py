@@ -56,7 +56,7 @@ def test_real_calls_join_document_management(tmp_path):
     def lookup(relpath, start_byte):
         return st.def_symbol_at(svc, relpath, start_byte)
 
-    stats = build_calls(svc, st, facts_by_file, lookup)
+    stats = build_calls(svc, st, facts_by_file, lookup, def_symbols=st.def_symbols(svc))
     calls = {(e.src, e.dst) for e in st.iter_edges() if e.type == "CALLS"}
     assert stats.calls_joined >= 5
     assert any("create_document" in s and "emit_document_indexed" in d
