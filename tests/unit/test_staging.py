@@ -192,6 +192,28 @@ def test_upsert_edges_origin_less_row_and_real_origin_row_coexist_as_separate_ro
     assert {e.evidence_line for e in edges} == {None, 9}
 
 
+def test_upsert_edges_none_origin_is_stored_as_empty_string_at_the_sql_layer(tmp_path):
+    """Pins the None->'' coercion at the STORAGE layer directly (raw SQL over the
+    stored literal), not just through the behavioral coexistence tests above:
+    `upsert_edges(origin_service=None)` must store the literal empty string '' in
+    edges.origin_service -- never SQL NULL (the column is a PK member now, `NOT
+    NULL DEFAULT ''` -- see core/schema.py's SCHEMA_VERSION "5 -> 6" history entry)
+    and never the string "None". Load-bearing beyond hygiene: begin_service/
+    delete_file_layer's `WHERE origin_service=?` scoping and pipeline/load.py's
+    lexicographic-origin tie-break ('' sorts before every real service name) both
+    key on this exact stored value."""
+    st = Staging(tmp_path / "s.db")
+    e = EdgeRec("proc:p", "sym:a:`m`/f().", "PART_OF_PROCESS", "derived", 1.0,
+                "linking")
+    st.upsert_edges([e])  # origin_service=None (default)
+
+    row = st._db.execute(  # noqa: SLF001 -- origin_service isn't surfaced by iter_edges()
+        "SELECT origin_service FROM edges WHERE src=? AND dst=? AND type=?",
+        (e.src, e.dst, e.type),
+    ).fetchone()
+    assert row[0] == ""
+
+
 def test_module_set(tmp_path):
     st = Staging(tmp_path / "s.db")
     st.begin_service("a")

@@ -554,6 +554,31 @@ def test_residual_gap_shared_edge_survives_sibling_removal_then_vanishes_when_bo
         graph_a = _graph_dump(_store(RESIDUAL_GAP_GRAPH_NAME))
         assert (ORDERS_TOPIC, "CONTAINS", ORDER_CREATED_EVENT) in graph_a["edge_triples"]
 
+        # Live dedup-winner property assertion (the ONE point in this test where
+        # BOTH origins' rows coexist in staging, so load's _dedup_edges genuinely
+        # has to pick): both rows tie on resolution ("static") AND confidence (1.0)
+        # by construction of the fixture idioms (live-probed, not assumed), so the
+        # winner here is decided by the LAST tie-break rule alone --
+        # lexicographically-first origin, "kyc-worker" < "orders-api" -- and the
+        # loaded edge must carry kyc-worker's OWN evidence (its dispatch_dict
+        # registration site), not orders-api's outbox call site. The
+        # resolution-priority and confidence tiers themselves are exercised by unit
+        # tests (test_pipeline_load_labels.py's _dedup_edges suite) -- the fixture
+        # ties on both, structurally.
+        winner_rows = _store(RESIDUAL_GAP_GRAPH_NAME).raw(
+            "MATCH (a {id: $src})-[e:CONTAINS]->(b {id: $dst}) RETURN e.evidence_file",
+            {"src": ORDERS_TOPIC, "dst": ORDER_CREATED_EVENT},
+        ).result_set
+        assert len(winner_rows) == 1, (
+            "expected exactly ONE loaded CONTAINS edge for the shared pair despite "
+            f"two staged per-origin rows, got {len(winner_rows)}"
+        )
+        assert winner_rows[0][0] == "app/consumers/orders.py", (
+            "dedup winner must be kyc-worker's row (lexicographically-first origin "
+            "on a full resolution+confidence tie), carrying ITS evidence_file -- got "
+            f"{winner_rows[0][0]!r}"
+        )
+
         # ==================================================================
         # 2. orders-api stops asserting the edge (file edit, not config) ->
         # --incremental (kyc-worker skipped) -> the edge MUST survive via
