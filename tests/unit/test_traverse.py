@@ -525,6 +525,32 @@ def test_compact_steps_run_of_exactly_head_plus_tail_is_left_as_is():
     assert result[5]["node"]["id"] == "n6"  # the role step, untouched, right after
 
 
+def test_compact_steps_run_of_6_single_interior_is_left_uncollapsed():
+    # M5 T5 review fix (Important): collapsing a run of exactly HEAD+TAIL+1 (=6)
+    # would display 3 + marker + 2 = 6 entries -- ZERO display savings -- while
+    # still destroying one real step's identity. Break-even is excluded: only a
+    # run with >= 2 interior steps to hide ever collapses.
+    ids_ = [f"n{i}" for i in range(1, 21)]  # segment total 20 > the 15 gate
+    steps, parents = _chain_steps(ids_, roles_by_id={"n7": ["RouteHandler"]})
+    result = traverse._compact_steps(steps, parents, set())
+    # leading run n1..n6 (exactly 6) survives verbatim, then the n7 role step
+    assert [s.get("node", {}).get("id") for s in result[:7]] == [f"n{i}" for i in range(1, 8)]
+    assert all("collapsed" not in s for s in result[:7])
+
+
+def test_compact_steps_run_of_7_two_interior_collapses_marker_shows_2():
+    # The other side of the same boundary (review sweep: break-even at run>=7):
+    # run=7 (interior 2) is the SMALLEST run that genuinely shrinks the display
+    # (6 entries shown for 7 steps) -- pins against overcorrecting the gate.
+    ids_ = [f"n{i}" for i in range(1, 21)]
+    steps, parents = _chain_steps(ids_, roles_by_id={"n8": ["RouteHandler"]})
+    result = traverse._compact_steps(steps, parents, set())
+    assert [s["node"]["id"] for s in result[:3]] == ["n1", "n2", "n3"]
+    assert result[3] == {"collapsed": 2}
+    assert [s["node"]["id"] for s in result[4:6]] == ["n6", "n7"]
+    assert result[6]["node"]["id"] == "n8"  # the role step, right after the run
+
+
 # -- _compact_steps: role-bearing step breaks the run in two --
 
 
@@ -627,6 +653,27 @@ def test_trace_process_segment_at_or_under_gate_is_byte_identical_regardless_of_
         store, "entry", max_segments=12, min_confidence=0.3, compact=False
     )
     assert compact_result == full_result
+
+
+def test_trace_process_real_walk_keeps_exit_producer_step_visible_in_compact_mode():
+    # M5 T5 review coverage pin: exit_producer_ids protection through a REAL BFS
+    # walk (the unit-level test above hands _compact_steps a hand-built id set;
+    # this one derives it from an actual PRODUCES edge in the store) -- a
+    # mid-chain node that produces a channel must survive visible in an
+    # otherwise-collapsed over-threshold segment.
+    store = _wide_chain_store(["a", "b"], 15)  # 30 steps total, > the 15 gate
+    store.add_node("chan:event_type:E", kind="Channel", channel_kind="event_type")
+    store.add_edge("a8", "PRODUCES", "chan:event_type:E")
+
+    result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+    seg = result["segments"][0]
+    # non-vacuity: the walk really did record a8's exit (so a8 IS an exit producer)
+    assert [ex["channel"]["id"] for ex in seg["exits"]] == ["chan:event_type:E"]
+    visible_ids = {s["node"]["id"] for s in seg["steps"] if "collapsed" not in s}
+    assert "a8" in visible_ids
+    markers = [s["collapsed"] for s in seg["steps"] if "collapsed" in s]
+    assert markers  # collapsing still happened around the protected step
+    assert sum(markers) + len(visible_ids) == 30  # every original step accounted for
 
 
 # ============================== find_paths ==============================

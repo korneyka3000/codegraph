@@ -204,9 +204,12 @@ _COMPACT_STEP_GATE = 15  # segment-level gate: _compact_steps is a strict no-op
 # so their output stays byte-identical whether compact=True (the new default) or not.
 _COMPACT_RUN_HEAD = 3
 _COMPACT_RUN_TAIL = 2
-# A run only gets replaced by a `{"collapsed": N}` marker once it is longer than
-# HEAD+TAIL: collapsing a run of HEAD+TAIL or fewer would show >= as many entries
-# as leaving it alone (head + 1 marker + tail > the run itself), never fewer.
+# A run only gets replaced by a `{"collapsed": N}` marker once it has at least 2
+# interior steps to hide (run > HEAD+TAIL+1): a run of HEAD+TAIL (5) or fewer
+# would show MORE entries collapsed than plain (head + 1 marker + tail = 6 > 5),
+# and a run of exactly HEAD+TAIL+1 (6) merely breaks even on display count
+# (6 == 6) while still destroying one real step's identity -- collapse must
+# strictly SHRINK the display, never merely match it (M5 T5 review fix).
 
 
 def _compact_steps(
@@ -216,9 +219,11 @@ def _compact_steps(
 ) -> list[dict]:
     """Collapse maximal consecutive (in `steps`' own BFS-discovery order -- see the
     NOTE below) runs of "boring" steps once the segment has more than
-    _COMPACT_STEP_GATE steps: each qualifying run keeps its first
+    _COMPACT_STEP_GATE steps: each qualifying run (>= 2 interior steps to hide --
+    see the break-even analysis at the constants above) keeps its first
     _COMPACT_RUN_HEAD and last _COMPACT_RUN_TAIL steps, with a single
-    `{"collapsed": N}` marker (N = the run's own hidden interior length) in between.
+    `{"collapsed": N}` marker (N = the run's own hidden interior length, always
+    >= 2) in between.
 
     A step is "boring" (collapsible) unless its node:
       - carries one of core.schema.ROLE_KINDS (RouteHandler/MessageConsumer/
@@ -267,7 +272,9 @@ def _compact_steps(
     run: list[dict] = []
 
     def _flush_run() -> None:
-        if len(run) > _COMPACT_RUN_HEAD + _COMPACT_RUN_TAIL:
+        # `> HEAD+TAIL+1`, not `> HEAD+TAIL` -- collapse must strictly shrink the
+        # display (interior >= 2); see the break-even analysis at the constants above.
+        if len(run) > _COMPACT_RUN_HEAD + _COMPACT_RUN_TAIL + 1:
             interior = len(run) - _COMPACT_RUN_HEAD - _COMPACT_RUN_TAIL
             result.extend(run[:_COMPACT_RUN_HEAD])
             result.append({"collapsed": interior})
