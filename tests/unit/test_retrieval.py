@@ -74,6 +74,33 @@ class _PoisonEmbedder:
         raise AssertionError("embed_query should not have been called")
 
 
+class _QueryOnlyEmbedder:
+    """M5 T6: unlike `FakeEmbedder` (whose `embed_query(t)`/`embed_batch([t])[0]`
+    happen to produce IDENTICAL output for the same text, by construction -- see its
+    own module docstring), this fake makes the two methods OBSERVABLY different:
+    `embed_batch` raises, `embed_query` records what it was called with. A test
+    built only on `FakeEmbedder` output can't tell whether retrieval.py's query leg
+    actually calls `embed_query` or falls back to `embed_batch([query])[0]` --
+    THIS class can, which is the whole point of pinning "the query leg uses
+    embed_query" as its own regression guard rather than trusting it stays true by
+    accident."""
+
+    model_id = "fake-4d"
+    dim = 4
+
+    def __init__(self) -> None:
+        self.embed_query_calls: list[str] = []
+
+    def embed_query(self, text):
+        self.embed_query_calls.append(text)
+        return [0.1, 0.2, 0.3, 0.4]
+
+    def embed_batch(self, texts):
+        raise AssertionError(
+            "retrieval.py's query leg must call embed_query, never embed_batch"
+        )
+
+
 def _chunk(chunk_id: str, **extra) -> dict:
     return {
         "id": chunk_id, "kind": "Chunk", "symbol_id": extra.pop("symbol_id", f"sym:{chunk_id}"),
@@ -258,6 +285,19 @@ def test_search_code_vector_mode_happy_path_never_touches_text_search():
     assert result["mode_used"] == "vector"
     assert [i["chunk_id"] for i in result["items"]] == ["c1", "c2"]
     assert store.text_calls == []
+
+
+def test_search_code_vector_leg_uses_embed_query_not_embed_batch():
+    # M5 T6: pins the query-side vector leg to embedder.embed_query specifically
+    # (see _QueryOnlyEmbedder's own docstring for why FakeEmbedder alone can't
+    # distinguish this from an embed_batch([query])[0] fallback).
+    store = _FakeStore()
+    store.meta = _meta("fake-4d")
+    store.vector_chunks = [(_chunk("c1"), 0.1)]
+    embedder = _QueryOnlyEmbedder()
+    result = retrieval.search_code(store, embedder, "где создаётся инцидент", mode="vector")
+    assert result["mode_used"] == "vector"
+    assert embedder.embed_query_calls == ["где создаётся инцидент"]
 
 
 # -- search_code: mode="hybrid" --
@@ -464,6 +504,20 @@ def test_find_entrypoint_hybrid_truncates_to_k_after_fusion():
     embedder = FakeEmbedder(dim=4, model_id="fake-4d")
     result = retrieval.find_entrypoint(store, embedder, "q", k=2)
     assert len(result["results"]) == 2
+
+
+def test_find_entrypoint_vector_leg_uses_embed_query_not_embed_batch():
+    # M5 T6: same regression guard as search_code's own version above, for
+    # find_entrypoint's independent embed_query call site.
+    store = _FakeStore()
+    store.meta = _meta("fake-4d")
+    store.sym_fulltext = []
+    store.vector_chunks = [(_chunk("c1", symbol_id="sym:a"), 0.1)]
+    store.nodes_by_id = {"sym:a": _sym("sym:a")}
+    embedder = _QueryOnlyEmbedder()
+    result = retrieval.find_entrypoint(store, embedder, "кто вызывает X", k=5)
+    assert result["mode_used"] == "hybrid"
+    assert embedder.embed_query_calls == ["кто вызывает X"]
 
 
 def test_find_entrypoint_stale_vector_ranking_id_skipped_not_crashed():

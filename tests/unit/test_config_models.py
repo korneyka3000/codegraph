@@ -5,6 +5,7 @@ from pydantic import ValidationError
 from codegraph.config.models import (
     ChannelSpec,
     ConsumerIdiom,
+    EmbeddingConfig,
     ProducerIdiom,
     ServiceConfig,
     ValueSpec,
@@ -121,3 +122,26 @@ def test_service_name_rejects_unsafe_characters():
             ServiceConfig.model_validate({"name": bad, "path": "."})
     svc = ServiceConfig.model_validate({"name": "kyc-worker_2", "path": "."})
     assert svc.name == "kyc-worker_2"
+
+
+def test_embedding_config_prefixes_default_empty():
+    # M5 T6: query_prefix/passage_prefix default to "" -- an existing codegraph.yaml
+    # that never mentions either field keeps building the exact same EmbeddingConfig
+    # it always has (LocalEmbedder then sees a no-op prefix, see test_embedders.py).
+    cfg = EmbeddingConfig()
+    assert cfg.query_prefix == ""
+    assert cfg.passage_prefix == ""
+
+
+def test_embedding_config_prefixes_settable_from_yaml():
+    raw = yaml.safe_load(
+        """
+        provider: local
+        model: intfloat/multilingual-e5-base
+        query_prefix: "query: "
+        passage_prefix: "passage: "
+        """
+    )
+    cfg = EmbeddingConfig.model_validate(raw)
+    assert cfg.query_prefix == "query: "
+    assert cfg.passage_prefix == "passage: "

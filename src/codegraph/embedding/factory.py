@@ -30,7 +30,11 @@ from codegraph.embedding.voyage import VoyageEmbedder
 
 def make_embedder(cfg: EmbeddingConfig) -> Embedder:
     if cfg.provider == "local":
-        return LocalEmbedder(cfg.model)
+        # M5 T6: query_prefix/passage_prefix are LocalEmbedder-only (see
+        # EmbeddingConfig's own docstring for why openai/voyage don't get them too).
+        return LocalEmbedder(
+            cfg.model, query_prefix=cfg.query_prefix, passage_prefix=cfg.passage_prefix
+        )
     if cfg.provider == "openai":
         return OpenAIEmbedder(cfg.model)
     if cfg.provider == "voyage":

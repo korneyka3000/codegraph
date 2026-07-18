@@ -59,7 +59,7 @@ _LOAD_HINT = (
 
 
 class LocalEmbedder:
-    def __init__(self, model: str):
+    def __init__(self, model: str, query_prefix: str = "", passage_prefix: str = ""):
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as e:
@@ -97,6 +97,15 @@ class LocalEmbedder:
             raise CodegraphError(_LOAD_HINT.format(model=model, error=e)) from e
 
         self.model_id = model
+        # M5 T6: instruction prefixes some models (e.g. intfloat/multilingual-e5-*'s
+        # canonical "query: "/"passage: ") expect prepended to distinguish a search
+        # QUERY from an indexed PASSAGE at encode time -- see EmbeddingConfig's own
+        # docstring for where these come from and why they're LocalEmbedder-only.
+        # "" (the default for both) makes both prefix expressions below a no-op
+        # string concat, so a caller that never sets either gets byte-identical
+        # behavior to before this parameter existed.
+        self._query_prefix = query_prefix
+        self._passage_prefix = passage_prefix
         # M4 T8: local, CPU/GPU-bound compute (not a network call) -- concurrent
         # Python threads would mostly just serialize on the GIL around whatever isn't
         # already vectorized C/CUDA inside sentence-transformers, with no reliable
@@ -107,10 +116,20 @@ class LocalEmbedder:
         self.concurrency_safe = False
 
     def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
+        """Bulk PASSAGE path (S8 embeds staged chunk bodies) -- every text gets
+        `self._passage_prefix` prepended before encoding (M5 T6)."""
         if not texts:
             return []
-        vectors = self._model.encode(list(texts), normalize_embeddings=True)
+        prefixed = [self._passage_prefix + t for t in texts]
+        vectors = self._model.encode(prefixed, normalize_embeddings=True)
         return vectors.tolist()
 
     def embed_query(self, text: str) -> list[float]:
-        return self.embed_batch([text])[0]
+        """Single QUERY path (retrieval time) -- `self._query_prefix` prepended
+        (M5 T6). Deliberately NOT `self.embed_batch([text])[0]` (the Protocol's own
+        default, see embedding/base.py) once query_prefix/passage_prefix can differ:
+        that delegation would run the query text through `embed_batch`'s
+        PASSAGE-prefixing instead, mixing the two up -- this method encodes directly
+        so the query only ever sees `_query_prefix`."""
+        vectors = self._model.encode([self._query_prefix + text], normalize_embeddings=True)
+        return vectors.tolist()[0]

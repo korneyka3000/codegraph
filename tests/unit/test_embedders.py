@@ -33,6 +33,7 @@ import pytest
 
 from codegraph.config.models import EmbeddingConfig
 from codegraph.core.errors import CodegraphError
+from codegraph.embedding.base import Embedder
 from codegraph.embedding.factory import make_embedder
 from codegraph.embedding.fake import FakeEmbedder
 
@@ -120,6 +121,38 @@ def test_fake_embedder_model_id_is_a_plain_string_attribute():
 
 
 # ---------------------------------------------------------------------------
+# Embedder Protocol -- embed_query default body (base.py, M5 T6)
+# ---------------------------------------------------------------------------
+
+
+class _MinimalEmbedder(Embedder):
+    """Nominally subclasses `Embedder` (real inheritance, not just the structural
+    "duck typing" every REAL provider in this package relies on -- see base.py's own
+    module docstring) and implements ONLY `embed_batch`. Exists purely to exercise
+    the Protocol's own default `embed_query` body in isolation: none of
+    fake/local/openai/voyage ever fall through to it (each defines its own
+    `embed_query` -- voyage's asymmetrically, via `input_type`), so without a class
+    like this one the default body would be unexercised by anything else in this
+    suite."""
+
+    model_id = "minimal"
+    dim = 3
+
+    def embed_batch(self, texts):
+        return [[float(len(t)), 0.0, 0.0] for t in texts]
+
+
+def test_embedder_protocol_embed_query_default_delegates_to_embed_batch():
+    emb = _MinimalEmbedder()
+    assert emb.embed_query("abc") == [3.0, 0.0, 0.0]
+
+
+def test_embedder_protocol_embed_query_default_is_first_and_only_batch_result():
+    emb = _MinimalEmbedder()
+    assert emb.embed_query("") == [0.0, 0.0, 0.0]
+
+
+# ---------------------------------------------------------------------------
 # factory.make_embedder -- dispatch (provider -> class, cfg.model forwarded)
 # ---------------------------------------------------------------------------
 
@@ -128,14 +161,20 @@ class _StubEmbedder:
     """Records the constructor argument; stands in for a real provider class so
     dispatch tests never construct a real Local/OpenAI/VoyageEmbedder (which
     would need a real package/network/API key just to prove factory picked the
-    right class)."""
+    right class). `query_prefix`/`passage_prefix` (M5 T6): accepted-and-ignored
+    keyword-only, matching ONLY the shape `factory.make_embedder` actually calls
+    `LocalEmbedder` with (`cfg.model` positional + these two kwargs) -- the
+    openai/voyage dispatch tests below construct this same stub with just a bare
+    positional `model`, which still works since both new params default."""
 
     last_model: str | None = None
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, *, query_prefix: str = "", passage_prefix: str = ""):
         type(self).last_model = model
         self.model_id = model
         self.dim = 1
+        self.query_prefix = query_prefix
+        self.passage_prefix = passage_prefix
 
     def embed_batch(self, texts):
         return [[0.0] for _ in texts]
@@ -150,6 +189,30 @@ def test_make_embedder_dispatches_local(monkeypatch):
     result = make_embedder(cfg)
     assert isinstance(result, _StubEmbedder)
     assert result.model_id == "jinaai/jina-embeddings-v2-base-code"
+
+
+def test_make_embedder_local_threads_query_and_passage_prefixes(monkeypatch):
+    # M5 T6: EmbeddingConfig's two new prefix fields must reach LocalEmbedder's
+    # constructor -- openai/voyage deliberately do NOT receive them (see
+    # embedding/local.py's own module docstring for why this is local-only).
+    monkeypatch.setattr("codegraph.embedding.factory.LocalEmbedder", _StubEmbedder)
+    cfg = EmbeddingConfig(
+        provider="local",
+        model="intfloat/multilingual-e5-base",
+        query_prefix="query: ",
+        passage_prefix="passage: ",
+    )
+    result = make_embedder(cfg)
+    assert result.query_prefix == "query: "
+    assert result.passage_prefix == "passage: "
+
+
+def test_make_embedder_local_prefixes_default_empty(monkeypatch):
+    monkeypatch.setattr("codegraph.embedding.factory.LocalEmbedder", _StubEmbedder)
+    cfg = EmbeddingConfig(provider="local", model="jinaai/jina-embeddings-v2-base-code")
+    result = make_embedder(cfg)
+    assert result.query_prefix == ""
+    assert result.passage_prefix == ""
 
 
 def test_make_embedder_dispatches_openai(monkeypatch):
@@ -256,6 +319,111 @@ def test_local_embedder_dim_probe_failure_also_wraps_as_codegraph_error(monkeypa
 
     with pytest.raises(CodegraphError, match="simulated dim-probe failure"):
         LocalEmbedder("jinaai/jina-embeddings-v2-base-code")
+
+
+class _RecordingSentenceTransformer:
+    """Stands in for `sentence_transformers.SentenceTransformer`: records every
+    `.encode(texts, ...)` call's texts (in order, across calls) and returns an
+    object shaped like a real `numpy` result (`.tolist()`) so `LocalEmbedder.
+    embed_batch`'s own `vectors.tolist()` call works unmodified. One vector per
+    input text, `[len(text), 0.0, 0.0]` -- deterministic and enough to prove WHAT
+    text (prefixed or not) actually reached the model, which is the only thing
+    these prefix tests care about."""
+
+    def __init__(self, model, trust_remote_code=False):
+        self.calls: list[list[str]] = []
+
+    def get_embedding_dimension(self):
+        return 3
+
+    def encode(self, texts, normalize_embeddings=True):
+        self.calls.append(list(texts))
+        rows = [[float(len(t)), 0.0, 0.0] for t in texts]
+        return SimpleNamespace(tolist=lambda: rows)
+
+
+def _install_fake_sentence_transformers(monkeypatch) -> dict:
+    """Same `captured`-dict-populated-by-the-constructor technique as
+    `_install_fake_openai`/`_install_fake_voyageai` below -- lets a test reach the
+    ONE `_RecordingSentenceTransformer` instance `LocalEmbedder.__init__` built,
+    after the fact, to inspect `.calls`."""
+    captured: dict[str, _RecordingSentenceTransformer] = {}
+
+    class _Factory(_RecordingSentenceTransformer):
+        def __init__(self, model, trust_remote_code=False):
+            super().__init__(model, trust_remote_code)
+            captured["model"] = self
+
+    fake_module = types.ModuleType("sentence_transformers")
+    fake_module.SentenceTransformer = _Factory
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+    return captured
+
+
+def test_local_embedder_default_prefixes_empty_leaves_text_untouched(monkeypatch):
+    """M5 T6 backward-compat anchor: query_prefix/passage_prefix default to "" ->
+    embed_batch/embed_query must see the exact, unprefixed input text -- byte-
+    identical to pre-M5-T6 behavior for every existing workspace that never sets
+    these two new config fields."""
+    from codegraph.embedding.local import LocalEmbedder
+
+    captured = _install_fake_sentence_transformers(monkeypatch)
+    emb = LocalEmbedder("some-model")
+    emb.embed_batch(["def f(): pass", "class C: pass"])
+    emb.embed_query("def f(): pass")
+    assert captured["model"].calls == [
+        ["def f(): pass", "class C: pass"],
+        ["def f(): pass"],
+    ]
+
+
+def test_local_embedder_passage_prefix_applied_in_embed_batch_only(monkeypatch):
+    from codegraph.embedding.local import LocalEmbedder
+
+    captured = _install_fake_sentence_transformers(monkeypatch)
+    emb = LocalEmbedder("some-model", passage_prefix="passage: ")
+    emb.embed_batch(["def f(): pass", "class C: pass"])
+    assert captured["model"].calls == [["passage: def f(): pass", "passage: class C: pass"]]
+
+
+def test_local_embedder_query_prefix_applied_in_embed_query_only(monkeypatch):
+    from codegraph.embedding.local import LocalEmbedder
+
+    captured = _install_fake_sentence_transformers(monkeypatch)
+    emb = LocalEmbedder("some-model", query_prefix="query: ")
+    emb.embed_query("where is X defined")
+    assert captured["model"].calls == [["query: where is X defined"]]
+
+
+def test_local_embedder_query_and_passage_prefixes_are_independent(monkeypatch):
+    """Canonical e5 usage (M5 T6): query_prefix != passage_prefix. embed_batch
+    (indexing passages) must never see query_prefix and embed_query must never see
+    passage_prefix -- a naive `embed_query = embed_batch([text])[0]` delegation
+    (correct for the OTHER providers, still the Protocol's own default -- see the
+    base.py section above) would incorrectly apply passage_prefix to a query, so
+    LocalEmbedder can no longer implement embed_query that way once prefixes
+    differ."""
+    from codegraph.embedding.local import LocalEmbedder
+
+    captured = _install_fake_sentence_transformers(monkeypatch)
+    emb = LocalEmbedder("some-model", query_prefix="query: ", passage_prefix="passage: ")
+    emb.embed_batch(["alpha", "beta"])
+    emb.embed_query("gamma")
+    assert captured["model"].calls == [
+        ["passage: alpha", "passage: beta"],
+        ["query: gamma"],
+    ]
+
+
+def test_local_embedder_embed_batch_empty_list_still_short_circuits(monkeypatch):
+    # Pre-existing contract (`[]` in -> `[]` out, no model call at all) must survive
+    # the prefix change -- an empty batch has no texts to prefix in the first place.
+    from codegraph.embedding.local import LocalEmbedder
+
+    captured = _install_fake_sentence_transformers(monkeypatch)
+    emb = LocalEmbedder("some-model", passage_prefix="passage: ")
+    assert emb.embed_batch([]) == []
+    assert captured["model"].calls == []
 
 
 def test_make_embedder_openai_missing_key_hint(monkeypatch):

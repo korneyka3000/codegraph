@@ -59,5 +59,17 @@ class Embedder(Protocol):
         ...
 
     def embed_query(self, text: str) -> list[float]:
-        """Single unit-normalized vector for one query string."""
-        ...
+        """Single unit-normalized vector for one query string.
+
+        Default body (M5 T6): `self.embed_batch([text])[0]` -- correct for any
+        `Embedder` whose query/passage encoding is symmetric (the common case; every
+        provider in this package except `voyage.py` currently overrides this method
+        anyway, purely structurally, so this default body is never actually reached
+        by fake/local/openai -- see this class's own module docstring). It only has
+        teeth for a class that NOMINALLY subclasses `Embedder` (real inheritance, not
+        just duck typing) and implements `embed_batch` alone; `voyage.py`'s
+        asymmetric `input_type="query"` handling is the one existing case that MUST
+        override this default rather than rely on it (it is not just an
+        optimization there -- `embed_batch([text])[0]` would silently use the wrong
+        `input_type`)."""
+        return self.embed_batch([text])[0]

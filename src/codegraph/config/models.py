@@ -135,6 +135,18 @@ class StorageConfig(_Strict):
 class EmbeddingConfig(_Strict):
     provider: Literal["local", "openai", "voyage"] = "local"
     model: str = "jinaai/jina-embeddings-v2-base-code"
+    # M5 T6: instruction prefixes some local embedding models expect prepended to
+    # their input to distinguish a search QUERY from an indexed PASSAGE (e.g. e5's
+    # canonical "query: "/"passage: " -- see intfloat/multilingual-e5-base's model
+    # card). "" (the default for both) is a byte-identical no-op -- every existing
+    # workspace/model that never mentions either field keeps building the exact same
+    # embedder input it always has. Only `embedding.local.LocalEmbedder` currently
+    # reads these (threaded through by `embedding.factory.make_embedder`) -- openai/
+    # voyage are deliberately left alone: voyage already has its own asymmetric
+    # query/document handling via its API's `input_type` param (see voyage.py), and
+    # neither openai provider model documents needing a text prefix the way e5 does.
+    query_prefix: str = ""
+    passage_prefix: str = ""
 
 
 class ScipConfig(_Strict):
