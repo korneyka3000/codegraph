@@ -266,3 +266,63 @@ def test_colliding_def_ids_get_ordinal_suffix_scip_path():
     # the structural ones, so the exact same ordinal sequence is expected here too
     # -- same mechanism, different provenance for the raw (pre-suffix) id text.
     assert [n.id for n in res.nodes[1:]] == _EXPECTED_DEF_IDS_IN_ORDER
+
+
+def test_inserting_same_named_branch_above_renumbers_previously_solo_def():
+    """Pins the sibling-insert renumbering dynamic as INTENDED, not accidental (see
+    extract()'s own def_ids comment block): appearance-order suffixing means
+    inserting a NEW same-named branch ABOVE a previously-solo def flips that def's
+    id (unsuffixed -> ~2) even though its own source text never changed -- the new
+    first occurrence takes over the unsuffixed id. Deliberate trade for line-shift
+    stability: churn happens only on a same-named-sibling insert, and only within
+    that collision family (the renumbered def's own method here -- `__str__`,
+    colliding with nothing -- keeps its unsuffixed id through the edit)."""
+    v1 = (
+        b'if FLAG == "kms":\n'
+        b"    class Secret:\n"
+        b"        def __str__(self):\n"
+        b'            return "***"\n'
+    )
+    # The edit: a new same-named branch inserted ABOVE (v1's class body text is
+    # untouched; only its `if` keyword becomes `elif`, outside the def's own span).
+    v2 = (
+        b'if FLAG == "metatron":\n'
+        b"    class Secret:\n"
+        b"        def __repr__(self):\n"
+        b'            return "<Secret>"\n'
+        b'elif FLAG == "kms":\n'
+        b"    class Secret:\n"
+        b"        def __str__(self):\n"
+        b'            return "***"\n'
+    )
+
+    def run(src):
+        return extract(FileContext(
+            service="dispatch", relpath=_COLLISION_RELPATH, source=src,
+            facts=build_file_facts(_COLLISION_RELPATH, src),
+            def_symbol_lookup=lambda rp, sb: None,
+            module_exists=lambda d: False,
+        ))
+
+    def class_id_containing(res, method_id_suffix):
+        """The class node's id, identified branch-agnostically as the CONTAINS src
+        of the given (branch-unique) method -- how this test tracks 'the same def'
+        across the edit without presuming which id it carries on either side."""
+        srcs = {
+            e.src for e in res.edges
+            if e.type == "CONTAINS" and e.dst.endswith(method_id_suffix)
+        }
+        assert len(srcs) == 1
+        return next(iter(srcs))
+
+    res_v1, res_v2 = run(v1), run(v2)
+
+    # V1: solo def -- plain unsuffixed id, exactly as before M5 T3 existed.
+    assert class_id_containing(res_v1, "/Secret#__str__().") == _SECRET_1
+    # V2: the SAME def (still the one containing `__str__`) now appears second ->
+    # renumbered to ~2, while the newly inserted branch takes the unsuffixed id.
+    assert class_id_containing(res_v2, "/Secret#__str__().") == _SECRET_2
+    assert class_id_containing(res_v2, "/Secret#__repr__().") == _SECRET_1
+    # The renumbered def's own method never collided with anything -> its id is
+    # untouched by the edit (family-scoped churn, not subtree-scoped).
+    assert _STR_2 in {n.id for n in res_v2.nodes}

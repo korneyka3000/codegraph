@@ -146,6 +146,35 @@ def extract(ctx: FileContext) -> ExtractionResult:
     # disambiguated by this exact same pass, in the exact same seen-set, since the
     # loop below never special-cases `kind` -- see test_python_core_extractor.py's
     # own "M5 T3" section.
+    #
+    # Sibling-insert renumbering (INTENDED dynamic, not an accident): because the
+    # numbering is appearance-order, inserting a NEW same-named branch ABOVE a
+    # previously-solo (or previously-first) def flips THAT def's id (unsuffixed ->
+    # ~2, and ~2 -> ~3, ...) even though its own source text never changed -- the
+    # new first occurrence takes over the unsuffixed id. This is the deliberate
+    # trade for line-shift stability: line-number-keyed ids would churn on EVERY
+    # edit anywhere above; appearance-order ids churn only when a same-named
+    # sibling is inserted earlier in the file, and only within that one collision
+    # family (a def whose raw id never collides is never renumbered by anything).
+    # Pinned by test_inserting_same_named_branch_above_renumbers_previously_solo_def.
+    #
+    # KNOWN LIMITATION (CALLS attribution -- user-facing note in README
+    # "Ограничения"): disambiguation exists only HERE, at node emission.
+    # extractors/calls.py derives a CALLS edge's dst purely from the call-site's
+    # ref SYMBOL text (`symbol_to_node_id`, a pure function over the symbol
+    # string -- ids.disambiguate is unreachable from that path), and scip
+    # resolves EVERY caller's ref into a collision family to the ONE
+    # control-flow-insensitive symbol all branches share -- so every such CALLS
+    # edge lands on the FIRST-appearing branch's unsuffixed node. That node is
+    # guaranteed staged (the first occurrence keeps exactly the id the symbol
+    # maps to -- no dangling edges), but branch-2+ nodes are CALLS-unreachable:
+    # fully present as nodes/CONTAINS/chunks, never a CALLS endpoint (calls.py's
+    # `_caller_id` recomputes the SRC side from the symbol/structural descriptor
+    # the same way, so a call-site INSIDE a branch-2+ def is likewise attributed
+    # to the first branch's node). Attributing a call to the branch the runtime
+    # would actually pick needs flow-sensitive analysis (which branch is live
+    # under which config) -- out of scope here, and inexpressible in scip's own
+    # symbol model.
     def_ids: dict[int, str] = {}
     _raw_id_occurrences: dict[str, int] = {}
     for d in facts.defs:
