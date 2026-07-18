@@ -115,7 +115,44 @@ def extract(ctx: FileContext) -> ExtractionResult:
     # -- Class/Function nodes + CONTAINS chain --
     # Resolve every def's id up front so the parent id used for a child's CONTAINS
     # edge is the exact same value as that parent's own NodeRec.id (never recomputed).
-    def_ids = {d.index: _def_id(ctx, d, dotted) for d in facts.defs}
+    #
+    # M5 T3 (pilot Bug 7.1): two DIFFERENT defs can legitimately compute the SAME raw
+    # id -- a class/function redefined under the same name in mutually-exclusive
+    # branches (if/elif feature-flag pattern, e.g. dispatch/config.py's
+    # `class Secret` in a metatron/kms/else fork). Two independent causes, both
+    # closed by the SAME mechanism below because it only ever looks at _def_id's
+    # OUTPUT text, never which branch of it produced that text: (1) SCIP path --
+    # pyright/scip-python's symbol table is control-flow-insensitive, so it can
+    # resolve BOTH branches' same-named defs to ONE symbol; (2) structural-fallback
+    # path -- nesting_chain walks the parent chain by NAME (`cur.name`), not by id,
+    # so two branches with identical (kind, name) ancestry rebuild the identical
+    # descriptor independently of each other. Left undetected, the second def's
+    # NodeRec silently overwrites the first's at `Staging.upsert_nodes`
+    # (`INSERT OR REPLACE`, PK == id alone) -- one branch's entire node, and
+    # transitively its methods, vanish, and `chunk_embed._symbol_ids_for_file`'s
+    # span-match then defensively skips chunking the WHOLE file (its own
+    # docstring), not just the colliding pair.
+    #
+    # Disambiguated in-order below: facts.defs is already appearance order (see
+    # parsing.facts.build_file_facts -- a def's `index` is assigned via `len(defs)`
+    # BEFORE recursing into its body, so parent.index < child.index always, and
+    # siblings are visited left-to-right/top-to-bottom exactly as tree-sitter hands
+    # back `node.children`). The FIRST def to produce a given raw id keeps it
+    # byte-identical to today (stability constraint, pinned by every pre-existing
+    # test -- a file with zero collisions sees zero id changes); every SUBSEQUENT
+    # def producing that SAME raw id gets `ids.disambiguate(raw_id, 2)`, then `3`,
+    # ... -- stable under line-number shifts (order of appearance, not line
+    # numbers). Duplicated class methods (e.g. both branches' `__init__`) are
+    # disambiguated by this exact same pass, in the exact same seen-set, since the
+    # loop below never special-cases `kind` -- see test_python_core_extractor.py's
+    # own "M5 T3" section.
+    def_ids: dict[int, str] = {}
+    _raw_id_occurrences: dict[str, int] = {}
+    for d in facts.defs:
+        raw_id = _def_id(ctx, d, dotted)
+        occurrence = _raw_id_occurrences.get(raw_id, 0) + 1
+        _raw_id_occurrences[raw_id] = occurrence
+        def_ids[d.index] = raw_id if occurrence == 1 else ids.disambiguate(raw_id, occurrence)
     for d in facts.defs:
         nid = def_ids[d.index]
         nesting = nesting_chain(facts.defs, d)

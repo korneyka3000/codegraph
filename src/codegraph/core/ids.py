@@ -8,6 +8,11 @@ M2: Channel/BusinessProcess id-хелперы (chan_kafka/chan_event/chan_http/p
 make_process_node, единственные вызыватели). Формат зафиксирован планом M2 (Global
 Constraints): "chan:kafka_topic:<name>" / "chan:event_type:<name>" /
 "chan:http:<owner|?>:<METHOD> <template>"; "proc:<slug>".
+
+M5 T3 (pilot Bug 7.1): `disambiguate` -- ordinal-suffix helper for within-file id
+collisions (same-named class/function redefined in mutually-exclusive if/elif
+branches). Единственный вызыватель -- extractors/python_core.py::extract, см. её
+собственный докстринг/комментарий у `def_ids` за полным разбором первопричины.
 """
 
 from __future__ import annotations
@@ -39,6 +44,21 @@ def node_id(service: str, descriptors: str) -> str:
 
 def local_id(service: str, relpath: str, local: str) -> str:
     return f"sym:{service}:{relpath}:{local.replace(' ', '')}"
+
+
+def disambiguate(base_id: str, ordinal: int) -> str:
+    """`ordinal`-th (2, 3, ...) def within one file to independently compute the
+    SAME `base_id` -- the first occurrence is returned unsuffixed by the caller and
+    never passed through here (see extractors/python_core.py::extract's own
+    seen-set loop, the only caller). "~" is safe to append to the END of an
+    already-finished id string: it can never appear in a legitimately generated
+    (non-disambiguated) id, because every id-construction path above builds its
+    descriptors out of either a Python identifier (which cannot contain "~" --
+    not a valid token character) or this format's own separator punctuation
+    ("`", "/", "#", "().", " " stripped by local_id) -- none of it "~" either.
+    That makes this trivially reversible/greppable too (strip a trailing
+    "~\\d+$" to recover the base id two-or-more defs collided on)."""
+    return f"{base_id}~{ordinal}"
 
 
 def display_qualified(descriptors: str) -> str:

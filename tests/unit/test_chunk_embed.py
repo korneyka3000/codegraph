@@ -27,6 +27,9 @@ from codegraph.chunking import augment
 from codegraph.config.models import ServiceConfig, WorkspaceConfig
 from codegraph.embedding.codec import pack_vector, unpack_vector
 from codegraph.embedding.fake import FakeEmbedder
+from codegraph.extractors.base import FileContext
+from codegraph.extractors.python_core import extract as extract_python_core
+from codegraph.parsing.facts import build_file_facts
 from codegraph.pipeline import chunk_embed
 from codegraph.pipeline.analyze import analyze_service
 from codegraph.resolvers.scip.runner import ScipRunError
@@ -919,3 +922,93 @@ def test_changed_files_still_recomputes_headers_workspace_wide(tmp_path, monkeyp
 
     assert len(fill_headers_all_calls) == 1
     assert report["chunks_total"] == 2  # a/x.py + b/n.py, both still staged
+
+
+# ======================================================================================
+# -- M5 T3 (pilot Bug 7.1): a file with colliding def ids is no longer skipped --
+#
+# Before the extractors/python_core.py ordinal-suffix fix, two same-named classes in
+# mutually-exclusive if/elif branches collided on id: one NodeRec silently overwrote
+# the other at `Staging.upsert_nodes` (PK == id alone), leaving `_symbol_ids_for_
+# file`'s span-match with FEWER staged nodes than `facts.defs` entries -- returning
+# None (its own "sweep-review fix" contract) and making `run`'s caller defensively
+# skip chunking the WHOLE file, not just the colliding pair. Post-fix, every def
+# (across however many colliding branches) gets a unique id -> unique staged node ->
+# unique span entry -> the span-match succeeds and this file chunks like any other.
+# ======================================================================================
+
+_COLLIDING_SECRET_SRC = (
+    'if FLAG == "metatron":\n'
+    "    class Secret:\n"
+    "        def __init__(self, value):\n"
+    "            self.value = value\n"
+    'elif FLAG == "kms":\n'
+    "    class Secret:\n"
+    "        def __init__(self, value):\n"
+    "            self.value = value\n"
+)
+
+
+def test_symbol_ids_for_file_no_longer_skips_a_file_with_colliding_def_ids(tmp_path):
+    """Direct unit test of `_symbol_ids_for_file` itself (the function whose
+    None-return is what makes `run` skip a whole file) -- reproduces the pilot's
+    `class Secret` if/elif shape through `python_core.extract` (structural-fallback
+    path, `def_symbol_lookup` always None) followed by a REAL `Staging.upsert_nodes`
+    call, independent of `analyze_service`/`chunk_embed.run` entirely. Routing
+    through a real `upsert_nodes` (not just comparing `extract()`'s own in-memory
+    NodeRec list) is load-bearing: pre-fix, this is EXACTLY where the collision
+    bites -- `upsert_nodes`'s `INSERT OR REPLACE` (PK == id alone) silently drops
+    one of the two colliding NodeRecs, so only what SURVIVES that call is what
+    `_symbol_ids_for_file` (and thus `run`) ever sees; span-matching `extract()`'s
+    own pre-staging list would never observe the drop at all (see the sibling
+    end-to-end test below for the same regression proven through the full
+    `analyze_service` pipeline, degraded-resolver symbol synthesis included)."""
+    relpath = "config.py"
+    source = _COLLIDING_SECRET_SRC.encode()
+    facts = build_file_facts(relpath, source)
+    ctx = FileContext(
+        service="dispatch", relpath=relpath, source=source, facts=facts,
+        def_symbol_lookup=lambda rp, sb: None,
+        module_exists=lambda d: False,
+    )
+    result = extract_python_core(ctx)
+
+    staging = Staging(tmp_path / "s.db")
+    staging.begin_service("dispatch")
+    staging.upsert_nodes(result.nodes)
+    staged_nodes = list(staging.iter_nodes())
+
+    resolved = chunk_embed._symbol_ids_for_file(staged_nodes, facts)
+
+    assert resolved is not None  # THE regression this task closes
+    symbol_ids, module_id = resolved
+    assert module_id is not None
+    assert len(symbol_ids) == len(facts.defs)  # every def resolved, none missing
+    assert len(set(symbol_ids.values())) == len(facts.defs)  # every resolved id distinct
+
+
+def test_colliding_def_ids_no_longer_skip_the_whole_file_from_chunking(tmp_path, caplog):
+    """End-to-end proof through the REAL pipeline this codebase actually runs:
+    `analyze_service` (degraded/heuristic-fallback mode, same harness technique as
+    every other test in this file) followed by `chunk_embed.run`. The degraded
+    resolver (`resolvers/fallback.py::_symbol`) builds its synthetic symbol the same
+    control-flow-insensitive, name-only way real scip-python's own symbol table does
+    (both if/elif branches' `class Secret`/`__init__` get the textually identical
+    synthetic symbol), so this harness genuinely reproduces the id collision, not
+    just the structural-fallback shape the lower-level test above exercises."""
+    svc = _write_service(tmp_path, "dispatch", {"config.py": _COLLIDING_SECRET_SRC})
+    cfg = _cfg(svc)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+
+    with caplog.at_level("WARNING"):
+        report = chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))
+
+    assert not any("spans no longer match" in rec.getMessage() for rec in caplog.records)
+    assert report["chunks_total"] > 0
+    chunked = [row for row in staging.iter_chunks() if row.relpath == "config.py"]
+    assert chunked  # pre-fix: this file was skipped entirely -> zero rows here
+    # both branches' Secret class got their OWN chunk family under their OWN
+    # (disambiguated) symbol_id -- pre-fix, one branch's node (and thus its whole
+    # symbol_id) would never have existed in staging at all.
+    assert len({row.symbol_id for row in chunked}) >= 2
