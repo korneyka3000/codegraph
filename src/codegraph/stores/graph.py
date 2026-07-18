@@ -95,7 +95,11 @@ class GraphStore(Protocol):
         through either method and stay agnostic to which one produced a given (id,
         score) pair. Slower than search_vector_chunks on a large graph (no index) --
         intended for eval/CI determinism (`codegraph eval retrieval --exact`), NOT
-        production/MCP search, which stays ANN-only via search_vector_chunks."""
+        production/MCP search, which stays ANN-only via search_vector_chunks.
+        One raise-behavior asymmetry vs ANN: a stored embedding whose dimension
+        differs from the query vector's raises a converted StoreError (ANN silently
+        excludes such rows from its index) -- unreachable through the real pipeline,
+        see the implementation's docstring for the load-gate invariant."""
         ...
 
     def search_text_chunks(

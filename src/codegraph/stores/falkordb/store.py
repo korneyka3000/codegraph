@@ -17,7 +17,7 @@ from falkordb import FalkorDB
 
 from codegraph.config.models import FalkorDBConfig
 from codegraph.stores.falkordb import batch, ddl
-from codegraph.stores.falkordb.connection import connect
+from codegraph.stores.falkordb.connection import StoreError, connect
 from codegraph.stores.graph import Hop
 
 # M3 T7: db.idx.vector.queryNodes over a Chunk.embedding that has NO vector index
@@ -28,6 +28,18 @@ from codegraph.stores.graph import Hop
 # error message, not a blind catch-and-swallow of every ResponseError (a malformed
 # query or a genuinely different server-side failure must still propagate).
 _NO_VECTOR_INDEX_MARKER = "undefined attribute"
+
+# M5 T2 review: vec.cosineDistance over a stored embedding whose length differs from
+# the query vector's raises `redis.exceptions.ResponseError: "Vector dimension
+# mismatch, expected 6 but got 4"` -- captured live against FalkorDB v4.18.11 (probe:
+# dim-4-indexed graph accepts a 6-dim vecf32 WRITE without complaint; the error only
+# fires when cosineDistance evaluates that row). Same substring-marker discipline as
+# _NO_VECTOR_INDEX_MARKER above -- but the reaction differs: that one SWALLOWS into []
+# (an unembedded graph honestly has no vector matches), while this one RE-RAISES as a
+# converted StoreError (see search_vector_chunks_exact) -- a graph holding embeddings
+# of mixed dimensions is a real data-integrity problem that must surface, not read as
+# an empty result.
+_VECTOR_DIM_MISMATCH_MARKER = "vector dimension mismatch"
 
 # search_vector_chunks' service filter: `queryNodes(..., $k, ...)` picks its k nearest
 # neighbors BEFORE any `WHERE node.service = $service` runs (k is an argument to the
@@ -387,15 +399,38 @@ class FalkorStore:
         FalkorDB's own internal tie resolution happens to fall, which is not a
         documented/guaranteed stable order.
 
-        Unlike search_vector_chunks, no try/except ResponseError dance is needed:
-        this is a plain MATCH+WHERE+ORDER BY+LIMIT over Chunk nodes, not a `CALL
-        db.idx.vector.queryNodes` procedure that requires a vector INDEX to exist --
-        a degraded graph (no embedder has ever run, so no Chunk carries a non-null
-        embedding, or the graph has no Chunk nodes at all) simply matches zero rows
-        and returns `[]` through completely ordinary Cypher semantics (live-verified:
-        MATCH on an entirely absent label, on a graph key that doesn't even exist
-        yet, raises nothing and returns an empty result_set) -- there is no separate
-        "index missing" failure mode to catch here.
+        Index-missing is NOT a failure mode here (unlike search_vector_chunks'
+        _NO_VECTOR_INDEX_MARKER catch): this is a plain MATCH+WHERE+ORDER BY+LIMIT
+        over Chunk nodes, not a `CALL db.idx.vector.queryNodes` procedure that
+        requires a vector INDEX to exist -- a degraded graph (no embedder has ever
+        run, so no Chunk carries a non-null embedding, or the graph has no Chunk
+        nodes at all) simply matches zero rows and returns `[]` through completely
+        ordinary Cypher semantics (live-verified: MATCH on an entirely absent label,
+        on a graph key that doesn't even exist yet, raises nothing and returns an
+        empty result_set).
+
+        The ONE failure mode this method DOES convert (M5 T2 review): a stored
+        embedding whose DIMENSION differs from the query vector's.
+        `vec.cosineDistance` evaluates per row and raises
+        `ResponseError("Vector dimension mismatch, expected N but got M")` (captured
+        live, see _VECTOR_DIM_MISMATCH_MARKER) on the first mismatched row -- where
+        the ANN twin silently EXCLUDES wrong-dim vectors instead (they never enter
+        its index; asymmetry live-verified on the same mixed-dim graph). UPSTREAM
+        INVARIANT making this unreachable through the real pipeline:
+        `pipeline/load.py`'s `_chunk_node_batches` dim-gates every chunk at load
+        time (an embedding whose length != the index dim is routed to the
+        without-vector batch -- pinned by tests/unit/test_pipeline_load_labels.py::
+        test_chunk_node_batches_routes_dim_mismatch_to_without_vector), so every
+        stored Chunk.embedding shares the one index dimension; hitting this error
+        therefore means embeddings were written AROUND that gate (e.g. mixed embed
+        models via raw Cypher). Converted -- substring-matched, same discipline as
+        the ANN method's marker -- into a StoreError naming that likely cause, so
+        the established (StoreError, StoreUnavailable) boundaries (GraphQuery's
+        error dict, cli's _store_guard red line) present it as a structured,
+        actionable error instead of a raw redis traceback. NOT swallowed into []
+        like the no-index case: a mixed-dimension graph is a real data-integrity
+        problem that must surface, not read as "no matches". Any OTHER
+        ResponseError still propagates unchanged.
 
         `service`, if given, is a plain `WHERE c.service = $service` alongside the
         `IS NOT NULL` check -- unlike search_vector_chunks' k*
@@ -414,7 +449,18 @@ class FalkorStore:
             " RETURN c, vec.cosineDistance(c.embedding, vecf32($vec)) AS dist "
             "ORDER BY dist ASC, c.id ASC LIMIT $k"
         )
-        res = self._g.query(cypher, params)
+        try:
+            res = self._g.query(cypher, params)
+        except redis.exceptions.ResponseError as e:
+            if _VECTOR_DIM_MISMATCH_MARKER not in str(e).lower():
+                raise
+            raise StoreError(
+                f"exact vector scan hit a stored embedding whose dimension differs "
+                f"from the query vector's ({e}) -- likely mixed-model embeddings "
+                f"written around pipeline/load's dim gate (every chunk loaded by "
+                f"'codegraph index' shares the embed model's single dimension); "
+                f"re-run 'codegraph index' so all embeddings come from one model"
+            ) from e
         return [(node.properties, dist) for node, dist in res.result_set]
 
     def search_text_chunks(

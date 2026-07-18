@@ -11,7 +11,10 @@ something a staging-only comparison could meaningfully approximate the way
 NOT a `GraphQuery` instance directly -- so it stays testable with a bare fake (no
 store/embedder/model needed, see tests/unit/test_retrieval_eval.py) while the real
 caller (tests/eval/test_m3_gate.py's gate, cli.py's `eval retrieval` command) passes
-`lambda q, k: gq.search_code(q, k=k, mode="hybrid")`: hybrid -- text (fulltext) +
+`lambda q, k: gq.search_code(q, k=k, mode="hybrid", exact=exact)` (`exact` -- M5 T2:
+cli.py's `--exact` flag, routing the vector leg through the deterministic full-scan
+store method for CI-reproducible hit@k; False by default, which keeps ANN -- the m3
+gate's own closure omits it entirely): hybrid -- text (fulltext) +
 vector (real embedder) fused via RRF -- is the intended real-world usage of this
 eval (graph+embedder together, exactly as an agent's own `search_code` MCP calls
 work), not baked into this module as a hardcoded dependency on `GraphQuery` itself.

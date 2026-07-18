@@ -7,7 +7,7 @@ import pytest
 
 from codegraph.embedding.fake import FakeEmbedder
 from codegraph.stores.falkordb.batch import upsert_nodes
-from codegraph.stores.falkordb.connection import connect
+from codegraph.stores.falkordb.connection import StoreError, connect
 from codegraph.stores.falkordb.ddl import ensure_schema
 from codegraph.stores.falkordb.store import FalkorStore
 
@@ -439,6 +439,49 @@ def test_search_vector_chunks_exact_ties_broken_by_id_ascending(falkordb_cfg):
 
         results = store.search_vector_chunks_exact(tied_vec, k=3)
         assert [props["id"] for props, _score in results] == ["aaa", "mmm", "zzz"]
+    finally:
+        store._g.delete()
+
+
+VECTOR_EXACT_DIM_MISMATCH_GRAPH = "__codegraph_vector_exact_dim_mismatch__"
+
+
+def test_search_vector_chunks_exact_mixed_dim_raises_store_error_where_ann_excludes(
+    falkordb_cfg,
+):
+    """M5 T2 review (Important): live pin of the dimension-mismatch asymmetry. A
+    rogue Chunk.embedding of a DIFFERENT dimension than the rest (written via raw
+    Cypher, deliberately around pipeline/load._chunk_node_batches' dim gate -- the
+    only way this state can arise, e.g. mixed embed models) is silently EXCLUDED by
+    the ANN method (never enters its index), but vec.cosineDistance evaluates per
+    row -- the exact scan hits it and FalkorDB raises ResponseError("Vector
+    dimension mismatch, ..."). The store must convert that into its established
+    StoreError form with the likely cause named, not leak the raw redis error (and
+    must NOT swallow it into [] -- a mixed-model graph is a real data-integrity
+    problem, unlike the ANN method's honest "no index -> no matches" case)."""
+    store = FalkorStore(falkordb_cfg, VECTOR_EXACT_DIM_MISMATCH_GRAPH)
+    try:
+        store.ensure_schema(dim=4)
+        store._g.query(
+            "MERGE (c:Chunk {id: 'good'}) SET c.service = 'svc', c.embedding = vecf32($v)",
+            {"v": [1.0, 0.0, 0.0, 0.0]},
+        )
+        store._g.query(
+            "MERGE (c:Chunk {id: 'rogue6'}) SET c.service = 'svc', c.embedding = vecf32($v)",
+            {"v": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+        )
+
+        # ANN side of the asymmetry: no exception, rogue row simply absent.
+        ann = store.search_vector_chunks([1.0, 0.0, 0.0, 0.0], k=5)
+        assert [props["id"] for props, _score in ann] == ["good"]
+
+        # Exact side: converted StoreError naming the likely cause, chained to the
+        # real FalkorDB error text.
+        with pytest.raises(StoreError) as exc_info:
+            store.search_vector_chunks_exact([1.0, 0.0, 0.0, 0.0], k=5)
+        assert type(exc_info.value) is StoreError  # converted, not raw ResponseError
+        assert "mixed-model" in str(exc_info.value)
+        assert "dimension mismatch" in str(exc_info.value).lower()
     finally:
         store._g.delete()
 
