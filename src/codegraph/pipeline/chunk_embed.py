@@ -153,6 +153,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 from codegraph.chunking import augment
@@ -224,32 +225,58 @@ def _augmented_texts(batch: list[ChunkRow]) -> list[str]:
 
 def _embed_batches(
     embedder: Embedder, batches: list[list[ChunkRow]]
-) -> list[list[list[float]]]:
-    """Runs one `embedder.embed_batch` call per entry of `batches`, returning results
-    in the SAME order as `batches` -- always, regardless of which call actually
-    finishes first. Sequential (today's pre-M4-T8 behavior, byte-identical) unless the
-    embedder opts in via `concurrency_safe=True` (see embedding/base.py's own Protocol
+) -> Iterator[list[list[float]]]:
+    """Yields one `embedder.embed_batch` result per entry of `batches`, in `batches`'
+    OWN order -- always, regardless of which call actually finishes first -- and
+    LAZILY (a generator, not a list -- review fix): the caller's write loop consumes,
+    writes, AND commits batch i's vectors before batch i+1's result is even awaited.
+    The streaming shape is load-bearing for failure semantics, not just memory: if
+    some batch's provider call raises, every batch already yielded has already been
+    durably written (`set_embeddings`/`embedding_cache_put` each commit -- see
+    stores/staging.py), exactly like the pre-T8 sequential loop, so a retry resumes
+    past them via `chunks_missing_embedding` instead of re-paying the provider for
+    the whole workload. (T8's first cut materialized ALL batches before the caller
+    wrote any -- eager list + eager `zip` argument -- silently discarding batches
+    0..N-1's computed vectors when batch N raised; caught in review, pinned by
+    test_failed_batch_leaves_earlier_batches_durable_and_retry_resumes_past_them.)
+
+    Sequential (the pre-T8 loop, one blocking call per yield) unless the embedder
+    opts in via `concurrency_safe=True` (see embedding/base.py's own Protocol
     docstring) AND there's more than one batch to overlap -- a single batch has
     nothing to overlap WITH, so the thread-pool path is skipped even for a
     concurrency-safe embedder rather than paying pool-startup overhead for zero
     possible benefit.
 
-    When it DOES run concurrently: `ThreadPoolExecutor.map` is documented to yield
-    its results in call order, not completion order (`concurrent.futures`'s own
-    contract -- `list(...)` blocks on each future in THAT order before moving to the
-    next) -- so a slow early batch can never let a fast later one jump ahead in the
-    returned list. This is what keeps `_embed_missing`'s own `set_embeddings`/
-    `embedding_cache_put` write order deterministic (batch-index order) even when the
-    batches themselves complete out of order -- a library guarantee, not a race that
-    happens to resolve the right way most of the time."""
+    When it DOES run concurrently: `ThreadPoolExecutor.map` submits every batch up
+    front, so workers run AHEAD of the consumer (overlapping their network round
+    trips -- the whole point), but its iterator is documented to yield results in
+    call order, not completion order -- a slow early batch can never let a fast
+    later one jump ahead. This is what keeps `_embed_missing`'s write order
+    deterministic (batch-index order) even when the batches themselves complete out
+    of order -- a library guarantee, not a race that happens to resolve the right
+    way most of the time. A batch whose call raised re-raises at its own position
+    in the yield order, AFTER every earlier batch was already yielded (and thus
+    written) -- same failure semantics as the sequential branch.
+
+    Executor lifetime (why `yield from` sits INSIDE the `with`): the pool must stay
+    alive until iteration completes, so the `with` block is only exited by generator
+    exhaustion, by an in-flight batch's exception propagating through, or by the
+    consumer abandoning iteration mid-way (generator close -> GeneratorExit at the
+    yield point -- e.g. a `set_embeddings` failure in the caller's own loop). All
+    three paths run `shutdown(wait=True)`; abandonment additionally cancels
+    not-yet-started batches first (`Executor.map`'s iterator cancels its remaining
+    futures when closed), so no worker thread ever outlives the consumer, and an
+    abandoned run wastes at most the few batches already in flight."""
     if getattr(embedder, "concurrency_safe", False) and len(batches) > 1:
         with ThreadPoolExecutor(
             max_workers=min(_MAX_CONCURRENT_EMBED_BATCHES, len(batches))
         ) as ex:
-            return list(
-                ex.map(lambda batch: embedder.embed_batch(_augmented_texts(batch)), batches)
+            yield from ex.map(
+                lambda batch: embedder.embed_batch(_augmented_texts(batch)), batches
             )
-    return [embedder.embed_batch(_augmented_texts(batch)) for batch in batches]
+    else:
+        for batch in batches:
+            yield embedder.embed_batch(_augmented_texts(batch))
 
 
 def _embed_missing(staging: Staging, embedder: Embedder) -> tuple[int, int]:
@@ -283,10 +310,13 @@ def _embed_missing(staging: Staging, embedder: Embedder) -> tuple[int, int]:
     M4 T8: the cache-miss batches themselves may now run concurrently (see
     `_embed_batches`) instead of always one-at-a-time, for a `concurrency_safe=True`
     embedder (openai/voyage) -- purely an internal scheduling change, invisible from
-    this function's own contract: `_embed_batches` always returns vectors in the SAME
+    this function's own contract: `_embed_batches` YIELDS vectors lazily, in the SAME
     order `batches` was built in, so the write loop right below (`set_embeddings`/
-    `embedding_cache_put`, one pair of calls per batch, in batch order) behaves
-    identically whether those vectors arrived sequentially or concurrently.
+    `embedding_cache_put`, one pair of calls per batch, in batch order, each pair
+    written+committed as soon as its own batch's vectors arrive) behaves identically
+    whether those vectors were computed sequentially or concurrently -- including on
+    FAILURE: a batch that raises mid-workload leaves every earlier batch already
+    durable, exactly like the pre-T8 loop (see `_embed_batches`' own docstring).
 
     Returns `(embedded_fresh, embedded_from_cache)` -- `run`'s own report counters
     (see its docstring)."""
@@ -326,9 +356,10 @@ def _embed_missing(staging: Staging, embedder: Embedder) -> tuple[int, int]:
     # M4 T8: `_embed_batches` runs these concurrently (<=4 at a time) ONLY for a
     # `concurrency_safe=True` embedder (openai/voyage); local/fake fall straight
     # through to the same sequential, one-`embed_batch`-call-at-a-time behavior this
-    # loop always had. Either way, `_embed_batches` returns vectors in `batches`'
-    # OWN order, so the write loop below -- and its determinism -- is completely
-    # unaware of whether the embed calls that fed it ran sequentially or concurrently.
+    # loop always had. Either way it YIELDS (lazily) in `batches`' OWN order, so each
+    # batch is written+committed here before the next batch's result is even awaited
+    # -- write order AND per-batch failure durability both match the pre-T8
+    # sequential loop exactly (see `_embed_batches`' own docstring for both halves).
     for batch, vectors in zip(batches, _embed_batches(embedder, batches), strict=True):
         packed = [pack_vector(vec) for vec in vectors]
         staging.set_embeddings([

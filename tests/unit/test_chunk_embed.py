@@ -21,6 +21,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
+
 from codegraph.chunking import augment
 from codegraph.config.models import ServiceConfig, WorkspaceConfig
 from codegraph.embedding.codec import pack_vector, unpack_vector
@@ -84,37 +86,66 @@ class _RecordingEmbedder:
         return self._inner.embed_query(text)
 
 
-class _ConcurrentSlowEmbedder:
-    """Wraps FakeEmbedder, adding `concurrency_safe = True` (opts into chunk_embed's
-    concurrent-batch path, M4 T8 -- see embedding/base.py's Protocol docstring) and an
-    artificial 50ms sleep on every `embed_batch` call -- proves two things at once in
-    `test_concurrent_embed_batches_give_wall_clock_win_and_deterministic_write_order`
-    below:
+class _SlowBatchEmbedder:
+    """Wraps FakeEmbedder with an artificial 50ms sleep per `embed_batch` call --
+    stands in for a real openai/voyage network round-trip (M4 T8, review-fixed shape:
+    was `_ConcurrentSlowEmbedder` with a hardwired `concurrency_safe=True`; the
+    sequential-control phase the review added needs the SAME delay through the
+    sequential path, so both knobs moved to the constructor).
 
-      - a real wall-clock win: naive sequential batching would burn >=4*50ms=200ms in
-        sleeps alone for 4 batches; running them concurrently (<=4 workers) should
-        finish in roughly one delay's worth of wall time, not four.
-      - deterministic `set_embeddings` write order regardless of which batch's sleep
-        happens to elapse first: with a UNIFORM delay across every batch, thread
-        completion order is not a controlled variable here at all -- what pins
-        determinism is `ThreadPoolExecutor.map`'s own documented guarantee that its
-        returned iterator yields results in CALL order, not completion order, so
-        `_embed_missing`'s write loop (which walks that same order) is unaffected by
-        scheduling regardless of delay pattern.
-    """
+      - `concurrency_safe`: True opts into chunk_embed's concurrent-batch path (see
+        embedding/base.py's Protocol docstring); False pins the sequential control,
+        whose wall-clock floor is mathematical, not statistical -- `time.sleep(0.05)`
+        guarantees AT LEAST 0.05s each, so 4 sequential batches cost >= 200ms in
+        sleeps alone, no scheduling luck involved.
+      - `model_id`: the timing test's two phases share ONE staging DB; a distinct
+        model_id makes `chunks_missing_embedding` re-flag every row for the second
+        phase (embed_model mismatch) while the first phase's persistent-cache entries
+        can't serve it either (cache key includes embed_model) -- a genuine
+        4-fresh-batches workload both times.
+
+    Write-order determinism under the concurrent path is NOT a function of the delay
+    pattern: with a UNIFORM delay, thread completion order isn't a controlled variable
+    at all -- what pins determinism is `ThreadPoolExecutor.map`'s own documented
+    guarantee that its iterator yields results in CALL order, not completion order,
+    so `_embed_missing`'s write loop is unaffected by scheduling."""
 
     _DELAY_SECONDS = 0.05
 
-    def __init__(self):
-        self._inner = FakeEmbedder(dim=8)
+    def __init__(self, concurrency_safe: bool, model_id: str | None = None):
+        self._inner = FakeEmbedder(dim=8, model_id=model_id)
         self.model_id = self._inner.model_id
         self.dim = self._inner.dim
-        self.concurrency_safe = True
+        self.concurrency_safe = concurrency_safe
         self.batch_sizes: list[int] = []
 
     def embed_batch(self, texts):
         time.sleep(self._DELAY_SECONDS)
         self.batch_sizes.append(len(texts))  # list.append -- GIL-atomic, no lock needed
+        return self._inner.embed_batch(texts)
+
+    def embed_query(self, text):
+        return self._inner.embed_query(text)
+
+
+class _FailsOnPoisonedBatchEmbedder:
+    """FakeEmbedder wrapper that raises on exactly ONE batch, identified by CONTENT
+    (a received text ending with one of `poison_texts` -- `augment_text` output always
+    ends with the chunk's own raw text), not by call order: under the concurrent path
+    call ORDER is scheduler-dependent, but batch COMPOSITION is deterministic
+    (`chunks_missing_embedding`'s ORDER BY chunk_id, sliced by 64), so poisoning a
+    known batch's texts fails that batch -- and only that batch -- on both paths."""
+
+    def __init__(self, poison_texts: list[str], concurrency_safe: bool):
+        self._inner = FakeEmbedder(dim=8)
+        self.model_id = self._inner.model_id
+        self.dim = self._inner.dim
+        self.concurrency_safe = concurrency_safe
+        self._poison = tuple(poison_texts)
+
+    def embed_batch(self, texts):
+        if any(t.endswith(p) for t in texts for p in self._poison):
+            raise RuntimeError("simulated provider failure on the poisoned batch")
         return self._inner.embed_batch(texts)
 
     def embed_query(self, text):
@@ -468,10 +499,10 @@ def test_embed_batches_capped_at_64(tmp_path):
 
 # ======================================================================================
 # -- M4 T8: concurrent embed batches for `concurrency_safe=True` embedders (openai/
-# voyage in production; `_ConcurrentSlowEmbedder` here stands in for one) -- wall-clock
-# win AND deterministic `set_embeddings` write order, both proven in one test per the
-# task-8 brief (generous margins to avoid flake: 4 batches * 50ms -> sequential-
-# equivalent floor 200ms, concurrent asserted <130ms).
+# voyage in production; `_SlowBatchEmbedder` here stands in for one) -- wall-clock win
+# (against a MEASURED sequential control, review fix -- not just a narrated floor) AND
+# deterministic `set_embeddings` write order, plus (review fix) per-batch streaming
+# durability when a mid-workload batch fails.
 # ======================================================================================
 
 
@@ -479,10 +510,20 @@ def test_concurrent_embed_batches_give_wall_clock_win_and_deterministic_write_or
     tmp_path, monkeypatch
 ):
     """256 tiny functions -> exactly 4 batches of 64 (_EMBED_BATCH_SIZE), each delayed
-    50ms by `_ConcurrentSlowEmbedder`. A naive sequential implementation would take
-    >=200ms just in sleeps; running up to 4 batches concurrently should land close to
-    one delay's worth of wall time. `Staging.set_embeddings` is spied on to prove the
-    concatenation of every chunk_id it's ever called with, IN CALL ORDER, is already
+    50ms by `_SlowBatchEmbedder`. Two timed phases against ONE staging DB:
+
+      - Phase 1 (sequential CONTROL -- review fix: the >=200ms floor used to be only a
+        comment): the same workload through the sequential path (concurrency_safe=
+        False, distinct model_id -- see `_SlowBatchEmbedder`'s docstring for why that
+        keeps phase 2 a genuine 4-fresh-batches workload). 4 blocking `time.sleep
+        (0.05)` calls make >=200ms a mathematical floor; asserted at >=190ms.
+      - Phase 2 (concurrent): same 4 batches, concurrency_safe=True -- must land close
+        to ONE delay's worth of wall time (asserted <130ms, generous margin against a
+        loaded CI box), proving the win against the control measured moments earlier
+        on this same machine, not against an assumed baseline.
+
+    `Staging.set_embeddings` is spied on (phase 2 only -- cleared in between) to prove
+    the concatenation of every chunk_id it's called with, IN CALL ORDER, is already
     sorted -- i.e. writes land in ascending chunk_id order (matching
     `chunks_missing_embedding`'s own `ORDER BY chunk_id`, the same order the batches
     were carved out of `missing` in), never scrambled by scheduling."""
@@ -490,8 +531,6 @@ def test_concurrent_embed_batches_give_wall_clock_win_and_deterministic_write_or
     cfg = _cfg(svc)
     staging = Staging(tmp_path / "s.db")
     _analyze_all(cfg, staging, tmp_path)
-
-    embedder = _ConcurrentSlowEmbedder()
 
     written_chunk_ids: list[list[str]] = []
     original_set_embeddings = Staging.set_embeddings
@@ -502,18 +541,37 @@ def test_concurrent_embed_batches_give_wall_clock_win_and_deterministic_write_or
 
     monkeypatch.setattr(Staging, "set_embeddings", spy_set_embeddings)
 
+    # -- phase 1: sequential control --
+    seq_embedder = _SlowBatchEmbedder(concurrency_safe=False, model_id="slow-seq-8d")
+    t0 = time.perf_counter()
+    seq_report = chunk_embed.run(cfg, staging, seq_embedder)
+    elapsed_seq = time.perf_counter() - t0
+
+    assert seq_report["chunks_total"] == 256
+    assert seq_report["embedded_fresh"] == 256
+    assert seq_embedder.batch_sizes == [64, 64, 64, 64]
+    assert elapsed_seq >= 0.19, (
+        f"sequential control under its own mathematical sleep floor? {elapsed_seq:.3f}s"
+    )
+
+    written_chunk_ids.clear()  # phase 2's order assertion covers phase 2's writes only
+
+    # -- phase 2: concurrent --
+    embedder = _SlowBatchEmbedder(concurrency_safe=True)
     t0 = time.perf_counter()
     report = chunk_embed.run(cfg, staging, embedder)
     elapsed = time.perf_counter() - t0
 
     assert report["chunks_total"] == 256
-    assert report["embedded_fresh"] == 256
+    assert report["embedded_fresh"] == 256  # phase 1's cache entries: different model_id
     assert report["embedded_from_cache"] == 0
     assert embedder.batch_sizes == [64, 64, 64, 64]  # 4 full batches, as designed
 
-    # -- wall-clock win: sequential-equivalent floor is 4*50ms=200ms; concurrent(<=4)
-    # comes in comfortably under that, generous margin against flake on a loaded CI box.
-    assert elapsed < 0.13, f"expected a concurrent wall-clock win, took {elapsed:.3f}s"
+    # -- wall-clock win, against the control measured above on this same machine --
+    assert elapsed < 0.13, (
+        f"expected a concurrent wall-clock win, took {elapsed:.3f}s "
+        f"(sequential control: {elapsed_seq:.3f}s)"
+    )
 
     # -- deterministic write order --
     flat = [cid for call in written_chunk_ids for cid in call]
@@ -532,6 +590,62 @@ def test_concurrent_embed_batches_give_wall_clock_win_and_deterministic_write_or
     for row in staging.iter_chunks():
         expected = reference.embed_query(augment.augment_text(row.context_header or "", row.text))
         assert unpack_vector(row.embedding) == unpack_vector(pack_vector(expected))
+
+
+@pytest.mark.parametrize("concurrency_safe", [False, True], ids=["sequential", "concurrent"])
+def test_failed_batch_leaves_earlier_batches_durable_and_retry_resumes_past_them(
+    tmp_path, concurrency_safe
+):
+    """Review fix pin (M4 T8): `_embed_batches` must STREAM (lazy generator), so a
+    provider failure in batch N leaves batches 0..N-1's vectors already written to
+    `chunks` AND the persistent `embedding_cache` when the raise propagates -- exactly
+    the pre-T8 per-batch write+commit behavior -- and a retry resumes past them
+    (re-embedding only the failed batch). T8's first cut materialized every batch's
+    vectors before writing ANY (eager list + eager `zip` argument), silently
+    discarding batches 0..N-1's computed work on a batch-N raise; caught in review.
+    Parametrized over both paths: the sequential loop and the ThreadPoolExecutor.map
+    pipeline must both exhibit the same durability."""
+    svc = _write_service(tmp_path, "a", {"m.py": _many_funcs_src(256)})
+    cfg = _cfg(svc)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+    # Prime the chunks table without embedding anything (embedder=None -- the chunk
+    # loop and fill_headers_all still run): chunks only exist after chunk_embed.run's
+    # own chunk loop, and the batch carve below needs to see them BEFORE the poisoned
+    # run. The poisoned run's own re-chunk pass is a no-op upsert over identical
+    # content, so the carve it actually embeds is byte-identical to this preview.
+    chunk_embed.run(cfg, staging, None)
+
+    # Replicate `_embed_missing`'s own deterministic batch carve (ORDER BY chunk_id,
+    # slices of 64) to learn which rows land in the LAST batch (index 3) -- poisoning
+    # by CONTENT keeps the failing batch fixed even though the concurrent path runs
+    # its calls in scheduler-dependent order (see _FailsOnPoisonedBatchEmbedder).
+    missing = staging.chunks_missing_embedding("fake-8d")
+    assert len(missing) == 256  # 4 batches of exactly 64
+    expected_durable_ids = [r.chunk_id for r in missing[:192]]
+    poison_texts = [r.text for r in missing[192:]]
+
+    embedder = _FailsOnPoisonedBatchEmbedder(poison_texts, concurrency_safe=concurrency_safe)
+    with pytest.raises(RuntimeError, match="poisoned batch"):
+        chunk_embed.run(cfg, staging, embedder)
+
+    rows = {r.chunk_id: r for r in staging.iter_chunks()}
+    durable = sorted(cid for cid, r in rows.items() if r.embedding is not None)
+    assert durable == expected_durable_ids  # batches 0-2 written; poisoned batch not
+
+    # ...and the persistent cache holds the same three batches (`embedding_cache_put`
+    # runs right after each batch's own `set_embeddings`, inside the streamed loop).
+    pairs = [(rows[cid].input_hash, "fake-8d") for cid in expected_durable_ids]
+    assert len(staging.embedding_cache_get(pairs)) == 192
+
+    # Retry with a healthy embedder: the 192 durable rows are never re-flagged
+    # (embedded_hash == input_hash, same model), so exactly ONE fresh 64-row batch
+    # runs -- the failure cost is bounded to the failed batch, not the whole workload.
+    retry = _RecordingEmbedder(FakeEmbedder(dim=8))
+    report = chunk_embed.run(cfg, staging, retry)
+    assert retry.batch_sizes == [64]
+    assert report["embedded_fresh"] == 64
+    assert report["reused"] == 192
 
 
 # ======================================================================================
