@@ -209,7 +209,7 @@ workspace, а не в точечных правках внутри одного 
 | Команда | Что делает |
 |---|---|
 | `codegraph init [DIR]` | Создать `codegraph.yaml` из прокомментированного шаблона. |
-| `codegraph doctor [--probe-scip] [--skip-store] [--config PATH]` | Проверить окружение (python/node/npx[/scip-python]) и возможности FalkorDB (feature-probes). |
+| `codegraph doctor [--probe-scip] [--skip-store] [--config PATH] [--graph NAME]` | Проверить окружение (python/node/npx[/scip-python]) и возможности FalkorDB (feature-probes; для целевого графа — в т.ч. наличие vector-индекса при живых эмбеддингах). |
 | `codegraph index [TARGET] [--dry-run] [--graph NAME] [--no-embed] [--incremental]` | Построить граф: scan → resolve → extract → join → link → chunk+embed → load → report. |
 | `codegraph load [TARGET] [--graph NAME]` | Пересобрать граф в FalkorDB из уже посчитанного `staging.db`, без повторного анализа. |
 | `codegraph stats [TARGET] [--graph NAME]` | Узлы по `kind` / рёбра по `type`. |
