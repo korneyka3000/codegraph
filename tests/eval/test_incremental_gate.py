@@ -252,6 +252,21 @@ def _edit_orders_api_function_body(orders_api_dir: Path) -> None:
     order_service.write_text(edited)
 
 
+def _edit_orders_api_function_body_again(orders_api_dir: Path) -> None:
+    """A SECOND, different body-only edit to the same function/file
+    `_edit_orders_api_function_body` already touched (that helper is one-shot: its
+    own sanity assert would fail if re-run, since 'status="unknown"' no longer
+    exists after the first pass) -- same edit character exactly (one function BODY
+    string literal, no rename, no signature change, no idiom/config change that
+    could flip the fingerprint), used ONLY by the perf sub-assertion's retry-once
+    re-measurement (see step 7 in the gate below), never by any correctness step."""
+    order_service = orders_api_dir / "app" / "services" / "order.py"
+    original = order_service.read_text()
+    edited = original.replace('status="not_found"', 'status="missing"')
+    assert edited != original  # sanity: the FIRST edit must have run before this one
+    order_service.write_text(edited)
+
+
 def _delete_and_add_file(kyc_worker_dir: Path) -> None:
     """Deletes app/consumer_main.py (confirmed unreferenced by any other fixture
     file -- an entrypoint module, same "nothing imports it" shape as
@@ -463,6 +478,24 @@ def test_incremental_dump_equivalence_and_perf(tmp_path, falkordb_cfg, record_pr
         # ws_c's own fresh-from-scratch call), per the plan's documented <50%
         # threshold (a deliberate relaxation from the master plan's <20%: scip-python
         # is not file-incremental, see the M4 plan's Global Constraints).
+        #
+        # M5 T7 hardening (pre-existing flake, review-measured): this ratio is a
+        # WALL-CLOCK measurement on shared developer hardware -- the reviewer
+        # measured it varying 28-61% across runs of IDENTICAL code on this machine
+        # (npx/scip-python startup jitter, OS scheduling, disk cache state), so a
+        # single unlucky measurement can cross the 0.5 threshold with no real
+        # regression behind it. The perf SUB-ASSERTION alone therefore retries
+        # ONCE: a first-measurement ratio >= 0.5 triggers exactly one fresh
+        # cold+incremental timing pair (same measurement character: a genuinely new
+        # 1-file body edit -> --incremental with warm caches, vs. a from-scratch
+        # sibling-workspace full index of the same edited tree), and the gate then
+        # asserts on the BETTER of the two ratios. A genuine regression fails both
+        # measurements and still fails the gate; the 0.5 threshold itself is
+        # unchanged. Every CORRECTNESS assertion in this test (dump equivalence,
+        # modes, isolation, deletion) is unaffected -- none of them ever retries;
+        # the few asserts INSIDE the retry block below only validate that the
+        # re-measurement itself is of the right character (not degraded, really
+        # incremental), and a failure there fails the test outright, un-retried.
         # ==================================================================
         ratio = t_incremental_edit / t_full_cold_edited
         print(
@@ -473,9 +506,41 @@ def test_incremental_dump_equivalence_and_perf(tmp_path, falkordb_cfg, record_pr
         record_property("m4_t_full_cold_edited_seconds", f"{t_full_cold_edited:.3f}")
         record_property("m4_t_incremental_edit_seconds", f"{t_incremental_edit:.3f}")
         record_property("m4_incremental_vs_full_ratio", f"{ratio:.3f}")
-        assert t_incremental_edit < 0.5 * t_full_cold_edited, (
-            f"perf gate failed: t_incremental={t_incremental_edit:.2f}s is not < 50% "
-            f"of t_full_cold={t_full_cold_edited:.2f}s (ratio={ratio:.1%})"
+
+        best_ratio, retry_note = ratio, ""
+        if ratio >= 0.5:
+            _edit_orders_api_function_body_again(service_dirs["orders-api"])
+            t_incremental_retry, _ = _invoke_index(ws_path, incremental=True)
+            report_retry = _load_report(ws_path)
+            _assert_not_degraded(report_retry)
+            modes_retry = {s["service"]: s["mode"] for s in report_retry["services"]}
+            assert modes_retry["orders-api"] == "incremental", modes_retry
+
+            retry_full_name = f"{GRAPH_NAME}__full_perf_retry"
+            graph_names.add(retry_full_name)
+            ws_retry = _write_workspace_yaml(
+                tmp_path / "full_check_perf_retry", service_dirs, retry_full_name
+            )
+            t_full_cold_retry, _ = _invoke_index(ws_retry)
+            _assert_not_degraded(_load_report(ws_retry))
+
+            retry_ratio = t_incremental_retry / t_full_cold_retry
+            print(
+                f"[M4 T7 perf gate, retry] t_full_cold={t_full_cold_retry:.2f}s "
+                f"t_incremental(1 file edit, warm)={t_incremental_retry:.2f}s "
+                f"ratio={retry_ratio:.1%} (first measurement was {ratio:.1%})"
+            )
+            record_property("m5_perf_retry_t_full_cold_seconds", f"{t_full_cold_retry:.3f}")
+            record_property("m5_perf_retry_t_incremental_seconds", f"{t_incremental_retry:.3f}")
+            record_property("m5_perf_retry_ratio", f"{retry_ratio:.3f}")
+            best_ratio = min(ratio, retry_ratio)
+            retry_note = f" and on the retry (ratio={retry_ratio:.1%})"
+
+        assert best_ratio < 0.5, (
+            f"perf gate failed on the first measurement (ratio={ratio:.1%})"
+            f"{retry_note}: incremental is not < 50% of full-cold either time "
+            f"(threshold: <50%) -- a consistent miss across two independent "
+            f"measurement pairs, not single-run wall-clock jitter"
         )
     finally:
         for name in graph_names:

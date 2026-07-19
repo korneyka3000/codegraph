@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 
 from codegraph.cli import app
 from codegraph.doctor import CheckResult
+from codegraph.stores.falkordb.connection import StoreError
 
 runner = CliRunner()
 
@@ -104,6 +105,36 @@ def test_doctor_skips_vector_probe_when_a_capability_probe_already_failed(tmp_pa
     result = runner.invoke(app, ["doctor", "--config", str(root)])
     assert result.exit_code == 1
     assert "ping" in result.output.lower()
+
+
+def test_doctor_vector_probe_store_error_becomes_failure_row_not_traceback(
+    tmp_path, monkeypatch
+):
+    """M5 T7 review fix (Important): FalkorDB dropping between the (green) capability
+    probes and the vector-index probe raises a bare StoreError out of
+    check_chunk_vector_index's raw()/graph_exists() passthroughs -- pre-fix that
+    propagated as a raw traceback out of doctor() (the justifying comment wrongly
+    claimed parity with stats(), which actually wraps its store calls in
+    _store_guard). Post-fix: the transient failure becomes one more FAILED row in the
+    SAME falkordb table (doctor._probe's own per-probe isolation discipline -- NOT
+    _store_guard's red-line-and-exit, which would discard the already-computed green
+    capability rows), flipping the exit code through the normal `ok` fold."""
+    root = _write_workspace(tmp_path, graph_name="wsgraph")
+
+    def _transient(store):
+        raise StoreError("Connection reset by peer")
+
+    monkeypatch.setattr("codegraph.cli.run_store_probes", lambda db_factory: list(_ALL_OK_PROBES))
+    monkeypatch.setattr("codegraph.cli.FalkorStore", _FakeStore)
+    monkeypatch.setattr("codegraph.cli.check_chunk_vector_index", _transient)
+
+    result = runner.invoke(app, ["doctor", "--config", str(root)])
+    assert result.exit_code == 1
+    assert not isinstance(result.exception, StoreError)  # handled, never propagated
+    assert "chunk_vector_index" in result.output  # rendered as a doctor failure ROW...
+    assert "Connection reset by peer" in result.output  # ...carrying the real cause
+    assert "ping" in result.output.lower()  # green capability rows still rendered too
+    assert "Traceback" not in result.output
 
 
 def test_doctor_skip_store_flag_never_touches_store_probes_or_vector_probe(tmp_path, monkeypatch):

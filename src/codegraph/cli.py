@@ -18,7 +18,12 @@ from rich.tree import Tree
 from codegraph.config.loader import ConfigError, effective_idioms, load_workspace
 from codegraph.config.models import WorkspaceConfig
 from codegraph.core.errors import CodegraphError
-from codegraph.doctor import check_chunk_vector_index, run_env_checks, run_store_probes
+from codegraph.doctor import (
+    CheckResult,
+    check_chunk_vector_index,
+    run_env_checks,
+    run_store_probes,
+)
 from codegraph.embedding.factory import make_embedder
 from codegraph.evalx.retrieval_eval import load_questions, run_questions
 from codegraph.linking.workspace import link_workspace
@@ -206,18 +211,35 @@ def doctor(
         # appended to the SAME probes list/table, not a separate command-level
         # concern. Only attempted once every capability probe above is already green
         # (`all(r.ok for r in results)`): an unreachable/degraded FalkorDB is already
-        # reported by "ping"/etc. above, and `check_chunk_vector_index` has no
-        # try/except of its own -- it trusts a store it can already reach, the same
-        # "connect once, then trust it" contract as this file's other post-connect
-        # sequences (e.g. stats()'s own graph_exists()-then-stats()). A `None` result
-        # (see that function's own docstring -- graph not indexed yet, no embedded
-        # Chunk anywhere, or the index is already there) adds no row at all: only the
-        # genuine "live embeddings, no covering index" gap is worth a line here.
+        # reported by "ping"/etc. above. The call is still guarded regardless (M5 T7
+        # review fix, Important -- an earlier version left it bare, wrongly claiming
+        # parity with stats(), which in fact wraps its own graph_exists()/stats()
+        # calls in _store_guard): FalkorDB can drop in the window between those early
+        # probes and this call, and check_chunk_vector_index's graph_exists()/raw()
+        # are bare passthroughs with no try/except of their own -- unguarded, a
+        # transient (StoreError, StoreUnavailable) here surfaced as a raw traceback.
+        # Deliberately a local guard producing one more FAILED row in the SAME table
+        # (doctor's own per-probe isolation discipline, see doctor._probe), NOT
+        # _store_guard (red one-liner + immediate exit 1): that would discard the
+        # already-computed green capability rows above, and doctor's whole job is
+        # SHOWING diagnostic rows -- the exit code still flips to 1 through the
+        # normal `ok` fold below. Same narrow exception pair as _store_guard, for
+        # the same reason (see its docstring): any OTHER exception is a genuine bug
+        # and must still traceback. A `None` result (see check_chunk_vector_index's
+        # own docstring -- graph not indexed yet, no embedded Chunk anywhere, or the
+        # index is already there) adds no row at all: only the genuine "live
+        # embeddings, no covering index" gap -- or a probe that itself failed
+        # mid-flight -- is worth a line here.
         if all(r.ok for r in results):
             graph_name = _resolve_graph_name(cfg, graph)
-            vector_check = check_chunk_vector_index(
-                FalkorStore(cfg.storage.falkordb, graph_name)
-            )
+            try:
+                vector_check = check_chunk_vector_index(
+                    FalkorStore(cfg.storage.falkordb, graph_name)
+                )
+            except (StoreError, StoreUnavailable) as e:
+                vector_check = CheckResult(
+                    "chunk_vector_index", False, f"probe failed: {e}"
+                )
             if vector_check is not None:
                 results = [*results, vector_check]
         ok &= _render(
