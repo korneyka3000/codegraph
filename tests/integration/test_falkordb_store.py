@@ -333,6 +333,55 @@ def test_search_text_chunks_and_success_does_not_widen_with_or(falkordb_cfg):
         _cleanup(falkordb_cfg, OR_FALLBACK)
 
 
+def test_search_text_chunks_or_fallback_respects_service_filter(falkordb_cfg):
+    """M4-T3 minor backlog, closed in M5 T7: pins that the OR-retried second pass
+    carries the SAME WHERE constraints as the first (AND) pass -- not a separate
+    concern to re-implement, but a structural guarantee already true by construction:
+    `_fulltext_result_set` re-runs the exact same `cypher` string the caller (here,
+    `search_text_chunks`) built ONCE, service filter baked in -- only `params["q"]`
+    changes between the two calls (see that method's own docstring). Verified here via
+    RESULTS, not internals: two services, two chunks, each carrying only ONE of a
+    two-token query's tokens, so the AND-only first pass matches NEITHER (0 rows,
+    triggering the OR retry) and the OR-joined retry matches BOTH chunks when
+    unfiltered -- but scoped to one service, only that service's chunk may come back,
+    never the other service's OR-only match leaking through the retried pass."""
+    store = FalkorStore(falkordb_cfg, OR_FALLBACK)
+    try:
+        store.ensure_schema()
+        store.upsert_nodes(("Chunk",), [
+            {
+                "id": "chunk:orders-created",
+                "props": {
+                    "service": "orders-api",
+                    "text": "def create_order(): emit(OrderCreated(order_id=order.id))",
+                },
+            },
+            {
+                "id": "chunk:invoice-created",
+                "props": {
+                    "service": "billing-api",
+                    "text": "def create_invoice(): emit(InvoiceCreated(invoice_id=inv.id))",
+                },
+            },
+        ])
+
+        # sanity: unfiltered, the OR fallback finds BOTH services' chunks (neither
+        # chunk has both tokens, so the AND-only first pass is empty -> retry fires).
+        unfiltered = store.search_text_chunks("OrderCreated InvoiceCreated", k=5)
+        assert {props["id"] for props, _score in unfiltered} == {
+            "chunk:orders-created", "chunk:invoice-created",
+        }
+
+        # filtered: the SAME query, scoped to orders-api -- only that service's chunk
+        # may come back, even though billing-api's chunk would OR-match too.
+        filtered = store.search_text_chunks(
+            "OrderCreated InvoiceCreated", k=5, service="orders-api"
+        )
+        assert {props["id"] for props, _score in filtered} == {"chunk:orders-created"}
+    finally:
+        _cleanup(falkordb_cfg, OR_FALLBACK)
+
+
 def test_search_fulltext_or_fallback_finds_mixed_language_query(falkordb_cfg):
     """Same OR-fallback contract as the search_text_chunks tests above, mirrored on
     the Sym fulltext leg (name/qualified_name/docstring) -- this task's brief

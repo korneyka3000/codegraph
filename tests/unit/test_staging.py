@@ -1010,6 +1010,41 @@ def test_chunks_missing_embedding_flags_header_change_with_same_content_hash(tmp
     assert missing == {"c1#c0"}
 
 
+def test_has_live_embeddings_false_when_nothing_ever_embedded(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [_chunk("c1#c0", "c1", 0)])
+    assert st.has_live_embeddings() is False
+
+
+def test_has_live_embeddings_false_on_an_empty_workspace(tmp_path):
+    st = Staging(tmp_path / "s.db")  # no chunks staged at all yet
+    assert st.has_live_embeddings() is False
+
+
+def test_has_live_embeddings_true_once_any_single_chunk_carries_a_vector(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [_chunk("c1#c0", "c1", 0), _chunk("c2#c0", "c2", 0)])
+    st.set_input_hashes([("c1#c0", "ih-1")])
+    st.set_embeddings([("c1#c0", b"\x01", "model-a", "ih-1")])  # only c1 embedded, c2 not
+    assert st.has_live_embeddings() is True
+
+
+def test_has_live_embeddings_ignores_staleness_a_stale_embedding_still_counts(tmp_path):
+    """Deliberately coarse (see the method's own docstring): a chunk whose
+    embedded_hash no longer matches its current input_hash (chunks_missing_embedding
+    WOULD flag it for re-embedding) still has a real, non-NULL embedding blob sitting
+    in the row -- has_live_embeddings must still see it as live, since that is exactly
+    the value pipeline/load.py would load into the graph as-is (freshness only gates
+    RE-embedding decisions, never whether a stored value gets loaded at all)."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_chunks("a", "m.py", [_chunk("c1#c0", "c1", 0, text="v1")])
+    st.set_input_hashes([("c1#c0", "ih-v1")])
+    st.set_embeddings([("c1#c0", b"\xaa", "model-a", "ih-v1")])
+    st.set_input_hashes([("c1#c0", "ih-v2")])  # header/text changed since embedding
+    assert {r.chunk_id for r in st.chunks_missing_embedding("model-a")} == {"c1#c0"}  # stale
+    assert st.has_live_embeddings() is True  # but still a real, loadable blob
+
+
 def test_set_embeddings_set_context_headers_and_set_input_hashes(tmp_path):
     st = Staging(tmp_path / "s.db")
     c1 = _chunk("c1#c0", "c1", 0)

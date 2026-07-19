@@ -137,19 +137,27 @@ def test_full_pipeline_rerun_chunk_embed_is_idempotent_before_load(
         _cleanup(falkordb_cfg, BUILD_NAME, GRAPH_NAME)
 
 
-def test_degraded_rerun_does_not_leak_stale_embeddings_into_graph(
+def test_degraded_rerun_over_unchanged_content_preserves_live_embedding_into_graph(
     falkordb_cfg, tmp_path,
 ):
-    """Coordinator fix, the reviewer's exact live repro: embed run -> SAME staging.db
-    -> rerun with embedder=None (the degradation path -- missing extra/`--no-embed`)
-    -> load. The degraded rerun correctly clears the workspace embed_model/dim meta,
-    but `upsert_chunks`' ON-CONFLICT contract deliberately preserves each unchanged
-    chunk's staged embedding blob (that's what lets a later embedder-restored run
-    reuse them). Pre-fix, `_chunk_node_batches`' guard (`dim is not None and len !=
-    dim`) waved those stale blobs straight into the vecf32 batch -- the loaded graph
-    got Chunk nodes carrying embedding+embed_model while Meta advertised NO model and
-    NO vector index existed (inconsistent state). Post-fix: dim=None routes every
-    embedded row to the without-vector batch, embed_model stripped."""
+    """M5 T7 -- supersedes an earlier version of this test that pinned the OPPOSITE
+    outcome (see .superpowers/sdd/task-7-report.md for the full before/after story).
+    Coordinator fix's original live repro still applies verbatim up through the
+    degraded rerun itself: embed run -> SAME staging.db -> rerun with embedder=None
+    (the degradation path -- missing extra/`--no-embed`), content on disk UNCHANGED.
+    `upsert_chunks`' ON-CONFLICT contract deliberately preserves each unchanged
+    chunk's staged embedding blob across the degraded rerun (that survival is what
+    lets a LATER embedder-restored run reuse them for free, at zero provider cost) --
+    what changed in M5 T7 is that `Staging.has_live_embeddings()` now correctly
+    recognizes that survival and PRESERVES Meta's embed_model/dim instead of blindly
+    blanking them. The pre-M5 unconditional clear didn't just make Meta lie about it:
+    `_chunk_node_batches`' `dim is None` branch (see its own docstring) trusted that
+    lie and stripped the still-valid vector from the load too, discarding real,
+    unchanged, genuinely-live search data on every degraded-but-unchanged rerun. Post-
+    fix, both the STAGED blob (unchanged, verified below) and Meta (preserved) stay
+    honest, so the vector round-trips all the way through `load_graph` into a
+    queryable FalkorDB vector index -- as if the degraded rerun had never touched this
+    chunk at all, which is exactly true of its embedding."""
     svc_dir = tmp_path / "svc"
     svc_dir.mkdir()
     (svc_dir / "m.py").write_text(SRC)
@@ -164,34 +172,34 @@ def test_degraded_rerun_does_not_leak_stale_embeddings_into_graph(
 
     degraded = run_chunk_embed(cfg, staging, None)  # then the degraded rerun
     assert degraded["skipped_no_embedder"] == 2
-    assert not staging.get_meta("embed_model")  # meta correctly cleared...
-    # ...but the stale blobs deliberately survive in staging (the reuse cache):
+    assert staging.get_meta("embed_model") == "fake-8d"  # preserved -- vectors still live
+    assert staging.get_meta("embed_dim") == "8"
+    # the unchanged blobs survive in staging (same reuse-cache mechanism as before):
     assert all(row.embedding is not None for row in staging.iter_chunks())
 
     try:
         load_graph(staging, lambda name: FalkorStore(falkordb_cfg, name), GRAPH_NAME)
 
         store = FalkorStore(falkordb_cfg, GRAPH_NAME)
-        # No Chunk node carries an embedding OR an embed_model property...
+        # EVERY Chunk node still carries its embedding + embed_model...
         res = store.raw(
             "MATCH (c:Chunk) RETURN c.id, c.embedding IS NOT NULL, "
             "c.embed_model IS NOT NULL"
         )
         assert len(res.result_set) == 2
         for _chunk_id, has_embedding, has_model in res.result_set:
-            assert not has_embedding
-            assert not has_model
-        # ...consistent with Meta (no model/dim, schema_version only)...
+            assert has_embedding
+            assert has_model
+        # ...consistent with Meta (still advertising the live model/dim)...
         meta_props = store.get_nodes(["meta"])[0]
-        assert "embed_model" not in meta_props
-        assert "dim" not in meta_props
-        # ...and with the absence of any vector index (querying one is an error, the
-        # honest signal -- not a silently empty index).
-        with pytest.raises(Exception):  # noqa: B017 -- exact FalkorDB error text not pinned
-            store.raw(
-                "CALL db.idx.vector.queryNodes('Chunk', 'embedding', 1, vecf32($v)) "
-                "YIELD node RETURN node.id",
-                {"v": [0.0] * 8},
-            )
+        assert meta_props["embed_model"] == "fake-8d"
+        assert meta_props["dim"] == 8
+        # ...and a real, queryable vector index actually exists (no error, a real hit).
+        res_vec = store.raw(
+            "CALL db.idx.vector.queryNodes('Chunk', 'embedding', 1, vecf32($v)) "
+            "YIELD node RETURN node.id",
+            {"v": [0.0] * 8},
+        )
+        assert len(res_vec.result_set) == 1
     finally:
         _cleanup(falkordb_cfg, BUILD_NAME, GRAPH_NAME)

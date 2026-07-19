@@ -681,13 +681,19 @@ def test_run_with_no_embedder_clears_staging_meta(tmp_path):
     assert not staging.get_meta("embed_dim")
 
 
-def test_run_with_embedder_then_no_embedder_clears_stale_meta(tmp_path):
-    """A LATER run (e.g. `--no-embed`) must not leave a PRIOR run's embed_model/dim
-    behind -- every chunk in the workspace was just re-chunked from scratch this run,
-    so if this run has no embedder, none of them actually carry that stale model's
-    embedding any more (see _embed_meta's own docstring for why this matters at load
-    time -- Meta must never advertise a model/dim no Chunk.embedding in the graph
-    actually matches)."""
+def test_run_with_embedder_then_no_embedder_over_unchanged_content_preserves_meta(
+    tmp_path,
+):
+    """M5 T7 (supersedes the pre-M5 "clears stale meta" test this replaces -- see
+    .superpowers/sdd/task-7-report.md for the full before/after story): a LATER
+    embedder=None run over UNCHANGED content is a FULL run (changed_files=None), so
+    every service's chunk loop reruns from scratch -- but `upsert_chunks`' own
+    ON-CONFLICT contract deliberately leaves embedding/embed_model/embedded_hash
+    untouched across a same-chunk_id re-upsert of unchanged text (see its docstring),
+    so the chunk's PRIOR embedding genuinely survives this second run, still valid,
+    still loadable. Meta must therefore be PRESERVED here, not blanked -- the old
+    unconditional-clear behavior was actively wrong in this exact scenario (see
+    chunk_embed.run's own updated comment), not merely conservative."""
     svc = _write_service(tmp_path, "a", {"m.py": SRC_ONE_FUNC})
     cfg = _cfg(svc)
     staging = Staging(tmp_path / "s.db")
@@ -696,9 +702,70 @@ def test_run_with_embedder_then_no_embedder_clears_stale_meta(tmp_path):
     chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))
     assert staging.get_meta("embed_model") == "fake-8d"
 
-    chunk_embed.run(cfg, staging, None)
+    chunk_embed.run(cfg, staging, None)  # e.g. `--no-embed`, content on disk unchanged
+    assert staging.get_meta("embed_model") == "fake-8d"  # preserved -- a live vector remains
+    assert staging.get_meta("embed_dim") == "8"
+
+
+def test_run_with_no_embedder_clears_meta_once_every_live_embedding_is_genuinely_gone(
+    tmp_path,
+):
+    """The "cleared" direction, proven even when Meta previously held REAL values (not
+    just the "never embedded at all" case covered by
+    test_run_with_no_embedder_clears_staging_meta above): `delete_file_layer` wipes
+    the ONE chunk's row entirely (mirrors T5's own incremental stale-file handling,
+    see chunk_embed.py's own M4 T6 docstring section) -- the immediately-following
+    embedder=None run re-chunks the same, still-on-disk file from scratch into a
+    BRAND NEW row (fresh INSERT, not an ON-CONFLICT UPDATE, since the old row is
+    genuinely gone), which starts with a NULL embedding. Nothing in the workspace
+    carries a live embedding any more -- has_live_embeddings() is False -- so Meta
+    must be cleared, exactly as before."""
+    svc = _write_service(tmp_path, "a", {"m.py": SRC_ONE_FUNC})
+    cfg = _cfg(svc)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+
+    chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))
+    assert staging.get_meta("embed_model") == "fake-8d"
+    assert staging.has_live_embeddings() is True
+
+    staging.delete_file_layer("a", {"m.py"}, drop_calls_evidence=set())
+    assert staging.has_live_embeddings() is False  # the only embedded row is gone
+
+    chunk_embed.run(cfg, staging, None)  # re-chunks m.py fresh, no embedder this run
     assert not staging.get_meta("embed_model")
     assert not staging.get_meta("embed_dim")
+
+
+def test_changed_files_no_embedder_preserves_meta_when_an_untouched_service_still_has_live_vectors(  # noqa: E501
+    tmp_path,
+):
+    """The exact `--incremental --no-embed` scenario the M4 final review's MINOR-3
+    deferred: two services, both fully embedded first -- a SECOND run scopes the
+    chunk loop to service "a" alone (`changed_files={"a": ...}`) with embedder=None,
+    leaving service "b" completely untouched, still carrying its own live vectors
+    from the first run. Meta must stay exactly as the first run left it -- "untouched
+    services keep serving their vectors; Meta stays honest" (this task's own brief)."""
+    svc_a = _write_service(tmp_path, "a", {"m.py": SRC_ONE_FUNC})
+    svc_b = _write_service(tmp_path, "b", {"n.py": SRC_ONE_FUNC})
+    cfg = _cfg(svc_a, svc_b)
+    staging = Staging(tmp_path / "s.db")
+    _analyze_all(cfg, staging, tmp_path)
+
+    chunk_embed.run(cfg, staging, FakeEmbedder(dim=8))
+    assert staging.get_meta("embed_model") == "fake-8d"
+    b_embedding_before = staging.chunks_for_service("b")[0].embedding
+    assert b_embedding_before is not None
+
+    # --incremental --no-embed: only "a" is named in changed_files, "b" is skipped
+    # entirely by the chunk loop (see run()'s own module docstring) but the embed
+    # phase still runs workspace-wide with embedder=None -- nothing gets embedded.
+    report = chunk_embed.run(cfg, staging, None, changed_files={"a": {"m.py"}})
+    assert report["skipped_no_embedder"] == report["chunks_total"]
+
+    assert staging.get_meta("embed_model") == "fake-8d"  # preserved
+    assert staging.get_meta("embed_dim") == "8"
+    assert staging.chunks_for_service("b")[0].embedding == b_embedding_before  # untouched
 
 
 # ======================================================================================

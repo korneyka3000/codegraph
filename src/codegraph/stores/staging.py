@@ -852,6 +852,31 @@ class Staging:
         )
         return [ChunkRow(*row) for row in cur.fetchall()]
 
+    def has_live_embeddings(self) -> bool:
+        """True iff ANY chunk (any service, workspace-wide) currently carries a real,
+        non-NULL `embedding` blob -- `SELECT EXISTS(...)`, not a `COUNT`, so SQLite can
+        stop at the first matching row instead of scanning the whole table.
+
+        Deliberately coarse -- unlike `chunks_missing_embedding`, this does NOT check
+        `embedded_hash`/`input_hash` freshness or which `embed_model` produced the
+        vector: a STALE-but-present embedding (content/header edited since, not yet
+        re-embedded) still counts as "live" here, because `pipeline/load.py` loads
+        whatever `chunks.embedding` currently holds as-is, regardless of staleness --
+        freshness only ever gates the RE-embedding DECISION (`chunks_missing_
+        embedding`'s own job), never whether an already-stored value gets loaded into
+        the graph at all.
+
+        M5 T7's own consumer: `pipeline.chunk_embed.run`'s embedder-is-None branch
+        reads this to decide whether clearing staging's `embed_model`/`embed_dim` Meta
+        keys is actually honest for THIS run, rather than assuming a full re-chunk
+        alone guarantees no chunk anywhere still has a vector (see that function's own
+        docstring -- `upsert_chunks`' ON-CONFLICT contract can leave a prior run's
+        embedding sitting untouched even after a full re-chunk of unchanged content)."""
+        row = self._db.execute(
+            "SELECT EXISTS(SELECT 1 FROM chunks WHERE embedding IS NOT NULL)"
+        ).fetchone()
+        return bool(row[0])
+
     def set_embeddings(self, rows: list[tuple[str, bytes, str, str]]) -> None:
         """`rows` -- `(chunk_id, embedding_blob, model_id, input_hash)`; `input_hash`
         (M4 T1 -- was `content_hash` through M3 T6, see core/schema.py's

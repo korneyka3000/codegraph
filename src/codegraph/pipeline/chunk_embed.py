@@ -461,36 +461,49 @@ def run(
 
     if embedder is None:
         embedded_fresh, embedded_from_cache, reused, skipped_no_embedder = 0, 0, 0, chunks_total
-        model_meta, dim_meta = "", ""
+        # M5 T7 (resolves the M4 final review MINOR-3 deferral this comment used to
+        # flag): clear Meta's embed_model/embed_dim ONLY when the workspace genuinely
+        # has NO live embedding left ANYWHERE (`Staging.has_live_embeddings` -- a SQL
+        # EXISTS over `chunks.embedding IS NOT NULL`), rather than unconditionally, as
+        # this branch used to. "" (not a missing key) is still the clearing VALUE, not
+        # the trigger -- pipeline.load._embed_meta reads "" back as None, identically
+        # to an absent key, so writing it explicitly still CLEARS whatever a prior run
+        # left behind; what changed is WHETHER that write happens at all.
+        #
+        # Why unconditional-clear was actually wrong, not just imprecise: `--incremental
+        # --no-embed` scopes the chunk loop above to only the services/files that
+        # changed THIS run (see this function's own M4 T6 docstring section) -- an
+        # UNTOUCHED service's chunks are left completely alone and can still carry a
+        # live embedding vector from an EARLIER run that DID have a working embedder.
+        # That vector is still real and still searchable -- but `pipeline/load.py`'s
+        # own `_chunk_node_batches` treats a blank Meta as authoritative and STRIPS
+        # the vector from EVERY chunk being loaded whenever `dim is None` (see its
+        # docstring's "dim is None" bullet), not just the ones that actually lack one.
+        # So the old unconditional clear didn't merely make Meta report a harmless
+        # under-count -- it made a `--incremental --no-embed` run silently discard an
+        # untouched service's still-live vectors from the GRAPH itself on every load.
+        # Untouched services now keep serving their vectors; Meta stays honest.
+        #
+        # A full run (changed_files is None) has no such untouched-service escape
+        # hatch in the common case -- every service's ENTIRE chunk loop reruns from
+        # scratch -- but even then, `upsert_chunks`' own ON-CONFLICT contract
+        # deliberately leaves embedding/embed_model/embedded_hash untouched across a
+        # same-chunk_id re-upsert of unchanged content (see its docstring), so a full
+        # run over an unchanged tree with embedder=None can ALSO leave live embeddings
+        # sitting there. `has_live_embeddings()` answers the real question directly,
+        # from the `chunks` table itself, instead of reasoning indirectly about which
+        # code path ran -- correct for both a full and an `--incremental` run, not
+        # just the flag combination this was originally deferred for.
+        if not staging.has_live_embeddings():
+            staging.set_meta("embed_model", "")
+            staging.set_meta("embed_dim", "")
     else:
         embedded_fresh, embedded_from_cache = _embed_missing(staging, embedder)
         embedded = embedded_fresh + embedded_from_cache
         reused, skipped_no_embedder = chunks_total - embedded, 0
-        model_meta, dim_meta = embedder.model_id, str(embedder.dim)
+        staging.set_meta("embed_model", embedder.model_id)
+        staging.set_meta("embed_dim", str(embedder.dim))
 
-    # "" (not a missing key) for the no-embedder case -- pipeline.load._embed_meta
-    # reads "" back as None, same as absent, but writing it explicitly here CLEARS any
-    # embed_model/dim a PRIOR run left behind. True for a full run (changed_files is
-    # None): every service's ENTIRE chunk loop reruns from scratch, so if THIS run has
-    # no embedder, no chunk in the whole workspace ends up with a live embedding, and
-    # Meta must not keep advertising a stale model/dim that no longer matches anything
-    # in the graph about to be loaded. FALSE under `--incremental --no-embed` (M4
-    # final review, MINOR-3 -- this comment previously claimed it unconditionally):
-    # `changed_files` scopes the chunk loop above to only the services/files that
-    # actually changed this run (see this function's own M4 T6 docstring section) --
-    # an UNTOUCHED service's chunks are left completely alone and can still carry live
-    # embedding vectors from an EARLIER run that DID have an embedder, even while this
-    # run's embedder is None and writes "" here regardless. So Meta can
-    # under-advertise in that specific flag combination (claim "no embeddings
-    # anywhere" while some untouched chunk genuinely still has one) -- the safer
-    # direction to be wrong in for now: a consumer that trusts Meta and skips vector
-    # search entirely still returns correct, merely incomplete, results, whereas the
-    # reverse (advertising a model/dim some chunk's real vector doesn't match) would
-    # not be -- which is why this write stays unconditional here rather than being
-    # made changed_files-aware too. What Meta SHOULD report for `--incremental
-    # --no-embed` specifically is a flag-combo semantics decision deferred to M5.
-    staging.set_meta("embed_model", model_meta)
-    staging.set_meta("embed_dim", dim_meta)
     return {
         "chunks_total": chunks_total,
         "embedded": embedded_fresh + embedded_from_cache,

@@ -355,15 +355,26 @@ def _chunk_node_batches(
       embedding blob. Such stale blobs genuinely exist on this path (reviewer-
       reproduced, M3 T6 coordinator fix): a PRIOR run embedded the workspace, then a
       LATER run against the SAME staging.db degrades to embedder=None --
-      `chunk_embed.run` correctly clears the workspace embed_model/dim meta, but
-      `upsert_chunks`' ON-CONFLICT contract deliberately preserves each unchanged
-      chunk's embedding column (that preservation is what lets a THIRD run, embedder
-      restored, reuse them all -- embedded==0). The pre-fix guard (`dim is not None
-      and len != dim`) waved those stale blobs straight into the vecf32 batch,
-      producing Chunk nodes carrying embedding+embed_model while Meta advertises no
-      model and no vector index exists -- an inconsistent graph. Stale-skipped rows
-      also get `embed_model` dropped from their props (a Chunk advertising a model
-      whose embedding it doesn't carry is the same inconsistency at property
+      `chunk_embed.run` used to clear the workspace embed_model/dim meta
+      UNCONDITIONALLY whenever this run's own embedder was None; M5 T7 narrowed that
+      to "only when `Staging.has_live_embeddings()` is False" (see that function's own
+      docstring). So through the real `chunk_embed.run` -> `load_graph` pipeline,
+      reaching THIS branch with `dim is None` now means no chunk anywhere genuinely
+      still carries a live embedding either -- the "even one whose staging row still
+      holds an embedding blob" scenario THIS bullet exists to guard against is, post-
+      M5-T7, mainly a defense against staging.db states the real pipeline no longer
+      produces (a hand-built/pre-M5-T7 database, or any writer that bypasses
+      `chunk_embed.run`'s own Meta bookkeeping entirely), not the everyday degraded-
+      rerun case it was originally written for. `upsert_chunks`' ON-CONFLICT contract
+      deliberately preserves each unchanged chunk's embedding column regardless
+      (that preservation is what lets a THIRD run, embedder restored, reuse them all
+      -- embedded==0). The pre-fix guard (`dim is not None and len != dim`) waved
+      those stale blobs straight into the vecf32 batch, producing Chunk nodes
+      carrying embedding+embed_model while Meta advertises no model and no vector
+      index exists -- an inconsistent graph.
+      Stale-skipped rows also get `embed_model` dropped from their props (a Chunk
+      advertising a model whose embedding it doesn't carry is the same inconsistency
+      at property
       granularity); ONE summary warning is logged, not one per chunk.
     - `dim` given: a row whose DECODED vector length differs is routed to
       `without_vector` (per-row warning naming the actual cause, plus the same

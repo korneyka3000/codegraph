@@ -18,7 +18,7 @@ from rich.tree import Tree
 from codegraph.config.loader import ConfigError, effective_idioms, load_workspace
 from codegraph.config.models import WorkspaceConfig
 from codegraph.core.errors import CodegraphError
-from codegraph.doctor import run_env_checks, run_store_probes
+from codegraph.doctor import check_chunk_vector_index, run_env_checks, run_store_probes
 from codegraph.embedding.factory import make_embedder
 from codegraph.evalx.retrieval_eval import load_questions, run_questions
 from codegraph.linking.workspace import link_workspace
@@ -186,6 +186,7 @@ def _store_guard(fn):
 @app.command()
 def doctor(
     config: Path | None = typer.Option(None, "--config", "-c"),  # noqa: B008 -- typer marker call, idiomatic
+    graph: str | None = typer.Option(None, "--graph"),
     probe_scip: bool = typer.Option(False, "--probe-scip"),
     skip_store: bool = typer.Option(False, "--skip-store"),
 ) -> None:
@@ -198,9 +199,29 @@ def doctor(
     if not skip_store:
         from codegraph.stores.falkordb.connection import connect
 
+        results = run_store_probes(lambda: connect(cfg.storage.falkordb))
+        # M5 T7 (M3 backlog "no-index marker -> doctor probe"): one more row about the
+        # TARGET workspace graph's OWN vector-index health (`--graph`, same override
+        # convention as stats/load/index/trace/serve via `_resolve_graph_name`) --
+        # appended to the SAME probes list/table, not a separate command-level
+        # concern. Only attempted once every capability probe above is already green
+        # (`all(r.ok for r in results)`): an unreachable/degraded FalkorDB is already
+        # reported by "ping"/etc. above, and `check_chunk_vector_index` has no
+        # try/except of its own -- it trusts a store it can already reach, the same
+        # "connect once, then trust it" contract as this file's other post-connect
+        # sequences (e.g. stats()'s own graph_exists()-then-stats()). A `None` result
+        # (see that function's own docstring -- graph not indexed yet, no embedded
+        # Chunk anywhere, or the index is already there) adds no row at all: only the
+        # genuine "live embeddings, no covering index" gap is worth a line here.
+        if all(r.ok for r in results):
+            graph_name = _resolve_graph_name(cfg, graph)
+            vector_check = check_chunk_vector_index(
+                FalkorStore(cfg.storage.falkordb, graph_name)
+            )
+            if vector_check is not None:
+                results = [*results, vector_check]
         ok &= _render(
-            run_store_probes(lambda: connect(cfg.storage.falkordb)),
-            f"falkordb {cfg.storage.falkordb.host}:{cfg.storage.falkordb.port}",
+            results, f"falkordb {cfg.storage.falkordb.host}:{cfg.storage.falkordb.port}",
         )
     raise typer.Exit(0 if ok else 1)
 
@@ -813,13 +834,12 @@ def eval_retrieval(
     questions_path: Path = typer.Option(  # noqa: B008 -- typer marker call, idiomatic
         _DEFAULT_QUESTIONS, "--questions",
         help=(
-            "golden questions YAML ({question, accept: [{service, symbol}], k} rows, "
-            "see fixtures/golden/questions.yaml). Defaults to codegraph's OWN golden "
-            "questions, bundled inside the package (data/questions.yaml -- works from "
-            "a wheel install too) -- there is no auto-discovered '<workspace>/"
-            "questions.yaml' convention (a real workspace's golden questions are "
-            "necessarily hand-authored against ITS OWN symbols; pass --questions "
-            "explicitly to point at one)."
+            "golden questions YAML ({question, accept: [{service, symbol}], k} rows). "
+            "Defaults to codegraph's OWN golden questions, bundled inside the package "
+            "(data/questions.yaml -- works from a wheel install too) -- there is no "
+            "auto-discovered '<workspace>/questions.yaml' convention (a real "
+            "workspace's golden questions are necessarily hand-authored against ITS "
+            "OWN symbols; pass --questions explicitly to point at one)."
         ),
     ),
     exact: bool = typer.Option(
