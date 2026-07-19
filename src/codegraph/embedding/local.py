@@ -96,7 +96,6 @@ class LocalEmbedder:
             # pair can raise.
             raise CodegraphError(_LOAD_HINT.format(model=model, error=e)) from e
 
-        self.model_id = model
         # M5 T6: instruction prefixes some models (e.g. intfloat/multilingual-e5-*'s
         # canonical "query: "/"passage: ") expect prepended to distinguish a search
         # QUERY from an indexed PASSAGE at encode time -- see EmbeddingConfig's own
@@ -106,6 +105,32 @@ class LocalEmbedder:
         # behavior to before this parameter existed.
         self._query_prefix = query_prefix
         self._passage_prefix = passage_prefix
+        # M5 T6 review fix: non-empty prefixes are folded into model_id, because a
+        # prefixed embedder IS a different embedding function over the same weights
+        # -- same input text, different vectors -- and model_id is the ONE identity
+        # string every downstream freshness/compatibility gate keys on:
+        # `Staging.chunks_missing_embedding`'s embed_model check, the persistent
+        # `embedding_cache`'s `(input_hash, embed_model)` key, and retrieval's
+        # Meta.embed_model-vs-embedder.model_id mismatch gate
+        # (query/retrieval._vector_unusable_reason). `input_hash` deliberately can't
+        # carry this (it hashes header+text BEFORE the prefix layer -- see
+        # chunking/augment.augment_text's own docstring), so a bare-HF model_id
+        # would make "user adds passage_prefix, same model" invisible to every one
+        # of those gates at once: chunks_missing_embedding finds 0 rows and the old
+        # unprefixed vectors keep serving forever, silently -- the exact bug class
+        # M4 T1's input_hash redesign exists to prevent, reintroduced on a new axis.
+        # Format (stable, documented contract): `<model>#q=<query_prefix>#p=
+        # <passage_prefix>`, both slots always rendered when EITHER is non-empty
+        # (so query-only and passage-only configs get distinct ids too); both empty
+        # -> the bare model string, byte-identical to pre-M5-T6 (every existing
+        # workspace's staged rows/cache keys/Meta stay valid, no spurious re-embed
+        # on upgrade). '#' can't collide with a real HF repo id (hub names don't
+        # allow it). Meta/report surfaces show the suffixed id verbatim -- honest,
+        # since it genuinely is a different embedding function.
+        if query_prefix or passage_prefix:
+            self.model_id = f"{model}#q={query_prefix}#p={passage_prefix}"
+        else:
+            self.model_id = model
         # M4 T8: local, CPU/GPU-bound compute (not a network call) -- concurrent
         # Python threads would mostly just serialize on the GIL around whatever isn't
         # already vectorized C/CUDA inside sentence-transformers, with no reliable

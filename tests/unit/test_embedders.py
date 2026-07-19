@@ -426,6 +426,91 @@ def test_local_embedder_embed_batch_empty_list_still_short_circuits(monkeypatch)
     assert captured["model"].calls == []
 
 
+# -- M5 T6 review fix: prefixes fold into model_id (cache-key identity) --
+
+
+def test_local_embedder_prefixes_fold_into_model_id(monkeypatch):
+    """Review Important: model_id IS the cache key everywhere downstream
+    (`chunks_missing_embedding`'s embed_model check, `embedding_cache`'s
+    `(input_hash, embed_model)` key, Meta.embed_model's retrieval-time gate) and
+    `input_hash` (sha256(header+text), chunking/augment.py) never sees the prefix
+    either -- so a bare-HF-string model_id would make a prefix change invisible
+    to EVERY freshness gate at once. Folding non-empty prefixes into model_id
+    canonically routes the change through all of them for free."""
+    from codegraph.embedding.local import LocalEmbedder
+
+    _install_fake_sentence_transformers(monkeypatch)
+    emb = LocalEmbedder("some-model", query_prefix="query: ", passage_prefix="passage: ")
+    assert emb.model_id == "some-model#q=query: #p=passage: "
+
+
+def test_local_embedder_single_nonempty_prefix_also_folds_into_model_id(monkeypatch):
+    # EITHER prefix non-empty changes the embedding function -> both slots always
+    # rendered (the empty one shows as empty), so "only query set" and "only passage
+    # set" get DISTINCT ids from each other and from bare.
+    from codegraph.embedding.local import LocalEmbedder
+
+    _install_fake_sentence_transformers(monkeypatch)
+    q_only = LocalEmbedder("some-model", query_prefix="query: ")
+    p_only = LocalEmbedder("some-model", passage_prefix="passage: ")
+    assert q_only.model_id == "some-model#q=query: #p="
+    assert p_only.model_id == "some-model#q=#p=passage: "
+    assert q_only.model_id != p_only.model_id
+
+
+def test_local_embedder_no_prefixes_model_id_stays_bare_model(monkeypatch):
+    # Both-empty -> byte-identical to the pre-M5-T6 model_id: every existing
+    # workspace's staged embed_model rows, embedding_cache keys and Meta.embed_model
+    # stay valid (no spurious workspace-wide re-embed on upgrade).
+    from codegraph.embedding.local import LocalEmbedder
+
+    _install_fake_sentence_transformers(monkeypatch)
+    emb = LocalEmbedder("jinaai/jina-embeddings-v2-base-code")
+    assert emb.model_id == "jinaai/jina-embeddings-v2-base-code"
+
+
+def test_prefix_change_with_same_model_flags_staged_chunks_for_reembedding(
+    monkeypatch, tmp_path
+):
+    """The review's exact failure scenario, end-to-end at the Staging level:
+    workspace indexed WITHOUT prefixes, then the user adds prefixes per the
+    README's e5 recommendation (same HF model string). `chunks_missing_embedding`
+    keys on embed_model + input_hash and BOTH are prefix-blind -- with a bare-HF
+    model_id, the second run would find 0 rows and serve the old unprefixed
+    vectors forever, silently (the M4-T1 bug class -- embed-input change invisible
+    to the cache key -- reintroduced on a new axis). With prefixes folded into
+    model_id, the stored embed_model no longer matches the new embedder's
+    model_id and every row is correctly flagged."""
+    import hashlib
+
+    from codegraph.chunking.splitter import ChunkRec
+    from codegraph.embedding.local import LocalEmbedder
+    from codegraph.stores.staging import Staging
+
+    _install_fake_sentence_transformers(monkeypatch)
+    bare = LocalEmbedder("some-model")
+    prefixed = LocalEmbedder("some-model", query_prefix="query: ", passage_prefix="passage: ")
+
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("a")
+    text = "def f(): pass"
+    st.upsert_chunks("a", "x.py", [ChunkRec(
+        chunk_id="c1", symbol_id="sym:a:f", ord=0, text=text,
+        start_line=1, end_line=1,
+        content_hash=hashlib.sha256(text.encode()).hexdigest(),
+    )])
+    input_hash = hashlib.sha256(f"header\n\n{text}".encode()).hexdigest()
+    st.set_input_hashes([("c1", input_hash)])
+    # First index run: embedded under the bare (no-prefix) embedder's identity.
+    st.set_embeddings([("c1", b"\x00\x00\x00\x00", bare.model_id, input_hash)])
+    assert st.chunks_missing_embedding(bare.model_id) == []  # fresh under bare id
+
+    # Second run, prefixes added, same HF model: MUST be flagged for re-embedding.
+    flagged = st.chunks_missing_embedding(prefixed.model_id)
+    assert [row.chunk_id for row in flagged] == ["c1"]
+    st.close()
+
+
 def test_make_embedder_openai_missing_key_hint(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     cfg = EmbeddingConfig(provider="openai", model="text-embedding-3-small")

@@ -358,10 +358,23 @@ def augment_text(header: str, chunk_text: str) -> str:
 
     M4 T1: this is ALSO the single source of truth for `input_hash`'s format
     (`sha256(augment_text(header, text))`, see `_input_hash` below) -- the persistent
-    embedding cache's whole cache-key contract rests on this function's output being
-    EXACTLY what gets embedded, so a future change to the header/text join here
-    automatically (and correctly) invalidates every existing cache entry, rather than
-    silently drifting out of sync with a hash built some other way elsewhere."""
+    embedding cache's cache-key contract rests on this function's output being exactly
+    what gets embedded, so a future change to the header/text join here automatically
+    (and correctly) invalidates every existing cache entry, rather than silently
+    drifting out of sync with a hash built some other way elsewhere.
+
+    M5 T6 amendment to that claim: "exactly what gets embedded" is now true only UP TO
+    the embedder's own model-level prefix layer -- `LocalEmbedder` with a non-empty
+    `passage_prefix` (EmbeddingConfig, e.g. e5's canonical "passage: ") prepends that
+    prefix INSIDE `embed_batch`, after this function's output is handed over, and
+    `input_hash` never sees it. That is deliberate, not a gap: the prefix is a
+    property of the EMBEDDER (same prefix for every chunk -- part of what makes a
+    prefixed embedder a different embedding function), not of any one chunk's input,
+    so it's keyed by the OTHER half of the cache key instead: `model_id`
+    (`LocalEmbedder` folds non-empty prefixes into `model_id` -- see its `__init__`'s
+    own comment). The two halves together stay complete: per-chunk input changes flow
+    through `input_hash`, embedder-identity changes (model OR prefix) flow through
+    `embed_model`."""
     return header + "\n\n" + chunk_text
 
 
