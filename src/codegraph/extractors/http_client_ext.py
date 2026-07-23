@@ -98,9 +98,12 @@ the payload would be redundant.
 
 M6 T2 (pilot GAPS §2 gap 1): decorator-SDK mode, a SECOND candidate-discovery mode this
 same extractor supports per-idiom, active whenever `HttpClientIdiom.route_from` is set
-(config/models.py fail-closes `route_from` without `call` at load time -- can't locate
-the call-site otherwise). Real convention that motivated this (camunda-gateway
-app/clients/*.py, class `*Client(BaseClient)`):
+(config/models.py fail-closes the DSL as all-or-nothing, review Important-2:
+`route_from`/`call`/`verb_from` must be set together or not at all -- a partial config
+either can't locate the call-site, can never resolve a verb (zero claims forever), or
+carries silently-inert fields, so every partial cell is a load-time ValidationError).
+Real convention that motivated this (camunda-gateway app/clients/*.py, class
+`*Client(BaseClient)`):
     @path_template("/v1/dmout/user_hv/uuid/{customer_uid}")     # <- route: DECORATOR
     async def get_client_hv_sign(self, customer_uid, **kwargs):
         request = Request(Method.GET, self.host, ...)            # <- verb: enum arg0
@@ -123,8 +126,12 @@ nothing HTTP-shaped, and arg0 is a `Request` object, not a URL. Per-idiom algori
      branch, `{param}`-shaped placeholders passing through untouched as ordinary string
      content (no interpolation to strip, unlike an f-string) -- but a module-const name
      or an f-string decorator arg would resolve too, free, via the identical machinery.
-     No decorator on this method matches, or none resolves to a path -> method skipped
-     entirely (no claim) -- covers "method without decorator -> no claim".
+     No decorator on this method matches BY NAME -> method skipped silently (the idiom
+     simply doesn't apply -- covers "method without decorator -> no claim"); a
+     name-MATCHING decorator whose arg can't be resolved to a path (kwarg-only call,
+     non-string expression, missing arg) -> no claim + `http_route_unresolved` bump
+     (review Important-3: a matched-but-unreadable route is a countable miss, unlike a
+     name mismatch) -- `_decorator_route`'s tri-state return separates the two.
   3. The call-site: `idiom.call`'s `|`-separated alternatives (`_call_alternatives`),
      each a receiver-tail dotted path (e.g. "driver.fetch_content"). `_matches_call_alt`
      compares against a call's OWN full dotted path (`receiver_text` + "." +
@@ -176,11 +183,6 @@ Evidence, in order:
     falsy, so this is not a degraded-but-working path, it is a crash. There is no
     existing "conf-penalty, path-only" matching tier for a null verb; the brief's own
     "null-verb claim with conf-penalty IF SUPPORTED" branch is therefore not available.
-  - `pipeline/analyze.py` never even reads `HttpClientResult.stats` today (only
-    `.claims`, via `staging.add_claims`) -- there is no existing stats -> doctor-row
-    wiring for THIS extractor to piggyback on either, and adding one is a
-    linking/doctor.py change outside this task's file scope (config/models.py +
-    extractors/http_client_ext.py per the brief's own Files list).
   DECISION: when no verb can be found, `_extract_decorator_sdk` emits NO claim at all
   (never `verb=None`) and increments `stats["http_verb_unresolved"]` instead -- the same
   "no claim, dedicated unresolved counter" shape verb-mode already uses for its own
@@ -188,9 +190,17 @@ Evidence, in order:
   `http_call_missing_node_id` (src node missing -> no claim, count it). This keeps
   `http_routes.link` byte-identical (it never sees a null-verb claim to crash on) and
   keeps `HttpCallClaim`'s shape's own invariant intact: every EMITTED claim has a real
-  string verb, exactly as before this task. Wiring `http_verb_unresolved` into an actual
-  `codegraph doctor` row is left as follow-up, consistent with `http_url_unresolved`'s
-  own current status (returned in `.stats`, not yet consumed by analyze.py or doctor.py).
+  string verb, exactly as before this task.
+
+VISIBILITY (M6 T2 review Important-1): `http_url_unresolved`/`http_verb_unresolved`/
+`http_route_unresolved` are no longer stats-dict-only -- pipeline/analyze.py's
+`_extract_join_and_stage` sums them across files (the `imports_external` precedent) and
+both the full and incremental per-service report dicts carry all three (always present,
+0 when this extractor is inactive; the "skipped" report shape predates them and
+report.py reads with `.get(key, 0)`); pipeline/report.py's `print_report` shows a
+yellow "http idiom misses" line whenever any counter is nonzero. `codegraph doctor`
+remains out of the loop by design -- the analyze report dict is the surface these
+belong to, same as `calls_unresolved`.
 """
 
 from __future__ import annotations
@@ -227,8 +237,16 @@ def _stats() -> dict[str, int]:
         # M6 T2: decorator-SDK mode only -- no Request(Method.X, ...) ctor found (or
         # none shaped as expected) inside the method body. See module docstring's "THE
         # NULL-VERB DECISION": no claim is emitted for this method, ever with verb=None;
-        # this counter is the sole record of the miss.
+        # this counter is the record of the miss (surfaced in analyze.py's per-service
+        # report dict, M6 T2 review Important-1).
         "http_verb_unresolved": 0,
+        # M6 T2 review Important-3, decorator-SDK mode only: a decorator whose NAME
+        # matched route_from.decorator was found on a candidate method, but its
+        # route_from.arg-th positional arg could not be resolved to a path (kwarg-only
+        # decorator call, non-string/non-const expression, missing arg, non-"/" value).
+        # A decorator-name MISmatch is deliberately NOT counted -- that is the idiom
+        # simply not matching (correct silence), not a resolution failure.
+        "http_route_unresolved": 0,
     }
 
 
@@ -321,23 +339,36 @@ def _mini_call(dec_text: str) -> CallFact | None:
     return mini.calls[0] if mini.calls else None
 
 
+_ROUTE_ARG_UNRESOLVED = "unresolved"
+
+
 def _decorator_route(
     method: DefFact, route_from: HttpRouteFromSpec, consts: ConstTable,
-) -> tuple[str, str] | None:
+) -> tuple[str, str] | str | None:
     """(path_template, resolution_hint) from the FIRST decorator on `method` whose
     callee name is `route_from.decorator`, resolved through the SAME resolve_arg +
-    _resolve_path pipeline verb-mode's own arg0 URL goes through (see module docstring)
-    -- None if no decorator matches by name, or none resolves to a path-shaped value."""
+    _resolve_path pipeline verb-mode's own arg0 URL goes through (see module docstring).
+    Tri-state return (M6 T2 review Important-3 -- the two failure shapes must be
+    distinguishable because only one of them is a counted miss):
+      - (path, hint)          -- a name-matching decorator resolved to a path.
+      - _ROUTE_ARG_UNRESOLVED -- at least one decorator MATCHED by name, but none of
+                                 the matching ones resolved a path (kwarg-only call,
+                                 non-string arg, missing arg, non-"/" value) -- the
+                                 caller bumps http_route_unresolved.
+      - None                  -- no decorator matched by name at all: the idiom simply
+                                 does not apply to this method (correct silence)."""
+    name_matched = False
     for dec_text in method.decorators:
         call = _mini_call(dec_text)
         if call is None or call.callee_name != route_from.decorator:
             continue
+        name_matched = True
         arg = next((a for a in call.args if a.index == route_from.arg), None)
         resolved = resolve_arg(arg, consts) if arg is not None else Resolved(kind="unresolved")
         path, hint = _resolve_path(resolved)
         if path is not None:
             return path, hint
-    return None
+    return _ROUTE_ARG_UNRESOLVED if name_matched else None
 
 
 def _call_alternatives(call_spec: str) -> list[list[str]]:
@@ -370,7 +401,14 @@ def _find_verb(
     def #`method_idx`, whose own arg0 is an attribute expression "ENUM.VERB" with
     ENUM == verb_from.enum -- returns VERB upper-cased. None if no such call/arg0 shape
     exists anywhere inside the method (see module docstring's "THE NULL-VERB DECISION"
-    for what the caller does then -- NOT a verb=None claim)."""
+    for what the caller does then -- NOT a verb=None claim).
+
+    First-match semantics (M6 T2 review Minor-4): `ctx.facts.calls` is built in AST
+    walk order, so if a method body somehow contains TWO matching `Request(Method.X,
+    ...)` ctors with different verbs, the TEXTUALLY FIRST one wins and the second is
+    never consulted. The pilot convention this mode models builds exactly one Request
+    per method (the whole point of the SDK shape), so this is a documented tiebreak
+    for a degenerate input, not a supported pattern."""
     for call in calls:
         if call.callee_name != verb_from.request_ctor:
             continue
@@ -391,14 +429,14 @@ def _extract_decorator_sdk(
     claims: list[dict], stats: dict[str, int],
 ) -> None:
     """One idiom's worth of decorator-SDK candidates -- see module docstring for the
-    full 5-step algorithm. Precondition (checked by the caller): `idiom.route_from` and
-    `idiom.call` are both set (config/models.py's fail-closed validator guarantees this
-    for any loaded config; a hand-built HttpClientIdiom bypassing that would simply find
-    no candidates -- `_call_alternatives(None)` is never reached because the caller only
-    invokes this when `idiom.route_from is not None`, and route_from implies call at the
-    model level)."""
+    full 5-step algorithm. Precondition: `idiom.route_from`, `idiom.call` AND
+    `idiom.verb_from` are all set -- config/models.py's fail-closed all-or-nothing
+    validator (M6 T2 review Important-2) guarantees this for EVERY HttpClientIdiom
+    instance (pydantic validators run on construction, not just YAML loading), and the
+    caller only dispatches here when `idiom.route_from is not None`."""
     assert idiom.route_from is not None
     assert idiom.call is not None
+    assert idiom.verb_from is not None
     alternatives = _call_alternatives(idiom.call)
 
     for method in ctx.facts.defs:
@@ -409,6 +447,12 @@ def _extract_decorator_sdk(
             continue
         route = _decorator_route(method, idiom.route_from, consts)
         if route is None:
+            continue
+        if route == _ROUTE_ARG_UNRESOLVED:
+            # Important-3: the route decorator itself matched by name, but its arg
+            # couldn't be read -- a real, countable miss (unlike a name mismatch just
+            # above, which is the idiom correctly not applying).
+            stats["http_route_unresolved"] += 1
             continue
         path, resolution_hint = route
 
@@ -425,10 +469,7 @@ def _extract_decorator_sdk(
             continue
         claimed_starts.add(driver_call.callee_start_byte)
 
-        verb = (
-            _find_verb(defs_by_index, ctx.facts.calls, method.index, idiom.verb_from)
-            if idiom.verb_from is not None else None
-        )
+        verb = _find_verb(defs_by_index, ctx.facts.calls, method.index, idiom.verb_from)
         if verb is None:
             stats["http_verb_unresolved"] += 1
             continue

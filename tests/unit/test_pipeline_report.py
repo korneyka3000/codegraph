@@ -304,6 +304,57 @@ def test_print_report_smoke_no_degraded_block_when_absent():
     assert "degraded services" not in text.lower()
 
 
+# -- M6 T2 review Important-1: print_report http idiom failure counters line --
+# Summed straight from report["services"] with .get(key, 0) (same precedent as the
+# fallback_services block: services-list iteration, defensive .get) -- a pre-M6
+# per-service dict without these keys contributes 0 and must never KeyError.
+
+
+def test_print_report_shows_http_idiom_misses_line_when_nonzero():
+    svc_with_misses = {
+        **SERVICE_OK,
+        "http_url_unresolved": 2, "http_verb_unresolved": 1, "http_route_unresolved": 3,
+    }
+    report = build_report([svc_with_misses, SERVICE_DEGRADED], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "http idiom misses" in text
+    assert "url_unresolved = 2" in text
+    assert "verb_unresolved = 1" in text
+    assert "route_unresolved = 3" in text
+
+
+def test_print_report_http_idiom_misses_line_sums_across_services():
+    svc_a = {**SERVICE_OK, "http_verb_unresolved": 1}
+    svc_b = {**SERVICE_DEGRADED, "http_verb_unresolved": 2}
+    report = build_report([svc_a, svc_b], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "verb_unresolved = 3" in text
+
+
+def test_print_report_no_http_idiom_misses_line_when_all_zero():
+    svc = {
+        **SERVICE_OK,
+        "http_url_unresolved": 0, "http_verb_unresolved": 0, "http_route_unresolved": 0,
+    }
+    report = build_report([svc], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    assert "http idiom misses" not in console.export_text()
+
+
+def test_print_report_http_idiom_misses_defaults_when_keys_absent():
+    """SERVICE_OK/SERVICE_DEGRADED (pre-M6 shapes, no http_* keys at all) must not
+    KeyError -- .get(0) makes them contribute nothing and the line stays absent."""
+    report = build_report([SERVICE_OK, SERVICE_DEGRADED], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise
+    assert "http idiom misses" not in console.export_text()
+
+
 # -- M2 T7: print_report linking summary (additive) --
 
 

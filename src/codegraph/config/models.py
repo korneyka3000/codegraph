@@ -139,14 +139,27 @@ class HttpClientIdiom(_Strict):
     verb_from: HttpVerbFromSpec | None = None
 
     @model_validator(mode="after")
-    def _route_from_requires_call(self) -> HttpClientIdiom:
-        # Fail-closed (brief M6 T2): decorator-SDK режим без `call` не может найти сам
-        # HTTP-вызов внутри тела метода (только маршрут) -- бессмысленная/сломанная
-        # конфигурация, отклоняем на загрузке конфига, а не молча эмитим ноль claim'ов.
-        if self.route_from is not None and self.call is None:
-            raise ValueError(
-                "HttpClientIdiom: route_from (decorator-SDK mode) requires call"
-            )
+    def _decorator_sdk_all_or_nothing(self) -> HttpClientIdiom:
+        # Fail-closed matrix (M6 T2 + review Important-2, следуя прецеденту
+        # ConsumerIdiom._kind_requirements): три decorator-SDK поля — всё-или-ничего.
+        # route_from без call — экстрактор не найдёт сам HTTP-вызов; route_from без
+        # verb_from — verb никогда не резолвится, ноль claim'ов навсегда (мёртвый
+        # конфиг, эмпирически доказано ревью); call/verb_from без route_from —
+        # молча-инертные поля, которые verb-режим вовсе не читает. Все частичные
+        # комбинации отклоняются на загрузке конфига, а не деградируют в тишину.
+        if self.route_from is not None:
+            missing = [f for f in ("call", "verb_from") if getattr(self, f) is None]
+            if missing:
+                raise ValueError(
+                    f"HttpClientIdiom: route_from (decorator-SDK mode) requires {missing}"
+                )
+        else:
+            inert = [f for f in ("call", "verb_from") if getattr(self, f) is not None]
+            if inert:
+                raise ValueError(
+                    f"HttpClientIdiom: {inert} are inert without route_from "
+                    "(decorator-SDK mode is all-or-nothing)"
+                )
         return self
 
 

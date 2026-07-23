@@ -12,6 +12,8 @@ from codegraph.config.models import (
     ChannelSpec,
     ConsumerIdiom,
     HttpClientIdiom,
+    HttpRouteFromSpec,
+    HttpVerbFromSpec,
     ProducerIdiom,
     ServiceConfig,
     ServiceIdioms,
@@ -58,6 +60,9 @@ def test_analyze_degraded_report_dict_fields(tmp_path):
     expected_keys = {
         "service", "files", "defs", "refs", "malformed_ranges", "nodes", "edges",
         "imports_external", "calls_joined", "calls_unresolved", "calls_external",
+        # M6 T2 review Important-1: http idiom failure counters are part of every
+        # full/incremental report shape (0 when the http_client extractor never ran).
+        "http_url_unresolved", "http_verb_unresolved", "http_route_unresolved",
         "degraded", "reason", "from_cache",
     }
     assert expected_keys <= report.keys()
@@ -480,6 +485,83 @@ def test_analyze_http_client_active_wires_http_call_claims(tmp_path):
     # "structurally empty besides claims" shape check.
     assert not any(n.roles for n in st.iter_nodes())
     assert not any(e.type == "CALLS_HTTP" for e in st.iter_edges())
+
+
+# -- M6 T2 review Important-1: http idiom failure counters flow into the per-service
+# report dict (hr.stats was dead-on-arrival before: analyze consumed only hr.claims).
+# Aggregated across files inside _extract_join_and_stage (imports_external precedent),
+# then copied into BOTH the full and incremental report shapes.
+
+DECORATOR_SDK_IDIOM = HttpClientIdiom(
+    name="decorator-sdk",
+    file_glob="**/clients/*.py",
+    class_glob="*Client",
+    route_from=HttpRouteFromSpec(decorator="path_template", arg=0),
+    call="driver.fetch_content|driver.fetch",
+    verb_from=HttpVerbFromSpec(request_ctor="Request", enum="Method"),
+)
+
+# One resolvable claim (get_ok) + one verb-unresolvable method (get_noverb: decorator
+# and driver call present, NO Request(Method.X, ...) anywhere in the body).
+_NOVERB_CLIENT_SRC = (
+    "from some_sdk import BaseClient, Method, Request, path_template\n"
+    "\n"
+    "\n"
+    "class DMoutClient(BaseClient):\n"
+    '    @path_template("/v1/ok/{id}")\n'
+    "    async def get_ok(self, id):\n"
+    "        request = Request(Method.GET, self.host)\n"
+    "        return await self.driver.fetch_content(request)\n"
+    "\n"
+    '    @path_template("/v1/noverb/{id}")\n'
+    "    async def get_noverb(self, id):\n"
+    "        return await self.driver.fetch_content(self.host)\n"
+)
+
+
+def _decorator_sdk_service_tree(tmp_path):
+    svc_root = tmp_path / "svc"
+    (svc_root / "app" / "clients").mkdir(parents=True)
+    (svc_root / "app" / "__init__.py").write_text("")
+    (svc_root / "app" / "clients" / "__init__.py").write_text("")
+    (svc_root / "app" / "clients" / "dmout_client.py").write_text(_NOVERB_CLIENT_SRC)
+    return svc_root
+
+
+def test_analyze_full_report_carries_http_idiom_failure_counters(tmp_path):
+    svc = ServiceConfig(name="svc", path=_decorator_sdk_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        idioms=ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]),
+    )
+
+    assert report["http_verb_unresolved"] == 1
+    assert report["http_url_unresolved"] == 0
+    assert report["http_route_unresolved"] == 0
+    # sanity: the resolvable sibling method still produced its claim -- the counter
+    # counts the miss, it does not swallow the file's other hits.
+    claims = st.claims_for("http_call", service="svc")
+    assert len(claims) == 1
+    assert claims[0]["path_template"] == "/v1/ok/{id}"
+
+
+def test_analyze_incremental_report_carries_http_idiom_failure_counters(tmp_path):
+    """Same counters on the INCREMENTAL report shape: first-run incremental (no prior
+    staged files) makes every scanned file `added` -> stale -> extracted, so the same
+    verb-unresolvable method is seen by the same aggregation."""
+    svc = ServiceConfig(name="svc", path=_decorator_sdk_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=False),
+        idioms=ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["http_verb_unresolved"] == 1
+    assert report["http_url_unresolved"] == 0
+    assert report["http_route_unresolved"] == 0
 
 
 # -- M4 T5: incremental analyze_service -- mode tagging, skip precondition,

@@ -224,7 +224,11 @@ def _extract_join_and_stage(
     caller already rewrote defs/refs for the whole service (S4) before calling this.
 
     Returns {"nodes": int, "edges": int, "imports_external": int, "join_stats":
-    JoinStats} -- everything the caller's own report dict still needs to assemble
+    JoinStats, "http_url_unresolved": int, "http_verb_unresolved": int,
+    "http_route_unresolved": int} (the last three: M6 T2 review Important-1 --
+    http_client_ext's per-file failure counters summed across `relpaths`, always
+    present, 0 when http_client is inactive) -- everything the caller's own report
+    dict still needs to assemble
     (service/files/defs/refs/malformed_ranges/degraded/reason/from_cache/mode/
     stale_files are all OUTSIDE this function's concern -- it only ever runs S5/S6
     and reports what THAT did)."""
@@ -247,6 +251,14 @@ def _extract_join_and_stage(
     nodes = [make_service_node(svc.name)]
     edges = []
     imports_external = 0
+    # M6 T2 review Important-1: http_client_ext's failure counters, aggregated across
+    # files exactly like imports_external just above -- before this, hr.stats was
+    # discarded entirely (only hr.claims was consumed), so a decorator-SDK method
+    # whose route/verb couldn't be resolved vanished without a trace. Keys always
+    # present (0 when the extractor is inactive) so both report shapes stay uniform.
+    http_stats = {
+        "http_url_unresolved": 0, "http_verb_unresolved": 0, "http_route_unresolved": 0,
+    }
     domain_roles: dict[str, set[str]] = {}
     domain_node_props: dict[str, dict] = {}
     domain_channels: list[NodeRec] = []
@@ -326,6 +338,8 @@ def _extract_join_and_stage(
                 # http_call: per-file claim, consumed later by S7 (T7) via
                 # staging.claims_for + the cross-service http_route table (CALLS_HTTP).
                 staging.add_claims(svc.name, rp, "http_call", hr.claims)
+                for key in http_stats:
+                    http_stats[key] += hr.stats[key]
 
     if domain_roles or domain_node_props:
         nodes = [_apply_role_props_patch(n, domain_roles, domain_node_props) for n in nodes]
@@ -374,6 +388,7 @@ def _extract_join_and_stage(
         "edges": len(edges),
         "imports_external": imports_external,
         "join_stats": join_stats,
+        **http_stats,
     }
 
 
@@ -446,6 +461,9 @@ def _analyze_full(
         "calls_joined": ej["join_stats"].calls_joined,
         "calls_unresolved": ej["join_stats"].calls_unresolved,
         "calls_external": ej["join_stats"].calls_external,
+        "http_url_unresolved": ej["http_url_unresolved"],
+        "http_verb_unresolved": ej["http_verb_unresolved"],
+        "http_route_unresolved": ej["http_route_unresolved"],
         "degraded": degraded,
         "reason": reason,
         "from_cache": from_cache,
@@ -549,6 +567,9 @@ def _analyze_incremental(
         "calls_joined": ej["join_stats"].calls_joined,
         "calls_unresolved": ej["join_stats"].calls_unresolved,
         "calls_external": ej["join_stats"].calls_external,
+        "http_url_unresolved": ej["http_url_unresolved"],
+        "http_verb_unresolved": ej["http_verb_unresolved"],
+        "http_route_unresolved": ej["http_route_unresolved"],
         "degraded": False,
         "reason": None,
         "from_cache": from_cache,

@@ -180,24 +180,43 @@ def test_http_client_idiom_new_fields_absent_by_default():
     assert idiom.verb_from is None
 
 
-def test_route_from_without_call_is_config_error_fail_closed():
-    """DSL validation fail-closed (brief): route_from without call can locate a path
-    template but never the HTTP call-site itself -- rejected at config-load time."""
+ROUTE_FROM = {"decorator": "path_template", "arg": 0}
+VERB_FROM = {"request_ctor": "Request", "enum": "Method"}
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"route_from": ROUTE_FROM},                                # route alone
+        {"route_from": ROUTE_FROM, "call": "driver.fetch"},        # no verb_from
+        {"route_from": ROUTE_FROM, "verb_from": VERB_FROM},        # no call
+        {"call": "driver.fetch"},                                  # call alone
+        {"verb_from": VERB_FROM},                                  # verb_from alone
+        {"call": "driver.fetch", "verb_from": VERB_FROM},          # both, no route_from
+    ],
+    ids=["route-only", "route+call", "route+verb", "call-only", "verb-only", "call+verb"],
+)
+def test_decorator_sdk_partial_field_matrix_is_config_error_fail_closed(fields):
+    """Fail-closed DSL matrix (M6 T2 review, Important-2): the three decorator-SDK
+    fields are all-or-nothing. route_from without call OR verb_from is a dead-forever
+    config (the extractor can never locate the call-site / never resolve a verb ->
+    zero claims, silently); call/verb_from without route_from are silently-inert
+    fields the verb-mode path never reads. Every partial cell is rejected at
+    config-load time; only all-three (decorator-SDK) or none (verb-mode) validate."""
     with pytest.raises(ValidationError):
-        HttpClientIdiom.model_validate({
-            "name": "decorator-sdk",
-            "route_from": {"decorator": "path_template", "arg": 0},
-        })
+        HttpClientIdiom.model_validate({"name": "decorator-sdk", **fields})
 
 
-def test_route_from_with_call_is_valid():
+def test_decorator_sdk_all_three_fields_is_valid():
     idiom = HttpClientIdiom.model_validate({
         "name": "decorator-sdk",
-        "route_from": {"decorator": "path_template", "arg": 0},
+        "route_from": ROUTE_FROM,
         "call": "driver.fetch_content",
+        "verb_from": VERB_FROM,
     })
     assert idiom.route_from.decorator == "path_template"
     assert idiom.call == "driver.fetch_content"
+    assert idiom.verb_from.request_ctor == "Request"
 
 
 def test_route_from_arg_defaults_to_zero():

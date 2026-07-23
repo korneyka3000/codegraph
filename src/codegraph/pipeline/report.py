@@ -190,6 +190,24 @@ def print_report(report: dict, console: Console) -> None:
         f"{health.get('staged_calls_with_valid_dst_pct', 0.0):.1f}%"
     )
 
+    # M6 T2 review Important-1 (additive): http idiom failure counters, summed straight
+    # from the per-service dicts with .get(key, 0) -- same services-list iteration +
+    # defensive-.get precedent as the fallback_services block below; a pre-M6
+    # per-service dict (no http_* keys at all) contributes 0 and never KeyErrors. Line
+    # only appears when at least one counter is nonzero (same "no noise when clean"
+    # convention as skipped_no_embedder / the degraded block). Yellow: each count is a
+    # would-be http_call claim that silently died inside the http_client extractor
+    # (unresolvable URL arg / route decorator arg / Request verb) -- a coverage
+    # warning, not an error. Plain ints, no foreign text -- no escape() needed.
+    http_url = sum(s.get("http_url_unresolved", 0) for s in report["services"])
+    http_verb = sum(s.get("http_verb_unresolved", 0) for s in report["services"])
+    http_route = sum(s.get("http_route_unresolved", 0) for s in report["services"])
+    if http_url or http_verb or http_route:
+        console.print(
+            f"[yellow]http idiom misses: url_unresolved = {http_url}, "
+            f"verb_unresolved = {http_verb}, route_unresolved = {http_route}[/]"
+        )
+
     degraded_services = health.get("degraded_services", [])
     if degraded_services:
         detail = ", ".join(

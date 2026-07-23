@@ -642,6 +642,39 @@ def test_decorator_sdk_no_matching_call_site_produces_no_claim():
     assert result.claims == []
 
 
+ROUTE_ARG_UNRESOLVABLE_SRC = b'''from some_sdk import BaseClient, Method, Request, path_template
+
+
+class KwargRouteClient(BaseClient):
+    @path_template(template="/v1/kwargroute/{id}")
+    async def get_kw(self, id):
+        request = Request(Method.GET, self.host)
+        return await self.driver.fetch_content(request)
+
+    @path_template(some_object)
+    async def get_nonstring(self, id):
+        request = Request(Method.GET, self.host)
+        return await self.driver.fetch_content(request)
+'''
+
+
+def test_decorator_sdk_route_arg_unresolvable_counts_no_claim():
+    """M6 T2 review Important-3: the route decorator NAME matches, but its
+    route_from.arg-th positional arg is unresolvable (passed as a KWARG on the first
+    method -- positional arg0 absent entirely; a non-string/non-const name on the
+    second) -> no claim AND a dedicated http_route_unresolved bump per method, so the
+    miss is visible, not silent. (A non-matching decorator NAME stays correctly
+    silent -- that's the idiom simply not matching, pinned separately below.)"""
+    ctx, node_ids, consts = _load(
+        "app/clients/kwargroute_client.py", "svc", ROUTE_ARG_UNRESOLVABLE_SRC,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]), consts,
+    )
+    assert result.claims == []
+    assert result.stats["http_route_unresolved"] == 2
+
+
 WRONG_DECORATOR_NAME_SRC = b'''from some_sdk import BaseClient, Method, Request, other_decorator
 
 
@@ -656,7 +689,10 @@ class WrongDecoratorClient(BaseClient):
 def test_decorator_sdk_non_matching_decorator_name_produces_no_claim():
     """Decorated, but with a DIFFERENT decorator than route_from.decorator names -- must
     not be mistaken for a route (distinct from the "zero decorators" case above: this
-    one actually exercises the callee-name comparison inside _decorator_route)."""
+    one actually exercises the callee-name comparison inside _decorator_route). Review
+    Important-3 scoping: a name mismatch is the idiom correctly NOT matching -- no
+    http_route_unresolved bump for it, unlike the matched-name-unresolvable-arg case
+    just above."""
     ctx, node_ids, consts = _load(
         "app/clients/wrongdec_client.py", "svc", WRONG_DECORATOR_NAME_SRC,
     )
@@ -664,6 +700,7 @@ def test_decorator_sdk_non_matching_decorator_name_produces_no_claim():
         ctx, node_ids, ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]), consts,
     )
     assert result.claims == []
+    assert result.stats["http_route_unresolved"] == 0
 
 
 def test_decorator_sdk_class_outside_class_glob_is_empty():
@@ -697,6 +734,7 @@ def test_verb_mode_idiom_without_route_from_is_unaffected_byte_identical():
     )
     assert len(result.claims) == 2
     assert result.stats["http_verb_unresolved"] == 0
+    assert result.stats["http_route_unresolved"] == 0
 
 
 def test_real_effective_idioms_custom_sdk_shadows_builtin_base_url_env():
