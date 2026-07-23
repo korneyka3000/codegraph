@@ -371,6 +371,31 @@ def test_registry_source_takes_priority_over_env_map_when_both_could_resolve(tmp
     assert len(edges) == 1 and edges[0].dst == real.id
 
 
+def test_malformed_env_sources_file_does_not_crash_link(tmp_path):
+    """M7 T3 review Important-1 (link-level pin, complements test_env_map.py's own
+    build-level one): env_map.build_env_service_map is called INSIDE link() -- i.e.
+    deep in S7, after every service's expensive analyze already ran -- so a malformed
+    env_sources file (the realistic shape: an UNRENDERED helm template, invalid YAML)
+    crashing there would lose the whole index run at its last stage. It must instead
+    be skipped (warn-and-continue inside env_map.py) with link() completing normally;
+    anchoring that never needed the env_map (tier 1(a) registry, here) stays
+    byte-identical."""
+    bad = tmp_path / "bad-values.yaml"
+    bad.write_text("SERVICE_X_URL: {{ .Values.host }}\n")
+    st = Staging(tmp_path / "s.db")
+    chan = _route_channel("service-b", "GET", "/x")
+    st.upsert_nodes([chan])
+    _claim(st, "caller", "a.py", "sym:caller:f", "GET", "/x", base_url_env="B_URL")
+
+    cfg = _cfg(_svc("service-b", "B_URL"), env_sources=[bad])
+    stats = http_routes.link(cfg, st)
+
+    assert stats == {"calls_http": 1, "calls_http_unresolved": 0}
+    edges = [e for e in st.iter_edges() if e.type == "CALLS_HTTP"]
+    assert len(edges) == 1 and edges[0].dst == chan.id
+    assert edges[0].resolution == "static" and edges[0].confidence == 1.0
+
+
 def test_env_map_hostname_label_not_a_workspace_service_falls_to_unmapped(tmp_path):
     """env_map resolves a hostname label, but the label ISN'T any configured
     workspace service name -- tier 2 (unmapped), not a silent guess."""

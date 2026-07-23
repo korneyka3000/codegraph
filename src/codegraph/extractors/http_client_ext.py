@@ -385,7 +385,27 @@ def _self_attr_env(
     None whenever no matching assignment exists in this class at all, its RHS isn't
     a plain dotted-chain/bare-name, or the join misses/collides -- "no auto-anchor"
     is a perfectly normal, tested outcome (claim stays unanchored, honest), never a
-    guess."""
+    guess.
+
+    TRACKED LIMITATION (M7 T3 review Important-2) -- inherited self.<host_attr>:
+    real client hierarchies often assign the host in a SHARED base ctor (`class
+    StepsClient(BaseClient)` where only BaseClient's `__init__` does `self.host =
+    config...` -- the OPEN R1 pilot's own real shape). This lookup performs NO
+    inheritance walk AT ALL: an assignment anchors a claim only when its own
+    enclosing class IS the claim's matched class (the `owner.index != cls.index`
+    check below -- DefFact identity, not name/base_exprs), so a base class's
+    assignment is excluded even when the base is defined in the SAME file.
+    Resolving it would need the service-wide class hierarchy (base_exprs give only
+    base-name TEXT, possibly defined in another file entirely) plus MRO walking --
+    the identical, deliberately-out-of-scope reasoning class_attrs.py's own
+    inherited-model_config TRACKED LIMITATION already documents (M7 T1 review
+    Important-3). A subclass whose own body has no `self.<host_attr>` assignment
+    therefore auto-anchors to None, honestly -- never a guessed anchor -- and its
+    claims stay unanchored (linking/http_routes.py tier 3: heuristic/0.7 at best,
+    unique-match required, never a false static/1.0). Pinned by
+    test_tracked_limitation_base_class_self_host_assign_not_seen. Workaround for
+    real codebases: explicit `base_url: {env: ...}` (or `{settings: ...}`) on the
+    idiom -- explicit config bypasses this lookup entirely."""
     if class_attr_index is None:
         return None
     for fact in self_attr_assigns:

@@ -28,22 +28,34 @@ from "verification-requests.kyc.svc.cluster.local") is looked up by EXACT string
 equality against the caller-given `service_names` set -- NO fuzzy matching (a near-miss
 is honestly absent from the resulting map, never guessed at) -- `.hostname` (unlike
 `.netloc`) is already lowercased and port-stripped by `urlparse` itself, so no manual
-cleanup is needed for either.
+cleanup is needed for either. One `urlparse` quirk worth naming (M7 T3 review Minor-4):
+a SCHEME-LESS `host:port` value (e.g. `verification-requests.kyc:8000`, no `http://`)
+parses with `hostname=None` (the text before ":" reads as a URL *scheme*, not a host),
+so such values are silently absent from the map -- a safe degradation (the claim just
+stays unanchored/unmapped, never mis-anchored).
 
 Defensive at read time (unlike `config/loader.py`'s own load-time validation of
 `env_sources` path existence, which is the PRIMARY, loud-failure guard for a real
-`codegraph index` run): a missing file here is silently skipped, not a crash -- this
-keeps `build_env_service_map` safely callable from unit tests (and any future in-memory
-caller) that construct a `WorkspaceConfig` directly, bypassing `config/loader.py`'s own
-validation entirely.
+`codegraph index` run): a missing file here is silently skipped, and a file with
+MALFORMED YAML (M7 T3 review Important-1 -- the realistic shape is an UNRENDERED helm
+template: `{{ .Values.host }}` is invalid YAML) is skipped with a `logger.warning`
+naming the file and the parse error, not a crash -- `build_env_service_map` runs
+INSIDE S7's `link()`, i.e. AFTER every service's expensive analyze work has already
+completed, so an uncaught parse error here would lose the whole index run at its very
+last stage over one bad optional-input file. This also keeps the function safely
+callable from unit tests (and any future in-memory caller) that construct a
+`WorkspaceConfig` directly, bypassing `config/loader.py`'s own validation entirely.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from urllib.parse import urlparse
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def _walk_strings(node: object) -> list[tuple[str, str]]:
@@ -82,13 +94,20 @@ def build_env_service_map(env_sources: list[Path], service_names: set[str]) -> d
     name in `service_names`. Files are read in list order; a key harvested from a
     LATER file overwrites an earlier one on collision (plain dict-assignment
     last-wins, same "later claim wins" precedent `class_attrs.build_class_attr_index`
-    already established for its own claim-merge). A missing file is silently skipped
-    (see module docstring's own "defensive at read time" note)."""
+    already established for its own claim-merge). A missing file is silently skipped;
+    a malformed-YAML file is skipped with a warning (see module docstring's own
+    "defensive at read time" note for both)."""
     result: dict[str, str] = {}
     for path in env_sources:
         if not path.is_file():
             continue
-        data = yaml.safe_load(path.read_text()) or {}
+        try:
+            data = yaml.safe_load(path.read_text()) or {}
+        except yaml.YAMLError as e:
+            # M7 T3 review Important-1: warn-and-skip (stores/falkordb/batch.py's own
+            # "skipping bad row" logger.warning precedent) -- see module docstring.
+            logger.warning("env_sources: skipping malformed YAML %s: %s", path, e)
+            continue
         for key, value in _walk_strings(data):
             label = _hostname_label(value)
             if label is not None and label in service_names:

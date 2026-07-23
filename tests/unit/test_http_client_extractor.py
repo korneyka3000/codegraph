@@ -926,6 +926,45 @@ def test_no_class_attr_index_wired_no_auto_anchor_gracefully():
     assert result.claims[0]["base_url_env"] is None
 
 
+BASE_ASSIGNS_SUBCLASS_CALLS_SRC = b'''import aiohttp
+
+
+class BaseClient:
+    def __init__(self, config):
+        self.host = config.services.verification_requests_url
+
+
+class StepsClient(BaseClient):
+    async def get_step(self, step_uid):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self.host}/api/v1/steps/{step_uid}") as resp:
+                return await resp.json()
+'''
+
+
+def test_tracked_limitation_base_class_self_host_assign_not_seen():
+    """TRACKED LIMITATION pin (M7 T3 review Important-2, see _self_attr_env's own
+    docstring): `self.host` is assigned in the BASE class's ctor -- the OPEN R1
+    pilot's own real shape (a shared BaseClient owns the assignment) -- while the
+    HTTP call sits in the subclass. Auto-anchor performs NO inheritance walk at all:
+    ownership is checked by DefFact identity against the claim's own matched class,
+    so the base's assignment is excluded EVEN when the base is defined in the SAME
+    file (as here -- BaseClient also matches the *Client glob, making this the
+    strongest form of the pin: the assigning class is in scope for the IDIOM, just
+    not the class that owns the claim). The claim stays honestly unanchored --
+    never a guessed anchor. Workaround for real codebases: explicit
+    `base_url: {env: ...}` (or `{settings: ...}`) on the idiom."""
+    ctx, node_ids, consts = _load(
+        "app/clients/baseassign_client.py", "svc", BASE_ASSIGNS_SUBCLASS_CALLS_SRC,
+        class_attr_index=AUTO_ANCHOR_INDEX,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[AIOHTTP_CLIENT_BUILTIN_IDIOM]), consts,
+    )
+    assert len(result.claims) == 1  # the subclass's own call still claims fine
+    assert result.claims[0]["base_url_env"] is None
+
+
 CUSTOM_HOST_ATTR_SRC = b'''import aiohttp
 
 

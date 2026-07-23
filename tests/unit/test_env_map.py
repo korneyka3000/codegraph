@@ -15,6 +15,7 @@ matching, an unmatched label is honestly absent from the map, never guessed.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from codegraph.linking.env_map import build_env_service_map
@@ -126,3 +127,25 @@ def test_missing_file_skipped_defensively(tmp_path):
 def test_empty_yaml_file_yields_empty_map(tmp_path):
     p = _write(tmp_path, "empty.yaml", "")
     assert build_env_service_map([p], {"svc"}) == {}
+
+
+def test_malformed_yaml_file_skipped_with_warning_others_still_contribute(tmp_path, caplog):
+    """M7 T3 review Important-1: a malformed env_sources file (the REALISTIC shape:
+    an UNRENDERED helm template -- `{{ .Values.host }}` is invalid YAML, raising
+    yaml.YAMLError on load) must NOT crash -- before this fix it propagated uncaught
+    out of build_env_service_map, i.e. deep inside S7's link() AFTER all the
+    expensive per-service scip/analyze work, contradicting this module's own
+    "defensive at read time" contract (the missing-file precedent right next to it).
+    Now: skip the file, warn (logger.warning, path + error visible), and keep every
+    OTHER file's contribution intact."""
+    bad = _write(tmp_path, "bad.yaml", "SERVICE_X_URL: {{ .Values.host }}\n")
+    good = _write(
+        tmp_path, "good.yaml", 'SERVICE_Y_URL: "http://y-service.ns.svc.cluster.local"\n',
+    )
+    with caplog.at_level(logging.WARNING, logger="codegraph.linking.env_map"):
+        result = build_env_service_map([bad, good], {"x-service", "y-service"})
+
+    assert result == {"SERVICE_Y_URL": "y-service"}
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "bad.yaml" in warnings[0].getMessage()
