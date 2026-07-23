@@ -95,6 +95,102 @@ embedded in the payload dict itself. `evidence_line` is a bare int (`call.start_
 -- because `claims_for()` already injects `_relpath` from the claims table's own
 `relpath` column at read time (see `Staging.claims_for`), so a duplicate relpath inside
 the payload would be redundant.
+
+M6 T2 (pilot GAPS §2 gap 1): decorator-SDK mode, a SECOND candidate-discovery mode this
+same extractor supports per-idiom, active whenever `HttpClientIdiom.route_from` is set
+(config/models.py fail-closes `route_from` without `call` at load time -- can't locate
+the call-site otherwise). Real convention that motivated this (camunda-gateway
+app/clients/*.py, class `*Client(BaseClient)`):
+    @path_template("/v1/dmout/user_hv/uuid/{customer_uid}")     # <- route: DECORATOR
+    async def get_client_hv_sign(self, customer_uid, **kwargs):
+        request = Request(Method.GET, self.host, ...)            # <- verb: enum arg0
+        return await self.driver.fetch_content(request, ...)     # <- the CALL itself
+None of verb-mode's own gating applies here at all (`_is_candidate_call`'s `_VERBS`
+membership, `_resolve_path`'s arg0-is-a-URL assumption) -- `fetch_content`/`fetch` name
+nothing HTTP-shaped, and arg0 is a `Request` object, not a URL. Per-idiom algorithm
+(`_extract_decorator_sdk`), driven off `ctx.facts.defs` (methods) rather than
+`ctx.facts.calls` (call-sites) as the outer loop, unlike verb-mode:
+  1. Every `function` DefFact with a non-empty `.decorators`, whose nearest class
+     ancestor matches `idiom.class_glob` (file_glob already gates the whole idiom, same
+     as verb-mode).
+  2. `_decorator_route`: mini-parse (`_mini_call`, ports fastapi_ext.py's own
+     `_mini_call` precedent -- decorators are never real CallFacts, see facts.py's
+     decorated_definition handling) each decorator string looking for one whose callee
+     name is `route_from.decorator`; its `route_from.arg`-th positional arg is resolved
+     through the SAME `resolve_arg` + `_resolve_path` pipeline verb-mode's own arg0 URL
+     goes through (module docstring above) -- a plain string literal (the overwhelming
+     common case: `@path_template("/v1/...")`) resolves via the "value, starts with /"
+     branch, `{param}`-shaped placeholders passing through untouched as ordinary string
+     content (no interpolation to strip, unlike an f-string) -- but a module-const name
+     or an f-string decorator arg would resolve too, free, via the identical machinery.
+     No decorator on this method matches, or none resolves to a path -> method skipped
+     entirely (no claim) -- covers "method without decorator -> no claim".
+  3. The call-site: `idiom.call`'s `|`-separated alternatives (`_call_alternatives`),
+     each a receiver-tail dotted path (e.g. "driver.fetch_content"). `_matches_call_alt`
+     compares against a call's OWN full dotted path (`receiver_text` + "." +
+     `callee_name`, e.g. "self.driver.fetch_content") by SUFFIX on "."-segments, so the
+     alt need not spell out `self` (or any deeper prefix a real SDK might have, e.g.
+     "self._impl.driver.fetch_content" -- the tail still matches "driver.fetch_content")
+     -- but the segment immediately preceding the callee must match literally, which is
+     exactly why "self.other.fetch_content" does NOT match the "driver.fetch_content"
+     alternative even though the callee name alone coincides. Candidates are narrowed to
+     calls textually nested anywhere inside the decorated method (`_is_within_def`, a
+     DefFact.parent walk from the call's own enclosing_def up to the method's index --
+     handles a call sitting in a nested closure inside the method too, though no fixture
+     here actually nests one). No call-site matches -> method skipped, no claim (the
+     decorator alone is not sufficient evidence of an HTTP call).
+  4. Verb: `_find_verb` scans `ctx.facts.calls` for a call to `verb_from.request_ctor`
+     (e.g. "Request") nested inside the SAME method (`_is_within_def` again), whose
+     OWN arg0 is an attribute expression -- `enum_part.rpartition(".")` splits e.g.
+     "Method.GET" into ("Method", "GET"); the enum_part must equal `verb_from.enum`
+     exactly. See "the null-verb decision" below for what happens when no such call, or
+     no such arg0 shape, is found anywhere in the method.
+  5. Claim emission mirrors verb-mode's own `_emit_claim` exactly in SHAPE (same six
+     keys, same base_url_env/evidence_line semantics -- `evidence_line` is the DRIVER
+     call's own `start_line`, i.e. where the actual network call happens, not the
+     decorator's or the Request-ctor's line) and in the missing-node-id defensive stat.
+
+Cross-idiom dedup: the driver call-site's OWN `callee_start_byte` is added to the SAME
+`claimed_starts` set verb-mode idioms populate, at the SAME point in the control flow
+(right after the call-site is found to match, before path/verb resolution is even
+attempted) -- an idiom that matches a call structurally (route decorator + call-site
+alternative) claims it permanently against later idioms in list order, exactly mirroring
+verb-mode's own "matched the scope gates, even if resolution then fails, still claims
+the byte" convention (see `_emit_claim`'s own call sites in the unmodified verb-mode loop
+below) -- kept consistent so a workspace mixing a decorator-SDK idiom and a verb-mode
+idiom over overlapping globs still dedups by one single, uniform rule.
+
+THE NULL-VERB DECISION (M6 T2 brief explicitly asks this be read from the code and
+documented, not assumed): read `linking/http_routes.py` before deciding whether a
+"verb=null" claim could ride the existing S7 path/unresolved-Channel machinery.
+Evidence, in order:
+  - `http_routes._candidates` filters `r.method == claim["verb"]`; every STAGED route's
+    `method` is always a real non-empty string (fastapi_ext.py always uppercases a real
+    HTTP verb into `props["http_method"]`) -- `r.method == None` can therefore never be
+    True. A verb=None claim would thus NEVER find a candidate route, unconditionally,
+    regardless of how well its path_template happens to match -- it always falls to the
+    "no candidates" branch.
+  - That branch (`_unresolved_channel_and_edge`) calls `core.schema.make_channel_node(
+    "http_route", method=claim["verb"], ...)`, and `make_channel_node` RAISES
+    `ValueError("... requires method and template")` whenever `not method` -- `None` is
+    falsy, so this is not a degraded-but-working path, it is a crash. There is no
+    existing "conf-penalty, path-only" matching tier for a null verb; the brief's own
+    "null-verb claim with conf-penalty IF SUPPORTED" branch is therefore not available.
+  - `pipeline/analyze.py` never even reads `HttpClientResult.stats` today (only
+    `.claims`, via `staging.add_claims`) -- there is no existing stats -> doctor-row
+    wiring for THIS extractor to piggyback on either, and adding one is a
+    linking/doctor.py change outside this task's file scope (config/models.py +
+    extractors/http_client_ext.py per the brief's own Files list).
+  DECISION: when no verb can be found, `_extract_decorator_sdk` emits NO claim at all
+  (never `verb=None`) and increments `stats["http_verb_unresolved"]` instead -- the same
+  "no claim, dedicated unresolved counter" shape verb-mode already uses for its own
+  `http_url_unresolved` (path can't be resolved -> no claim, count it) and
+  `http_call_missing_node_id` (src node missing -> no claim, count it). This keeps
+  `http_routes.link` byte-identical (it never sees a null-verb claim to crash on) and
+  keeps `HttpCallClaim`'s shape's own invariant intact: every EMITTED claim has a real
+  string verb, exactly as before this task. Wiring `http_verb_unresolved` into an actual
+  `codegraph doctor` row is left as follow-up, consistent with `http_url_unresolved`'s
+  own current status (returned in `.stats`, not yet consumed by analyze.py or doctor.py).
 """
 
 from __future__ import annotations
@@ -102,9 +198,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 
-from codegraph.config.models import HttpClientIdiom, ServiceIdioms
+from codegraph.config.models import (
+    HttpClientIdiom,
+    HttpRouteFromSpec,
+    HttpVerbFromSpec,
+    ServiceIdioms,
+)
 from codegraph.parsing.consts import ConstTable, Resolved, resolve_arg
-from codegraph.parsing.facts import CallFact, DefFact
+from codegraph.parsing.facts import CallFact, DefFact, build_file_facts
 
 from .base import FileContext
 
@@ -123,6 +224,11 @@ def _stats() -> dict[str, int]:
         "http_calls_resolved": 0,
         "http_url_unresolved": 0,
         "http_call_missing_node_id": 0,
+        # M6 T2: decorator-SDK mode only -- no Request(Method.X, ...) ctor found (or
+        # none shaped as expected) inside the method body. See module docstring's "THE
+        # NULL-VERB DECISION": no claim is emitted for this method, ever with verb=None;
+        # this counter is the sole record of the miss.
+        "http_verb_unresolved": 0,
     }
 
 
@@ -173,6 +279,176 @@ def _resolve_path(resolved: Resolved) -> tuple[str | None, str]:
     return None, ""
 
 
+# -- M6 T2: decorator-SDK mode helpers (route_from/call/verb_from) ------------------
+
+
+def _enclosing_class(defs_by_index: dict[int, DefFact], d: DefFact) -> DefFact | None:
+    """Nearest class ancestor of `d` itself (as opposed to `_enclosing_method_and_class`,
+    which starts from a CALL's enclosing def) -- walks DefFact.parent upward from `d`."""
+    idx = d.parent
+    while idx is not None:
+        parent = defs_by_index.get(idx)
+        if parent is None:
+            return None
+        if parent.kind == "class":
+            return parent
+        idx = parent.parent
+    return None
+
+
+def _is_within_def(defs_by_index: dict[int, DefFact], call: CallFact, target_idx: int) -> bool:
+    """True if `call` sits anywhere inside def #`target_idx`'s body -- directly, or
+    nested through any number of intervening function defs (closures), by walking
+    DefFact.parent upward from `call.enclosing_def` looking for `target_idx`."""
+    idx = call.enclosing_def
+    while idx is not None:
+        if idx == target_idx:
+            return True
+        d = defs_by_index.get(idx)
+        if d is None:
+            return False
+        idx = d.parent
+    return False
+
+
+def _mini_call(dec_text: str) -> CallFact | None:
+    """Re-parses one decorator's raw text as a standalone snippet to get a real
+    CallFact with `.args` -- ports fastapi_ext.py's own `_mini_call` (decorators are
+    never visited as CallFacts by build_file_facts: the decorator expression lives
+    outside `body`, see facts.py's decorated_definition handling). A bare/non-call
+    decorator (e.g. "staticmethod") mini-parses to zero calls -> None."""
+    mini = build_file_facts("<decorator>", dec_text.encode("utf-8") + b"\n")
+    return mini.calls[0] if mini.calls else None
+
+
+def _decorator_route(
+    method: DefFact, route_from: HttpRouteFromSpec, consts: ConstTable,
+) -> tuple[str, str] | None:
+    """(path_template, resolution_hint) from the FIRST decorator on `method` whose
+    callee name is `route_from.decorator`, resolved through the SAME resolve_arg +
+    _resolve_path pipeline verb-mode's own arg0 URL goes through (see module docstring)
+    -- None if no decorator matches by name, or none resolves to a path-shaped value."""
+    for dec_text in method.decorators:
+        call = _mini_call(dec_text)
+        if call is None or call.callee_name != route_from.decorator:
+            continue
+        arg = next((a for a in call.args if a.index == route_from.arg), None)
+        resolved = resolve_arg(arg, consts) if arg is not None else Resolved(kind="unresolved")
+        path, hint = _resolve_path(resolved)
+        if path is not None:
+            return path, hint
+    return None
+
+
+def _call_alternatives(call_spec: str) -> list[list[str]]:
+    """"driver.fetch_content|driver.fetch" -> [["driver", "fetch_content"], ["driver", "fetch"]]."""
+    return [alt.split(".") for alt in call_spec.split("|")]
+
+
+def _full_call_path(call: CallFact) -> list[str]:
+    """Full dotted receiver+callee path, e.g. "self.driver" + "fetch_content" ->
+    ["self", "driver", "fetch_content"]; a receiver-less call contributes just
+    [callee_name]."""
+    receiver_segments = call.receiver_text.split(".") if call.receiver_text else []
+    return [*receiver_segments, call.callee_name]
+
+
+def _matches_call_alt(call: CallFact, alternatives: list[list[str]]) -> bool:
+    """True if `call`'s full dotted path ENDS WITH any alternative's segments, aligned
+    on "."-boundaries -- e.g. ["self", "driver", "fetch_content"] matches alternative
+    ["driver", "fetch_content"] (tail of 2), but NOT ["self", "other", "fetch_content"]
+    (the segment right before the callee name differs: other != driver)."""
+    path = _full_call_path(call)
+    return any(len(alt) <= len(path) and path[len(path) - len(alt):] == alt for alt in alternatives)
+
+
+def _find_verb(
+    defs_by_index: dict[int, DefFact], calls: list[CallFact], method_idx: int,
+    verb_from: HttpVerbFromSpec,
+) -> str | None:
+    """Scans ALL calls in the file for one to `verb_from.request_ctor` nested inside
+    def #`method_idx`, whose own arg0 is an attribute expression "ENUM.VERB" with
+    ENUM == verb_from.enum -- returns VERB upper-cased. None if no such call/arg0 shape
+    exists anywhere inside the method (see module docstring's "THE NULL-VERB DECISION"
+    for what the caller does then -- NOT a verb=None claim)."""
+    for call in calls:
+        if call.callee_name != verb_from.request_ctor:
+            continue
+        if not _is_within_def(defs_by_index, call, method_idx):
+            continue
+        arg0 = next((a for a in call.args if a.index == 0), None)
+        if arg0 is None or arg0.value_kind != "attr":
+            continue
+        enum_part, sep, verb_part = arg0.text.rpartition(".")
+        if sep and enum_part == verb_from.enum and verb_part:
+            return verb_part.upper()
+    return None
+
+
+def _extract_decorator_sdk(
+    ctx: FileContext, idiom: HttpClientIdiom, defs_by_index: dict[int, DefFact],
+    node_ids: dict[int, str], consts: ConstTable, claimed_starts: set[int],
+    claims: list[dict], stats: dict[str, int],
+) -> None:
+    """One idiom's worth of decorator-SDK candidates -- see module docstring for the
+    full 5-step algorithm. Precondition (checked by the caller): `idiom.route_from` and
+    `idiom.call` are both set (config/models.py's fail-closed validator guarantees this
+    for any loaded config; a hand-built HttpClientIdiom bypassing that would simply find
+    no candidates -- `_call_alternatives(None)` is never reached because the caller only
+    invokes this when `idiom.route_from is not None`, and route_from implies call at the
+    model level)."""
+    assert idiom.route_from is not None
+    assert idiom.call is not None
+    alternatives = _call_alternatives(idiom.call)
+
+    for method in ctx.facts.defs:
+        if method.kind != "function" or not method.decorators:
+            continue
+        cls = _enclosing_class(defs_by_index, method)
+        if cls is None or not fnmatchcase(cls.name, idiom.class_glob):
+            continue
+        route = _decorator_route(method, idiom.route_from, consts)
+        if route is None:
+            continue
+        path, resolution_hint = route
+
+        driver_call = next(
+            (
+                c for c in ctx.facts.calls
+                if c.callee_start_byte not in claimed_starts
+                and _is_within_def(defs_by_index, c, method.index)
+                and _matches_call_alt(c, alternatives)
+            ),
+            None,
+        )
+        if driver_call is None:
+            continue
+        claimed_starts.add(driver_call.callee_start_byte)
+
+        verb = (
+            _find_verb(defs_by_index, ctx.facts.calls, method.index, idiom.verb_from)
+            if idiom.verb_from is not None else None
+        )
+        if verb is None:
+            stats["http_verb_unresolved"] += 1
+            continue
+
+        method_id = node_ids.get(method.index)
+        if method_id is None:
+            stats["http_call_missing_node_id"] += 1
+            continue
+
+        claims.append({
+            "src_id": method_id,
+            "verb": verb,
+            "path_template": path,
+            "base_url_env": idiom.base_url.env if idiom.base_url else None,
+            "resolution_hint": resolution_hint,
+            "evidence_line": driver_call.start_line,
+        })
+        stats["http_calls_resolved"] += 1
+
+
 def _emit_claim(
     idiom: HttpClientIdiom, call: CallFact, method: DefFact, node_ids: dict[int, str],
     consts: ConstTable, claims: list[dict], stats: dict[str, int],
@@ -211,6 +487,14 @@ def extract_http_client(
 
     for idiom in idioms.http_clients:
         if not fnmatchcase(ctx.relpath, idiom.file_glob):
+            continue
+        if idiom.route_from is not None:
+            # M6 T2: decorator-SDK mode -- entirely separate candidate discovery (defs,
+            # not calls, drive the outer loop); see module docstring. config/models.py
+            # fail-closes route_from without call, so idiom.call is never None here.
+            _extract_decorator_sdk(
+                ctx, idiom, defs_by_index, node_ids, consts, claimed_starts, claims, stats,
+            )
             continue
         for call in ctx.facts.calls:
             if call.callee_start_byte in claimed_starts or not _is_candidate_call(call):

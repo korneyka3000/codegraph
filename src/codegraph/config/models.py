@@ -105,12 +105,49 @@ class BaseUrlSpec(_Strict):
     env: str | None = None
 
 
+class HttpRouteFromSpec(_Strict):
+    """M6 T2: откуда брать path_template — декоратор метода (напр. `@path_template(...)`),
+    а не arg0 самого HTTP-вызова. `arg` — позиция строкового аргумента ВНУТРИ декоратора
+    (обычно 0 — единственный позиционный арг маршрута)."""
+
+    decorator: str
+    arg: int = 0
+
+
+class HttpVerbFromSpec(_Strict):
+    """M6 T2: откуда брать verb — enum-атрибут arg0 конструктора `request_ctor` (напр.
+    `Request(Method.GET, ...)` -> `request_ctor="Request"`, `enum="Method"` -> "GET")."""
+
+    request_ctor: str
+    enum: str
+
+
 class HttpClientIdiom(_Strict):
     name: str
     file_glob: str = "**/*_client.py"
     class_glob: str = "*Client"
     base_url: BaseUrlSpec | None = None
     service: str | None = None  # явный pin целевого сервиса, если base_url не резолвится
+    # M6 T2: decorator-SDK режим (GAPS §2 pilot gap) — все три поля опциональны и по
+    # умолчанию отсутствуют, так что существующий verb-режим (`get`/`post`/... callee +
+    # arg0=URL) остаётся байт-в-байт прежним. Когда `route_from` задан, экстрактор
+    # переключается на альтернативный режим: маршрут — из декоратора метода, HTTP-вызов —
+    # driver-индирекция (`call`), verb — из `Request(Method.X, ...)`-конструктора
+    # (`verb_from`) внутри тела метода. См. extractors/http_client_ext.py.
+    route_from: HttpRouteFromSpec | None = None
+    call: str | None = None  # "recv_tail.callee|recv_tail2.callee2" -- "|"-альтернативы
+    verb_from: HttpVerbFromSpec | None = None
+
+    @model_validator(mode="after")
+    def _route_from_requires_call(self) -> HttpClientIdiom:
+        # Fail-closed (brief M6 T2): decorator-SDK режим без `call` не может найти сам
+        # HTTP-вызов внутри тела метода (только маршрут) -- бессмысленная/сломанная
+        # конфигурация, отклоняем на загрузке конфига, а не молча эмитим ноль claim'ов.
+        if self.route_from is not None and self.call is None:
+            raise ValueError(
+                "HttpClientIdiom: route_from (decorator-SDK mode) requires call"
+            )
+        return self
 
 
 class ServiceIdioms(_Strict):

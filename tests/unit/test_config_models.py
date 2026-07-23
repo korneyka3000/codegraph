@@ -6,6 +6,9 @@ from codegraph.config.models import (
     ChannelSpec,
     ConsumerIdiom,
     EmbeddingConfig,
+    HttpClientIdiom,
+    HttpRouteFromSpec,
+    HttpVerbFromSpec,
     ProducerIdiom,
     ServiceConfig,
     ValueSpec,
@@ -145,3 +148,58 @@ def test_embedding_config_prefixes_settable_from_yaml():
     cfg = EmbeddingConfig.model_validate(raw)
     assert cfg.query_prefix == "query: "
     assert cfg.passage_prefix == "passage: "
+
+
+# -- M6 T2: decorator-SDK HttpClientIdiom (route_from/call/verb_from) --
+
+DECORATOR_SDK_YAML = """
+name: decorator-sdk
+file_glob: "**/clients/*.py"
+class_glob: "*Client"
+route_from: { decorator: "path_template", arg: 0 }
+call: "driver.fetch_content|driver.fetch"
+verb_from: { request_ctor: "Request", enum: "Method" }
+"""
+
+
+def test_decorator_sdk_yaml_shape_parses():
+    """Exact YAML shape from the M6 T2 brief -- route_from/call/verb_from round-trip."""
+    idiom = HttpClientIdiom.model_validate(yaml.safe_load(DECORATOR_SDK_YAML))
+    assert idiom.file_glob == "**/clients/*.py"
+    assert idiom.class_glob == "*Client"
+    assert idiom.route_from == HttpRouteFromSpec(decorator="path_template", arg=0)
+    assert idiom.call == "driver.fetch_content|driver.fetch"
+    assert idiom.verb_from == HttpVerbFromSpec(request_ctor="Request", enum="Method")
+
+
+def test_http_client_idiom_new_fields_absent_by_default():
+    """All three new fields absent -> existing verb-mode idiom is byte-identical."""
+    idiom = HttpClientIdiom(name="default-sdk")
+    assert idiom.route_from is None
+    assert idiom.call is None
+    assert idiom.verb_from is None
+
+
+def test_route_from_without_call_is_config_error_fail_closed():
+    """DSL validation fail-closed (brief): route_from without call can locate a path
+    template but never the HTTP call-site itself -- rejected at config-load time."""
+    with pytest.raises(ValidationError):
+        HttpClientIdiom.model_validate({
+            "name": "decorator-sdk",
+            "route_from": {"decorator": "path_template", "arg": 0},
+        })
+
+
+def test_route_from_with_call_is_valid():
+    idiom = HttpClientIdiom.model_validate({
+        "name": "decorator-sdk",
+        "route_from": {"decorator": "path_template", "arg": 0},
+        "call": "driver.fetch_content",
+    })
+    assert idiom.route_from.decorator == "path_template"
+    assert idiom.call == "driver.fetch_content"
+
+
+def test_route_from_arg_defaults_to_zero():
+    spec = HttpRouteFromSpec(decorator="path_template")
+    assert spec.arg == 0

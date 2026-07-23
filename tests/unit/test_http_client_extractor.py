@@ -26,7 +26,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from codegraph.config.loader import effective_idioms, load_workspace
-from codegraph.config.models import BaseUrlSpec, HttpClientIdiom, ServiceIdioms
+from codegraph.config.models import (
+    BaseUrlSpec,
+    HttpClientIdiom,
+    HttpRouteFromSpec,
+    HttpVerbFromSpec,
+    ServiceIdioms,
+)
 from codegraph.extractors.base import FileContext
 from codegraph.extractors.http_client_ext import HttpClientResult, extract_http_client
 from codegraph.extractors.python_core import extract as extract_python_core
@@ -469,6 +475,228 @@ def test_cross_idiom_dedup_reversed_order_flips_winner():
     result = extract_http_client(ctx, node_ids, idioms, consts)
     assert len(result.claims) == 2
     assert all(c["base_url_env"] == "DOCUMENT_MANAGEMENT_URL" for c in result.claims)
+
+
+# -- M6 T2: decorator-SDK mode (route_from/call/verb_from) -- pilot GAPS §2 gap 1 --
+#
+# Real convention (camunda-gateway app/clients/*.py, class *Client(BaseClient)):
+#   @path_template("/v1/dmout/user_hv/uuid/{customer_uid}")     <- route lives HERE
+#   async def get_client_hv_sign(self, customer_uid, **kwargs):
+#       request = Request(Method.GET, self.host, ...)            <- verb lives HERE
+#       return await self.driver.fetch_content(request, ...)     <- the CALL is HERE
+# Old verb-mode never matches this shape at all (callee_name="fetch_content" not in
+# _VERBS, arg0=`request` is not a URL). route_from switches extract_http_client to this
+# second mode entirely, per-idiom.
+
+DECORATOR_SDK_IDIOM = HttpClientIdiom(
+    name="decorator-sdk",
+    file_glob="**/clients/*.py",
+    class_glob="*Client",
+    route_from=HttpRouteFromSpec(decorator="path_template", arg=0),
+    call="driver.fetch_content|driver.fetch",
+    verb_from=HttpVerbFromSpec(request_ctor="Request", enum="Method"),
+)
+
+
+DMOUT_CLIENT_SRC = b'''from some_sdk import BaseClient, Method, Request, path_template
+
+
+class DMoutClient(BaseClient):
+    @path_template("/v1/dmout/user_hv/uuid/{customer_uid}")
+    async def get_client_hv_sign(self, customer_uid, **kwargs):
+        request = Request(Method.GET, self.host, customer_uid=customer_uid)
+        return await self.driver.fetch_content(request)
+
+    async def get_no_decorator(self, customer_uid):
+        request = Request(Method.GET, self.host)
+        return await self.driver.fetch_content(request)
+'''
+
+
+def _dmout_ctx():
+    return _load("app/clients/dmout_client.py", "svc", DMOUT_CLIENT_SRC)
+
+
+def test_decorator_sdk_single_claim_correct_path_and_verb():
+    """GAPS §2 synthetic client: exactly one http_call claim, decorator path template
+    (with its {customer_uid} placeholder untouched) and GET verb from Method.GET."""
+    ctx, node_ids, consts = _dmout_ctx()
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]), consts,
+    )
+    method_id = node_ids[_def(ctx, "get_client_hv_sign").index]
+    assert len(result.claims) == 1
+    claim = result.claims[0]
+    assert claim["src_id"] == method_id
+    assert claim["path_template"] == "/v1/dmout/user_hv/uuid/{customer_uid}"
+    assert claim["verb"] == "GET"
+    assert claim["resolution_hint"] == "static"
+    assert result.stats["http_calls_resolved"] == 1
+
+
+def test_decorator_sdk_method_without_decorator_produces_no_claim():
+    """Same file, second method calls the same driver indirection but carries no
+    @path_template decorator at all -- must not produce a claim."""
+    ctx, node_ids, consts = _dmout_ctx()
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]), consts,
+    )
+    no_dec_id = node_ids[_def(ctx, "get_no_decorator").index]
+    assert not any(c["src_id"] == no_dec_id for c in result.claims)
+
+
+FETCH_ALT_SRC = b'''from some_sdk import BaseClient, Method, Request, path_template
+
+
+class AltClient(BaseClient):
+    @path_template("/v1/alt/{id}")
+    async def get_alt(self, id):
+        request = Request(Method.POST, self.host)
+        return await self.driver.fetch(request)
+'''
+
+
+def test_decorator_sdk_driver_fetch_alternative_matches():
+    """`call` DSL is "|"-separated alternatives -- the SECOND alt ("driver.fetch", no
+    "_content" suffix) must match too, proving alternation is actually tried in full,
+    not just the first entry."""
+    ctx, node_ids, consts = _load("app/clients/alt_client.py", "svc", FETCH_ALT_SRC)
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]), consts,
+    )
+    assert len(result.claims) == 1
+    assert result.claims[0]["verb"] == "POST"
+    assert result.claims[0]["path_template"] == "/v1/alt/{id}"
+
+
+WRONG_RECEIVER_SRC = b'''from some_sdk import BaseClient, Method, Request, path_template
+
+
+class WrongReceiverClient(BaseClient):
+    @path_template("/v1/wrong/{id}")
+    async def get_wrong(self, id):
+        request = Request(Method.GET, self.host)
+        return await self.other.fetch_content(request)
+'''
+
+
+def test_decorator_sdk_wrong_receiver_tail_produces_no_claim():
+    """receiver-tail match is exact on dotted segments -- "self.other.fetch_content"
+    must NOT match the "driver.fetch_content" alternative (only the callee name
+    coincides; the receiver segment right before it differs: other != driver)."""
+    ctx, node_ids, consts = _load(
+        "app/clients/wrongrecv_client.py", "svc", WRONG_RECEIVER_SRC,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]), consts,
+    )
+    assert result.claims == []
+
+
+NO_VERB_SRC = b'''from some_sdk import BaseClient, path_template
+
+
+class NoVerbClient(BaseClient):
+    @path_template("/v1/noverb/{id}")
+    async def get_noverb(self, id):
+        return await self.driver.fetch_content(self.host)
+'''
+
+
+def test_decorator_sdk_verb_not_found_produces_no_claim_not_null_verb():
+    """M6 T2 null-verb decision (see task-2-report.md): linking/http_routes.py's
+    make_channel_node(kind="http_route") raises ValueError on a falsy method, and a
+    None-verb claim can never match a real route (every staged route carries a real
+    string http_method) -- it would ALWAYS fall to the unresolved-channel branch and
+    crash there. So: no `Request(Method.X, ...)` found in the method body -> emit NO
+    claim at all (never verb=None), bump a dedicated stat instead."""
+    ctx, node_ids, consts = _load("app/clients/noverb_client.py", "svc", NO_VERB_SRC)
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]), consts,
+    )
+    assert result.claims == []
+    assert result.stats["http_verb_unresolved"] == 1
+
+
+NO_DRIVER_CALL_SRC = b'''from some_sdk import BaseClient, Method, Request, path_template
+
+
+class NoDriverCallClient(BaseClient):
+    @path_template("/v1/nodrivercall/{id}")
+    async def get_x(self, id):
+        request = Request(Method.GET, self.host)
+        return request
+'''
+
+
+def test_decorator_sdk_no_matching_call_site_produces_no_claim():
+    """Decorator present, verb-ctor present -- but NEITHER `call` alternative is
+    actually invoked anywhere in the method body -- still no claim (the driver
+    call-site is mandatory, not just the decorator + Request ctor)."""
+    ctx, node_ids, consts = _load(
+        "app/clients/nodrivercall_client.py", "svc", NO_DRIVER_CALL_SRC,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]), consts,
+    )
+    assert result.claims == []
+
+
+WRONG_DECORATOR_NAME_SRC = b'''from some_sdk import BaseClient, Method, Request, other_decorator
+
+
+class WrongDecoratorClient(BaseClient):
+    @other_decorator("/v1/wrongdec/{id}")
+    async def get_y(self, id):
+        request = Request(Method.GET, self.host)
+        return await self.driver.fetch_content(request)
+'''
+
+
+def test_decorator_sdk_non_matching_decorator_name_produces_no_claim():
+    """Decorated, but with a DIFFERENT decorator than route_from.decorator names -- must
+    not be mistaken for a route (distinct from the "zero decorators" case above: this
+    one actually exercises the callee-name comparison inside _decorator_route)."""
+    ctx, node_ids, consts = _load(
+        "app/clients/wrongdec_client.py", "svc", WRONG_DECORATOR_NAME_SRC,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]), consts,
+    )
+    assert result.claims == []
+
+
+def test_decorator_sdk_class_outside_class_glob_is_empty():
+    ctx, node_ids, consts = _dmout_ctx()
+    idiom = HttpClientIdiom(
+        name="wrong-class", file_glob="**/clients/*.py", class_glob="*Gateway",
+        route_from=HttpRouteFromSpec(decorator="path_template", arg=0),
+        call="driver.fetch_content|driver.fetch",
+        verb_from=HttpVerbFromSpec(request_ctor="Request", enum="Method"),
+    )
+    result = extract_http_client(ctx, node_ids, ServiceIdioms(http_clients=[idiom]), consts)
+    assert result.claims == []
+
+
+def test_decorator_sdk_missing_node_id_skips_gracefully():
+    ctx, _real_node_ids, consts = _dmout_ctx()
+    result = extract_http_client(
+        ctx, {}, ServiceIdioms(http_clients=[DECORATOR_SDK_IDIOM]), consts,
+    )
+    assert result.claims == []
+    assert result.stats["http_call_missing_node_id"] == 1
+
+
+def test_verb_mode_idiom_without_route_from_is_unaffected_byte_identical():
+    """route_from absent -> existing verb-mode path is completely untouched by the new
+    branch (regression guard alongside every pre-existing test in this module, which
+    stays green unmodified)."""
+    ctx, node_ids, consts = _client_ctx()
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[DEFAULT_SDK_IDIOM]), consts,
+    )
+    assert len(result.claims) == 2
+    assert result.stats["http_verb_unresolved"] == 0
 
 
 def test_real_effective_idioms_custom_sdk_shadows_builtin_base_url_env():
