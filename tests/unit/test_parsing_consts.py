@@ -1,7 +1,14 @@
 from pathlib import Path
 
 from codegraph.config.models import ValueSpec
-from codegraph.parsing.consts import ConstTable, Resolved, resolve_arg, resolve_value_spec
+from codegraph.parsing.class_attrs import ClassAttrIndex, SettingsField
+from codegraph.parsing.consts import (
+    ConstTable,
+    Resolved,
+    resolve_arg,
+    resolve_settings_source,
+    resolve_value_spec,
+)
 from codegraph.parsing.facts import build_file_facts
 
 CONSTS_SRC = b'''TOPIC = "orders.events"
@@ -243,4 +250,105 @@ def test_resolve_value_spec_missing_kwarg_is_unresolved():
     call = _call_in(facts, "call_with_const")
     spec = ValueSpec(kwarg="nope")
     resolved = resolve_value_spec(spec, call, _consts())
+    assert resolved.kind == "unresolved"
+
+
+# -- resolve_settings_source / resolve_value_spec settings: source (M7 T2, OPEN R2) --
+
+SETTINGS_FIELD_WITH_DEFAULT = SettingsField(
+    class_fqn="app.config.kafka.KafkaSettings", field="step_topic",
+    default="kyc.step.changed", env_name="SERVICE_KAFKA_STEP_TOPIC",
+)
+SETTINGS_FIELD_NO_DEFAULT = SettingsField(
+    class_fqn="app.config.kafka.KafkaSettings", field="worker_url",
+    default=None, env_name="SERVICE_WORKER_URL",
+)
+SETTINGS_FIELD_BARE = SettingsField(
+    class_fqn="app.config.kafka.KafkaSettings", field="mystery",
+    default=None, env_name=None,
+)
+SETTINGS_INDEX = ClassAttrIndex(
+    settings_by_class={
+        "app.config.kafka.KafkaSettings": {
+            "step_topic": SETTINGS_FIELD_WITH_DEFAULT,
+            "worker_url": SETTINGS_FIELD_NO_DEFAULT,
+            "mystery": SETTINGS_FIELD_BARE,
+        },
+    },
+    enums_by_class={},
+    field_index={},
+)
+
+
+def test_resolve_settings_source_with_default_is_static_value():
+    resolved = resolve_settings_source("app.config.kafka.KafkaSettings.step_topic", SETTINGS_INDEX)
+    assert resolved == Resolved(kind="value", value="kyc.step.changed")
+
+
+def test_resolve_settings_source_no_default_env_present_is_config_ref():
+    """Mirrors resolve_value_spec's pre-existing `env:` source shape exactly (same
+    Resolved kind, same field names) -- a settings field discovered to have no
+    literal default but a real env_name is, for every downstream purpose (kafka_ext's
+    channel-name/confidence/props machinery), indistinguishable from an idiom that
+    named the env var directly."""
+    resolved = resolve_settings_source("app.config.kafka.KafkaSettings.worker_url", SETTINGS_INDEX)
+    assert resolved == Resolved(kind="config_ref", value=None, config_ref="SERVICE_WORKER_URL")
+
+
+def test_resolve_settings_source_neither_default_nor_env_is_unresolved():
+    """A genuinely bare field (`Field(...)` with no default, no alias, and no
+    env_prefix'd model_config in scope -- SettingsField(default=None,
+    env_name=None)) has nothing at all to resolve to -- the same honest miss as an
+    unknown class/field, not a crash."""
+    resolved = resolve_settings_source("app.config.kafka.KafkaSettings.mystery", SETTINGS_INDEX)
+    assert resolved.kind == "unresolved"
+
+
+def test_resolve_settings_source_unknown_field_is_unresolved_not_crash():
+    resolved = resolve_settings_source("app.config.kafka.KafkaSettings.nope", SETTINGS_INDEX)
+    assert resolved.kind == "unresolved"
+
+
+def test_resolve_settings_source_unknown_class_is_unresolved_not_crash():
+    resolved = resolve_settings_source("app.config.kafka.Nope.step_topic", SETTINGS_INDEX)
+    assert resolved.kind == "unresolved"
+
+
+def test_resolve_settings_source_no_class_attr_index_is_unresolved():
+    resolved = resolve_settings_source("app.config.kafka.KafkaSettings.step_topic", None)
+    assert resolved.kind == "unresolved"
+
+
+def test_resolve_value_spec_settings_source_with_default():
+    facts = _facts()
+    call = _call_in(facts, "call_with_const")
+    spec = ValueSpec(settings="app.config.kafka.KafkaSettings.step_topic")
+    resolved = resolve_value_spec(spec, call, _consts(), SETTINGS_INDEX)
+    assert resolved == Resolved(kind="value", value="kyc.step.changed")
+
+
+def test_resolve_value_spec_settings_source_defaults_class_attr_index_param_to_none():
+    """`class_attr_index` is an optional TRAILING parameter (default None, M7 T2
+    brief) -- an existing call site that never threads T1's index at all degrades to
+    the same honest unresolved outcome as an index that simply doesn't know the
+    class, not a TypeError from a suddenly-required argument."""
+    facts = _facts()
+    call = _call_in(facts, "call_with_const")
+    spec = ValueSpec(settings="app.config.kafka.KafkaSettings.step_topic")
+    resolved = resolve_value_spec(spec, call, _consts())
+    assert resolved.kind == "unresolved"
+
+
+def test_resolve_value_spec_enum_source_is_defensively_unresolved():
+    """enum_ is NOT a single-value source at all -- kafka_ext.py special-cases it
+    BEFORE ever calling resolve_value_spec (see kafka_ext._emit_enum_fanout_produces),
+    fanning out into multiple channels itself from ClassAttrIndex.enum_values
+    directly. Reaching this branch at all means some caller didn't special-case it
+    first -- defensively unresolved rather than a crash or a fabricated single
+    value; ValueSpec's OWN config-load-time validators (config/models.py) are what
+    actually keep this from happening for the DSL's sanctioned shapes."""
+    facts = _facts()
+    call = _call_in(facts, "call_with_const")
+    spec = ValueSpec(enum_="app.models.enums.KycTopicName")
+    resolved = resolve_value_spec(spec, call, _consts(), SETTINGS_INDEX)
     assert resolved.kind == "unresolved"

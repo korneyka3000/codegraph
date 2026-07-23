@@ -22,14 +22,24 @@ DEFAULT_BUILTIN_IDIOMS = [
 
 
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    # M7 T2: populate_by_name=True (alongside extra="forbid"/frozen=True, unchanged)
+    # -- purely additive, verified on pydantic 2.13 to emit no deprecation warning --
+    # lets a field defined with an `alias=` (ValueSpec.enum_ below, the first field
+    # in this whole DSL to need one) be populated EITHER by its Python attribute name
+    # (`ValueSpec(enum_=...)`, every direct-construction call site in this codebase's
+    # own extractors/tests) OR by the alias (`ValueSpec.model_validate({"enum": ...})`,
+    # the natural YAML/DSL surface -- "enum" reads far better than "enum_" in a
+    # codegraph.yaml). Every OTHER existing field in every model below has no alias
+    # at all, so this is a no-op for all of them -- both spellings already coincided.
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
 
 class ValueSpec(_Strict):
     """Откуда берётся строковое значение (имя топика, тип события, base_url...).
 
-    Ровно один источник: литерал, позиционный аргумент, kwarg, env-переменная
-    или атрибут объекта.
+    Ровно один источник: литерал, позиционный аргумент, kwarg, env-переменная,
+    атрибут объекта, pydantic-Settings поле (M7 T2) или Enum-класс (M7 T2, только
+    там, где источник это явно допускает -- см. ChannelSpec/ConsumerIdiom).
     """
 
     const: str | None = None
@@ -37,16 +47,47 @@ class ValueSpec(_Strict):
     kwarg: str | None = None
     env: str | None = None
     attr: str | None = None
+    # M7 T2 (OPEN R2): "<ClassFQN>.<field>" -- split on the LAST dot (parsing/
+    # consts.py's resolve_settings_source) -- ClassAttrIndex.settings_field (M7 T1)
+    # lookup. Unlike every other source above, resolution needs NO call-site at all
+    # (a pure class-body literal lookup), which is exactly why it's also sanctioned
+    # for consumer kind=base_class's topic field (no CallFact there either) --
+    # see ConsumerIdiom._kind_requirements below.
+    settings: str | None = None
+    # M7 T2 (OPEN R2a): enum-class FQN -- ClassAttrIndex.enum_values (M7 T1) lookup.
+    # Field name is `enum_`, not `enum` (`enum` alone shadows nothing HERE, but reads
+    # oddly as a bare attribute name right next to Python's own `enum` stdlib module
+    # this file could otherwise want to import, and "trailing underscore to dodge a
+    # near-keyword" is an established, unsurprising convention) -- the pydantic
+    # `alias="enum"` keeps the YAML/DSL surface exactly the natural `enum:
+    # "app.enums.KycTopicName"` (see _Strict's populate_by_name comment above for how
+    # BOTH spellings populate this one field). Unlike every other source, an enum
+    # does not name a SINGLE value at all -- kafka_ext.py fans it out into one
+    # PRODUCES edge/channel PER member -- so its placement is fail-closed to the one
+    # shape that sanctions that over-approximation (a producer's topic identity,
+    # ChannelSpec.name_from/.topic); ChannelSpec.event_type_from and every
+    # ConsumerIdiom ValueSpec field reject it at config-load time (see those models'
+    # own validators below) rather than silently doing something nobody asked for.
+    enum_: str | None = Field(default=None, alias="enum")
 
     @model_validator(mode="after")
     def _exactly_one(self) -> ValueSpec:
         set_fields = [
-            f for f in ("const", "arg", "kwarg", "env", "attr")
+            f for f in ("const", "arg", "kwarg", "env", "attr", "settings", "enum_")
             if getattr(self, f) is not None
         ]
         if len(set_fields) != 1:
             raise ValueError(f"ValueSpec requires exactly one source, got: {set_fields}")
         return self
+
+
+def _is_enum_source(spec: object) -> bool:
+    """Shared guard: `spec` is a ValueSpec carrying an enum_ source. Used by both
+    ChannelSpec and ConsumerIdiom's own fail-closed validators below (M7 T2) --
+    `event_type_from`'s wider `ValueSpec | Literal["dict_key"] | GenericArgSpec`
+    union means every caller needs the SAME isinstance-narrowing first; one shared
+    predicate keeps the two checks (and any future one) from silently drifting."""
+    return isinstance(spec, ValueSpec) and spec.enum_ is not None
 
 
 class GenericArgSpec(_Strict):
@@ -73,6 +114,22 @@ class ChannelSpec(_Strict):
     name_from: ValueSpec | None = None
     topic: ValueSpec | None = None
     event_type_from: EventTypeFrom | None = None
+
+    @model_validator(mode="after")
+    def _enum_only_on_topic_identity(self) -> ChannelSpec:
+        # M7 T2 (OPEN R2a): enum's fan-out over-approximation is sanctioned ONLY for
+        # a producer's TOPIC identity -- name_from (the kafka_topic kind's own
+        # channel identity) and topic (the event_type kind's CONTAINS-pairing field)
+        # -- both left unrestricted here. event_type_from names the PRODUCED EVENT's
+        # type, a different identity fanning out has no sanctioned semantics for
+        # (see ValueSpec.enum_'s own docstring) -- rejected at config-load time.
+        if _is_enum_source(self.event_type_from):
+            raise ValueError(
+                "ChannelSpec.event_type_from does not support an enum source -- enum "
+                "fan-out is sanctioned only for a producer's topic identity "
+                f"(name_from/topic); got {self.event_type_from!r}"
+            )
+        return self
 
 
 class ProducerIdiom(_Strict):
@@ -143,11 +200,42 @@ class ConsumerIdiom(_Strict):
                     "(GenericArgSpec) -- ValueSpec/dict_key presuppose a call-site a class "
                     f"definition never has; got {self.event_type_from!r}"
                 )
-            if self.topic is not None and self.topic.attr is None:
+            # M7 T2: {settings: ...} joins {attr: ...} as the second (and, per
+            # ValueSpec.enum_'s own docstring, ONLY the second) meaningful shape
+            # here -- both need no call-site (attr is always an unresolved
+            # config-reference LABEL; settings resolves from the service-wide
+            # ClassAttrIndex alone, see parsing/consts.py's resolve_settings_source)
+            # -- const/arg/kwarg/env/enum all still have nothing to resolve against
+            # (or, for enum, no sanctioned fan-out semantics on the consumer side --
+            # see the dedicated _enum_forbidden_on_consumers validator below, which
+            # independently rejects it too).
+            if self.topic is not None and self.topic.attr is None and self.topic.settings is None:
                 raise ValueError(
-                    "consumer kind=base_class topic only supports {attr: ...} -- there is "
-                    f"no call-site to resolve const/arg/kwarg/env against here; got {self.topic!r}"
+                    "consumer kind=base_class topic only supports {attr: ...} or "
+                    "{settings: ...} -- there is no call-site to resolve const/arg/kwarg/"
+                    f"env/enum against here; got {self.topic!r}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _enum_forbidden_on_consumers(self) -> ConsumerIdiom:
+        # M7 T2 (OPEN R2a / brief: "consumer topic/event_type_from with enum ->
+        # config error"): a consumer handler consumes ONE topic/event -- there is no
+        # analogous "fan out CONSUMES to every enum member" semantics the producer
+        # side's over-approximation could justify here. Checked for every kind
+        # uniformly (not just base_class, whose OWN topic validator above already
+        # independently excludes enum via its attr-or-settings allowlist) --
+        # kind="call"'s topic and kind="dispatch_dict"'s event_type_from have no
+        # other guard against it at all.
+        if _is_enum_source(self.topic):
+            raise ValueError(
+                f"ConsumerIdiom.topic does not support an enum source; got {self.topic!r}"
+            )
+        if _is_enum_source(self.event_type_from):
+            raise ValueError(
+                "ConsumerIdiom.event_type_from does not support an enum source; got "
+                f"{self.event_type_from!r}"
+            )
         return self
 
 

@@ -42,6 +42,7 @@ from codegraph.config.models import (
 from codegraph.extractors.base import FileContext
 from codegraph.extractors.kafka_ext import KafkaResult, extract_kafka
 from codegraph.extractors.python_core import extract as extract_python_core
+from codegraph.parsing.class_attrs import ClassAttrIndex, SettingsField
 from codegraph.parsing.consts import ConstTable
 from codegraph.parsing.facts import build_file_facts
 
@@ -52,13 +53,21 @@ def _fixture_bytes(relpath: str) -> bytes:
     return (FIXTURES / relpath).read_bytes()
 
 
-def _load(relpath: str, service: str, source: bytes, *, ref_symbol_lookup=None):
+def _load(
+    relpath: str, service: str, source: bytes, *,
+    ref_symbol_lookup=None, class_attr_index: ClassAttrIndex | None = None,
+):
     """Builds (ctx, node_ids, consts) exactly as analyze.py's S5 wiring will: node_ids
     is def-index -> resolved node id (from python_core's own per-file output, Module
     node first then exactly one node per facts.defs entry, same order) PLUS a
     None -> Module-node-id entry (CallFact.enclosing_def is None for module-level
     calls -- the same sentinel, so `node_ids.get(call.enclosing_def)` transparently
-    falls back to the Module id with no special-casing in the extractor itself)."""
+    falls back to the Module id with no special-casing in the extractor itself).
+
+    `class_attr_index` (M7 T2): same "optional trailing kwarg, default None"
+    convention `ref_symbol_lookup` already established -- every pre-existing call
+    site (every test in this file before this task) keeps building a ctx with
+    class_attr_index=None, unchanged."""
     facts = build_file_facts(relpath, source)
     core_ctx = FileContext(
         service=service, relpath=relpath, source=source, facts=facts,
@@ -73,7 +82,7 @@ def _load(relpath: str, service: str, source: bytes, *, ref_symbol_lookup=None):
     ctx = FileContext(
         service=service, relpath=relpath, source=source, facts=facts,
         def_symbol_lookup=lambda rp, sb: None, module_exists=lambda d: False,
-        ref_symbol_lookup=ref_symbol_lookup,
+        ref_symbol_lookup=ref_symbol_lookup, class_attr_index=class_attr_index,
     )
     consts = ConstTable.build(facts, source)
     return ctx, node_ids, consts
@@ -1336,4 +1345,372 @@ def test_producer_wrapper_const_event_type_produces_event_channel():
     assert p.dst == "chan:event_type:OrderCreated"
     assert p.resolution == "heuristic" and p.confidence == 0.6
     assert result.roles[use_id] == {"MessageProducer"}
+    assert not any(e.type == "CONTAINS" for e in result.edges)
+
+
+# -- M7 T2 (OPEN R2): settings:/enum: ValueSpec sources -- producer-side literals
+# from code, and the enum fan-out over-approximation.
+#
+# ClassAttrIndex fixture shared by every test below (M7 T1's own index -- directly
+# constructible per that module's own docstring: "the three fields are this
+# module's own assembly detail, freely constructible directly in tests").
+
+KAFKA_SETTINGS_INDEX = ClassAttrIndex(
+    settings_by_class={
+        "app.config.kafka.KafkaSettings": {
+            "step_topic": SettingsField(
+                class_fqn="app.config.kafka.KafkaSettings", field="step_topic",
+                default="kyc.step.changed", env_name="SERVICE_KAFKA_STEP_TOPIC",
+            ),
+            "worker_url": SettingsField(
+                class_fqn="app.config.kafka.KafkaSettings", field="worker_url",
+                default=None, env_name="SERVICE_WORKER_URL",
+            ),
+        },
+    },
+    enums_by_class={
+        "app.models.enums.KycTopicName": (
+            "kyc.camunda.step_changed.basic_survey",
+            "kyc.camunda.step_changed.basic_kyc",
+            "kyc.camunda.restrictions_changed",
+        ),
+    },
+    field_index={},
+)
+
+SETTINGS_PRODUCER_SRC = b'''from pkg import Client
+
+
+def use():
+    client = Client()
+    client.send("ignored-arg")
+'''
+
+
+def _settings_producer_idiom(settings_ref: str) -> ProducerIdiom:
+    return ProducerIdiom(
+        name="p", call="pkg.Client.send",
+        channel=ChannelSpec(kind="kafka_topic", name_from=ValueSpec(settings=settings_ref)),
+    )
+
+
+def test_producer_settings_source_with_default_is_static_literal_channel():
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(
+        relpath, "svc", SETTINGS_PRODUCER_SRC, class_attr_index=KAFKA_SETTINGS_INDEX,
+    )
+    idiom = _settings_producer_idiom("app.config.kafka.KafkaSettings.step_topic")
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    p = produces[0]
+    assert p.dst == "chan:kafka_topic:kyc.step.changed"
+    # RECEIVER tier (0.8): `client = Client()` is a same-scope AssignFact -- settings
+    # resolves to a Resolved(kind="value") literal, so _resolution_for keeps the
+    # MATCHED CALL's own tier resolution/confidence as-is (a resolved literal never
+    # further downgrades, exactly like const:).
+    assert p.resolution == "heuristic" and p.confidence == 0.8
+    assert p.props == {}
+    assert result.stats["producers_resolved"] == 1
+    assert result.stats["producer_unresolved_channel"] == 0
+
+
+def test_producer_settings_source_no_default_is_config_ref_placeholder_channel():
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(
+        relpath, "svc", SETTINGS_PRODUCER_SRC, class_attr_index=KAFKA_SETTINGS_INDEX,
+    )
+    idiom = _settings_producer_idiom("app.config.kafka.KafkaSettings.worker_url")
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    p = produces[0]
+    assert p.dst == "chan:kafka_topic:${SERVICE_WORKER_URL}"
+    # config_ref -- SAME downgrade/placeholder/props convention `env:` already gets
+    # (resolve_settings_source produces the IDENTICAL Resolved shape spec.env does).
+    assert p.resolution == "heuristic" and p.confidence == 0.6
+    assert p.props == {"config_ref": "SERVICE_WORKER_URL"}
+    assert result.stats["producer_unresolved_channel"] == 0
+
+
+def test_producer_settings_source_unknown_field_is_unresolved_with_existing_counter():
+    """"settings-unknown-class/field -> miss counter not crash" (M7 T2 brief) --
+    reuses the EXISTING producer_unresolved_channel counter, no new one."""
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(
+        relpath, "svc", SETTINGS_PRODUCER_SRC, class_attr_index=KAFKA_SETTINGS_INDEX,
+    )
+    idiom = _settings_producer_idiom("app.config.kafka.KafkaSettings.nope")
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+
+    assert result.edges == []
+    assert result.channels == []
+    assert result.roles == {}
+    assert result.stats["producer_unresolved_channel"] == 1
+
+
+def test_producer_settings_source_unknown_class_is_unresolved_with_existing_counter():
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(
+        relpath, "svc", SETTINGS_PRODUCER_SRC, class_attr_index=KAFKA_SETTINGS_INDEX,
+    )
+    idiom = _settings_producer_idiom("app.config.kafka.NopeSettings.step_topic")
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+
+    assert result.edges == []
+    assert result.stats["producer_unresolved_channel"] == 1
+
+
+def test_producer_settings_source_no_class_attr_index_wired_is_unresolved_not_crash():
+    """No ClassAttrIndex wired at all (ctx.class_attr_index stays the default None,
+    e.g. a caller that predates M7 T1/T2) -- honest miss, not a crash."""
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(relpath, "svc", SETTINGS_PRODUCER_SRC)
+    idiom = _settings_producer_idiom("app.config.kafka.KafkaSettings.step_topic")
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+
+    assert result.edges == []
+    assert result.stats["producer_unresolved_channel"] == 1
+
+
+# -- enum: fan-out (OPEN R2a: over-approximation, documented tradeoff) --
+
+ENUM_PRODUCER_SRC = b'''from pkg import Client
+
+
+def use():
+    client = Client()
+    client.send("ignored")
+'''
+
+ENUM_FANOUT_IDIOM = ProducerIdiom(
+    name="p", call="pkg.Client.send",
+    channel=ChannelSpec(
+        kind="kafka_topic", name_from=ValueSpec(enum_="app.models.enums.KycTopicName"),
+    ),
+)
+
+
+def test_producer_enum_fanout_three_members_three_produces_and_channels():
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(
+        relpath, "svc", ENUM_PRODUCER_SRC, class_attr_index=KAFKA_SETTINGS_INDEX,
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[ENUM_FANOUT_IDIOM]), consts)
+    use_id = node_ids[_def(ctx, "use").index]
+
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 3
+    expected_names = {
+        "kyc.camunda.step_changed.basic_survey",
+        "kyc.camunda.step_changed.basic_kyc",
+        "kyc.camunda.restrictions_changed",
+    }
+    assert {e.dst for e in produces} == {f"chan:kafka_topic:{n}" for n in expected_names}
+    for e in produces:
+        assert e.src == use_id
+        assert e.resolution == "heuristic" and e.confidence == 0.8
+        assert e.props == {"mechanism": "enum_fanout"}
+        assert e.extractor == "kafka"
+    assert {c.name for c in result.channels} == expected_names
+    assert len(result.channels) == 3
+    assert result.roles[use_id] == {"MessageProducer"}
+    assert result.stats["producers_resolved"] == 3
+    assert result.stats["producer_unresolved_channel"] == 0
+
+
+def test_producer_enum_fanout_unknown_enum_is_unresolved_with_existing_counter():
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(
+        relpath, "svc", ENUM_PRODUCER_SRC, class_attr_index=KAFKA_SETTINGS_INDEX,
+    )
+    idiom = ProducerIdiom(
+        name="p", call="pkg.Client.send",
+        channel=ChannelSpec(
+            kind="kafka_topic", name_from=ValueSpec(enum_="app.models.enums.Nope"),
+        ),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+
+    assert result.edges == []
+    assert result.channels == []
+    assert result.roles == {}
+    assert result.stats["producer_unresolved_channel"] == 1
+
+
+def test_producer_enum_fanout_no_class_attr_index_wired_is_unresolved_not_crash():
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(relpath, "svc", ENUM_PRODUCER_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[ENUM_FANOUT_IDIOM]), consts)
+
+    assert result.edges == []
+    assert result.stats["producer_unresolved_channel"] == 1
+
+
+def test_producer_enum_fanout_empty_string_member_skipped_no_crash():
+    """Same "M2 final review" empty-name crash guard every other make_channel_node
+    call site in this module already carries (`_harvest_enum_values`'s own contract
+    only requires a string value, not a non-empty one -- an enum member like
+    `NONE = ""` legitimately harvests to an empty string): the one empty member is
+    skipped silently, the other two still fan out normally, no crash."""
+    relpath = "m.py"
+    index_with_empty_member = ClassAttrIndex(
+        settings_by_class={},
+        enums_by_class={
+            "app.models.enums.KycTopicName": ("kyc.a", "", "kyc.b"),
+        },
+        field_index={},
+    )
+    ctx, node_ids, consts = _load(
+        relpath, "svc", ENUM_PRODUCER_SRC, class_attr_index=index_with_empty_member,
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[ENUM_FANOUT_IDIOM]), consts)
+
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 2
+    assert {e.dst for e in produces} == {"chan:kafka_topic:kyc.a", "chan:kafka_topic:kyc.b"}
+    assert len(result.channels) == 2
+    assert result.stats["producers_resolved"] == 2
+
+
+# -- outbox-Event ctor pin (M7 T2 brief): existing call:-matching machinery already
+# generically handles a class-constructor FQN pattern (ctor-form, idiom_match.
+# _is_ctor_pattern) exactly like any method-form wrapper -- kafka_ext.py itself
+# needs NO production change for this; a pure regression pin. --
+
+OUTBOX_EVENT_CTOR_SRC = b'''from app.models.outbox import Event
+
+
+def place_order():
+    event = Event(topic="orders.created", body=b"payload")
+    return event
+'''
+
+
+def test_outbox_event_ctor_call_site_matches_producer_idiom_pin():
+    """`call: "app.models.outbox.Event"` (a bare class FQN, no method segment) is a
+    ctor-form pattern (idiom_match._is_ctor_pattern: last segment capitalized) --
+    match_calls' IMPORT_NAME tier already resolves it against a real ctor call-site
+    (`Event(topic=..., body=...)`) via `from app.models.outbox import Event`
+    from-import evidence, the SAME machinery M6 T4's wrapper-method pin already
+    proved for a METHOD-form pattern. The topic itself comes from the ctor's own
+    `topic=` kwarg (M6-T4's kwarg source, unmodified)."""
+    relpath = "app/services/order.py"
+    ctx, node_ids, consts = _load(relpath, "orders-api", OUTBOX_EVENT_CTOR_SRC)
+    idiom = ProducerIdiom(
+        name="outbox-event-ctor", call="app.models.outbox.Event",
+        channel=ChannelSpec(kind="kafka_topic", name_from=ValueSpec(kwarg="topic")),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+    place_id = node_ids[_def(ctx, "place_order").index]
+
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    p = produces[0]
+    assert p.src == place_id
+    assert p.dst == "chan:kafka_topic:orders.created"
+    assert p.resolution == "heuristic" and p.confidence == 0.6
+    assert result.roles[place_id] == {"MessageProducer"}
+    assert result.stats["producers_resolved"] == 1
+
+
+# -- consumer kind=base_class topic: {settings: ...} (M7 T2) -- allowed alongside
+# {attr: ...} (pinned above, UNCHANGED): unlike attr (always an unresolved
+# config-reference label), settings needs no call-site either but CAN resolve to a
+# real literal from the service-wide ClassAttrIndex -- both remain valid paths.
+
+TOPIC_SETTINGS_IDIOM = ConsumerIdiom(
+    name="base-consumer-subclass", kind="base_class",
+    base_class="kyc_base_consumer.base.BaseConsumer",
+    handler_method="process_event",
+    event_type_from=GenericArgSpec(generic_arg=0),
+    topic=ValueSpec(settings="app.config.kafka.KafkaSettings.step_topic"),
+)
+
+
+def test_base_class_topic_settings_with_default_emits_literal_channel_and_containment():
+    relpath = "app/consumers/ocr.py"
+    ctx, node_ids, consts = _load(
+        relpath, "kyc-worker", BASE_CLASS_SRC, class_attr_index=KAFKA_SETTINGS_INDEX,
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[TOPIC_SETTINGS_IDIOM]), consts)
+
+    assert result.stats["consumers_resolved"] == 1
+    contains = [e for e in result.edges if e.type == "CONTAINS"]
+    assert len(contains) == 1
+    c = contains[0]
+    assert c.src == "chan:kafka_topic:kyc.step.changed"
+    assert c.dst == "chan:event_type:OCRDataEvent"
+    # textual IMPORT_NAME base-match tier (no scip stub, mirrors
+    # test_base_class_textual_fallback_tier_without_scip_stub) -- resolved.kind is
+    # "value" (a real literal), so _resolution_for keeps the tier's own res/conf.
+    assert c.resolution == "heuristic" and c.confidence == 0.6
+    assert c.extractor == "kafka"
+
+    topic_chan = next(
+        ch for ch in result.channels if ch.id == "chan:kafka_topic:kyc.step.changed"
+    )
+    assert "unresolved" not in topic_chan.props
+    assert "config_ref" not in topic_chan.props
+    assert topic_chan.props["channel_kind"] == "kafka_topic"
+
+
+TOPIC_SETTINGS_NO_DEFAULT_IDIOM = ConsumerIdiom(
+    name="base-consumer-subclass", kind="base_class",
+    base_class="kyc_base_consumer.base.BaseConsumer",
+    handler_method="process_event",
+    event_type_from=GenericArgSpec(generic_arg=0),
+    topic=ValueSpec(settings="app.config.kafka.KafkaSettings.worker_url"),
+)
+
+
+def test_base_class_topic_settings_no_default_emits_config_ref_placeholder_channel():
+    relpath = "app/consumers/ocr.py"
+    ctx, node_ids, consts = _load(
+        relpath, "kyc-worker", BASE_CLASS_SRC, class_attr_index=KAFKA_SETTINGS_INDEX,
+    )
+    result = extract_kafka(
+        ctx, node_ids, _idioms(consumers=[TOPIC_SETTINGS_NO_DEFAULT_IDIOM]), consts,
+    )
+    contains = [e for e in result.edges if e.type == "CONTAINS"]
+    assert len(contains) == 1
+    assert contains[0].src == "chan:kafka_topic:${SERVICE_WORKER_URL}"
+
+    topic_chan = next(
+        ch for ch in result.channels if ch.id == "chan:kafka_topic:${SERVICE_WORKER_URL}"
+    )
+    # SAME node-props convention (unresolved=True + config_ref) the pre-existing
+    # {attr: ...} path already uses in THIS function specifically (a documented
+    # divergence from the rest of the module, M6 T3 review Minor-3) -- kept
+    # consistent within this one containment-emission function.
+    assert topic_chan.props["unresolved"] is True
+    assert topic_chan.props["config_ref"] == "SERVICE_WORKER_URL"
+
+
+TOPIC_SETTINGS_UNKNOWN_IDIOM = ConsumerIdiom(
+    name="base-consumer-subclass", kind="base_class",
+    base_class="kyc_base_consumer.base.BaseConsumer",
+    handler_method="process_event",
+    event_type_from=GenericArgSpec(generic_arg=0),
+    topic=ValueSpec(settings="app.config.kafka.KafkaSettings.nope"),
+)
+
+
+def test_base_class_topic_settings_unknown_field_skips_containment_silently_not_crash():
+    """Honest miss: the CONSUMES edge (handler -> event channel) is entirely
+    unaffected -- only the OPTIONAL topic-containment pairing on top of it is
+    skipped, silently, matching this module's existing "no counter" convention for
+    this specific containment path (see _emit_base_class_topic_containment's own
+    established precedent -- the pre-existing {attr: ...} path never bumped a
+    counter either)."""
+    relpath = "app/consumers/ocr.py"
+    ctx, node_ids, consts = _load(
+        relpath, "kyc-worker", BASE_CLASS_SRC, class_attr_index=KAFKA_SETTINGS_INDEX,
+    )
+    result = extract_kafka(
+        ctx, node_ids, _idioms(consumers=[TOPIC_SETTINGS_UNKNOWN_IDIOM]), consts,
+    )
+    assert result.stats["consumers_resolved"] == 1
     assert not any(e.type == "CONTAINS" for e in result.edges)

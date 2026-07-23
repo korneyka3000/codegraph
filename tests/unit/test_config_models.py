@@ -345,3 +345,142 @@ def test_base_class_topic_only_supports_attr_shape(topic):
             "event_type_from": {"generic_arg": 0},
             "topic": topic,
         })
+
+
+# -- M7 T2 (OPEN R2): ValueSpec settings:/enum: sources --
+
+
+def test_value_spec_settings_source_parses():
+    spec = ValueSpec.model_validate({"settings": "app.config.kafka.KafkaSettings.step_topic"})
+    assert spec.settings == "app.config.kafka.KafkaSettings.step_topic"
+
+
+def test_value_spec_enum_source_parses_via_alias():
+    """YAML/DSL surface: the natural key is `enum:`, not the Python attribute name
+    `enum_` (see ValueSpec's own field docstring for why the trailing underscore) --
+    an alias, populated the same way `model_validate` already handles every other
+    DSL field."""
+    spec = ValueSpec.model_validate({"enum": "app.models.enums.KycTopicName"})
+    assert spec.enum_ == "app.models.enums.KycTopicName"
+
+
+def test_value_spec_enum_source_constructible_by_field_name():
+    """`_Strict.model_config` gained `populate_by_name=True` (M7 T2) specifically so
+    Python call sites (this test file's own idiom fixtures, kafka_ext.py) can
+    construct `ValueSpec(enum_=...)` directly without spelling the YAML alias --
+    both spellings populate the SAME field."""
+    spec = ValueSpec(enum_="app.models.enums.KycTopicName")
+    assert spec.enum_ == "app.models.enums.KycTopicName"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"settings": "a.B.c", "arg": 0},
+        {"enum": "a.B", "arg": 0},
+        {"settings": "a.B.c", "enum": "a.B"},
+        {"settings": "a.B.c", "const": "x"},
+    ],
+    ids=["settings+arg", "enum+arg", "settings+enum", "settings+const"],
+)
+def test_value_spec_exactly_one_source_extended_to_settings_and_enum(fields):
+    """Same "exactly one source" contract as the original five fields (M2), now
+    covering the two M7 T2 additions -- a ValueSpec naming settings/enum ALONGSIDE
+    any other source (including each other) is a config error, not a
+    first-source-wins silent resolution."""
+    with pytest.raises(ValidationError):
+        ValueSpec.model_validate(fields)
+
+
+def test_value_spec_settings_alone_is_valid():
+    assert ValueSpec.model_validate({"settings": "a.B.c"}) is not None
+
+
+# -- M7 T2: enum source fail-closed outside a producer's topic-identity fields --
+
+
+def test_channel_spec_event_type_from_enum_source_rejected():
+    """R2a's fan-out over-approximation is sanctioned ONLY for a producer's TOPIC
+    identity (name_from/topic, both plain kafka_topic-shaped channel identity) --
+    the event_type_from field names the produced EVENT's type, a semantically
+    different (and, for `event_type` kind, singular per PRODUCES edge) identity;
+    fanning that out too has no analogous justification and is rejected at
+    config-load time."""
+    with pytest.raises(ValidationError):
+        ChannelSpec.model_validate({
+            "kind": "event_type", "event_type_from": {"enum": "app.models.enums.KycTopicName"},
+        })
+
+
+def test_channel_spec_name_from_enum_source_is_allowed():
+    """Sanity/contrast: the SAME enum source on `name_from` (a kafka_topic channel's
+    own identity, the field kafka_ext.py's fan-out mechanism actually reads) is NOT
+    rejected -- only event_type_from is restricted."""
+    ch = ChannelSpec.model_validate({
+        "kind": "kafka_topic", "name_from": {"enum": "app.models.enums.KycTopicName"},
+    })
+    assert ch.name_from.enum_ == "app.models.enums.KycTopicName"
+
+
+def test_channel_spec_topic_enum_source_is_allowed():
+    """Same contrast on the OTHER topic-shaped field (event_type kind's CONTAINS-
+    pairing `topic`) -- also unrestricted at the DSL layer (kafka_ext.py documents
+    why it doesn't implement fan-out there today, a runtime/extraction decision, not
+    a config-validity one)."""
+    ch = ChannelSpec.model_validate({
+        "kind": "event_type", "event_type_from": {"arg": 0},
+        "topic": {"enum": "app.models.enums.KycTopicName"},
+    })
+    assert ch.topic.enum_ == "app.models.enums.KycTopicName"
+
+
+def test_consumer_topic_enum_source_rejected():
+    """"Consumer topic/event_type_from with enum -> config error" (M7 T2 brief): a
+    handler consumes ONE topic, not a fan-out of every enum member -- no analogous
+    semantics to the producer side's over-approximation."""
+    with pytest.raises(ValidationError):
+        ConsumerIdiom.model_validate({
+            "name": "x", "kind": "call", "call": "pkg.Client.listen",
+            "topic": {"enum": "app.models.enums.KycTopicName"},
+        })
+
+
+def test_consumer_event_type_from_enum_source_rejected():
+    with pytest.raises(ValidationError):
+        ConsumerIdiom.model_validate({
+            "name": "x", "kind": "dispatch_dict",
+            "registrar_call": "app.consumers.base.register_handlers",
+            "event_type_from": {"enum": "app.models.enums.KycTopicName"},
+        })
+
+
+def test_base_class_topic_enum_source_still_rejected():
+    """base_class's topic validator now accepts attr OR settings (see the test just
+    below) but NOT enum -- both the base_class-specific "attr or settings" check and
+    the general consumer-wide enum ban independently reject this; either is
+    sufficient, this test just pins the observable outcome."""
+    with pytest.raises(ValidationError):
+        ConsumerIdiom.model_validate({
+            "name": "x", "kind": "base_class",
+            "base_class": "pkg.Base", "handler_method": "process_event",
+            "event_type_from": {"generic_arg": 0},
+            "topic": {"enum": "app.models.enums.KycTopicName"},
+        })
+
+
+# -- M7 T2: base_class topic now also accepts {settings: ...} alongside {attr: ...} --
+
+
+def test_base_class_topic_settings_shape_is_valid():
+    """Extends the base_class topic validator (previously attr-only): {settings:
+    ...} needs no call-site either (it resolves from the service-wide ClassAttrIndex
+    alone, see parsing/consts.py's resolve_settings_source), so it is just as
+    meaningful here as {attr: ...} -- both remain valid (pinned separately at the
+    extractor level, see test_kafka_extractor.py)."""
+    idiom = ConsumerIdiom.model_validate({
+        "name": "x", "kind": "base_class",
+        "base_class": "pkg.Base", "handler_method": "process_event",
+        "event_type_from": {"generic_arg": 0},
+        "topic": {"settings": "app.config.kafka.KafkaSettings.step_topic"},
+    })
+    assert idiom.topic.settings == "app.config.kafka.KafkaSettings.step_topic"

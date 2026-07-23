@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from codegraph.config.models import ValueSpec
+from codegraph.parsing.class_attrs import ClassAttrIndex
 from codegraph.parsing.facts import (
     ArgFact,
     CallFact,
@@ -90,9 +91,23 @@ def resolve_arg(arg: ArgFact, consts: ConstTable) -> Resolved:
     return Resolved(kind="unresolved")
 
 
-def resolve_value_spec(spec: ValueSpec, call: CallFact, consts: ConstTable) -> Resolved:
+def resolve_value_spec(
+    spec: ValueSpec, call: CallFact, consts: ConstTable,
+    class_attr_index: ClassAttrIndex | None = None,
+) -> Resolved:
     """const → value; arg/kwarg → найти ArgFact на call → resolve_arg; env → config_ref;
-    attr — http-идиома receiver-атрибута (T6): здесь заглушка unresolved."""
+    settings (M7 T2, OPEN R2) → resolve_settings_source (ClassAttrIndex lookup, needs
+    NO call-site at all -- see that function's own docstring); enum_ → defensively
+    unresolved (NOT a single-value source -- kafka_ext.py fans it out itself, see
+    kafka_ext._emit_enum_fanout_produces; reaching here means a caller that should
+    have special-cased enum_ FIRST did not, see ValueSpec.enum_'s own docstring);
+    attr — http-идиома receiver-атрибута (T6): здесь заглушка unresolved.
+
+    `class_attr_index` (M7 T2): trailing optional param, default None -- every
+    pre-existing call site (this module's own non-settings branches never touch it)
+    keeps working unchanged; only the settings branch reads it, and even then
+    gracefully degrades to unresolved when it's None (no ClassAttrIndex wired at
+    all) rather than raising."""
     if spec.const is not None:
         return Resolved(kind="value", value=spec.const)
     if spec.arg is not None:
@@ -103,8 +118,55 @@ def resolve_value_spec(spec: ValueSpec, call: CallFact, consts: ConstTable) -> R
         return resolve_arg(arg, consts) if arg is not None else Resolved(kind="unresolved")
     if spec.env is not None:
         return Resolved(kind="config_ref", config_ref=spec.env)
+    if spec.settings is not None:
+        return resolve_settings_source(spec.settings, class_attr_index)
+    if spec.enum_ is not None:
+        return Resolved(kind="unresolved")
     # spec.attr: ValueSpec._exactly_one гарантирует, что это единственная оставшаяся
     # ветка — receiver-атрибут разрешается только в T6 (http-client extractor).
+    return Resolved(kind="unresolved")
+
+
+def resolve_settings_source(
+    settings_ref: str, class_attr_index: ClassAttrIndex | None,
+) -> Resolved:
+    """M7 T2 (OPEN R2): `settings_ref` is "<ClassFQN>.<field>" -- split on the LAST
+    dot (the field name itself can never legitimately contain a dot, so
+    `str.rpartition(".")`'s "everything before the last dot" is exactly the class
+    FQN even when the FQN itself is deeply dotted, e.g.
+    "app.config.kafka.KafkaSettings.step_topic" -> class_fqn=
+    "app.config.kafka.KafkaSettings", field="step_topic"). Public (not
+    underscore-prefixed) because kafka_ext.py's base_class consumer topic path
+    (M6 T3) has no CallFact at all to satisfy resolve_value_spec's signature --
+    that call-site-less path calls this directly, exactly the same lookup
+    resolve_value_spec's OWN settings branch performs above (single source of
+    truth, no logic duplicated between the two call sites).
+
+    Three-way outcome, per ClassAttrIndex.settings_field (M7 T1)'s own
+    SettingsField(default, env_name) shape:
+      - a literal default is present -> Resolved(kind="value") -- a real static
+        literal, exactly as trustworthy as any other code-literal ValueSpec source.
+      - no default, but env_name is present (the field carries an env-derived name
+        via env_prefix or an explicit alias, T1) -> Resolved(kind="config_ref",
+        config_ref=env_name) -- the IDENTICAL shape resolve_value_spec's own `env:`
+        source already produces (same downstream channel-name/confidence/props
+        handling in kafka_ext.py, no new machinery needed).
+      - neither (a genuinely bare field, OR class_attr_index is None, OR the class/
+        field isn't found in it at all -- unknown class, unknown field, or an
+        ambiguous suffix match, ClassAttrIndex.settings_field's own None contract)
+        -> Resolved(kind="unresolved") -- an honest miss, not a crash; callers reuse
+        their EXISTING unresolved-value counters for this (kafka_ext.py's
+        producer_unresolved_channel/consumer_unresolved_topic), no new counter."""
+    if class_attr_index is None:
+        return Resolved(kind="unresolved")
+    class_fqn, _, field_name = settings_ref.rpartition(".")
+    field_obj = class_attr_index.settings_field(class_fqn, field_name)
+    if field_obj is None:
+        return Resolved(kind="unresolved")
+    if field_obj.default is not None:
+        return Resolved(kind="value", value=field_obj.default)
+    if field_obj.env_name is not None:
+        return Resolved(kind="config_ref", config_ref=field_obj.env_name)
     return Resolved(kind="unresolved")
 
 

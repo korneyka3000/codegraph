@@ -100,6 +100,56 @@ config-ref straight through the existing `Resolved(kind="config_ref")` /
 unresolved kafka_topic Channel(unresolved=True, config_ref=<attr text>) +
 CONTAINS(topic -> event), same edge shape _emit_event_type_produces already builds
 for its own topic/event pairing.
+
+M7 T2 (OPEN R2/R2a -- producer topic identity from code literals, ClassAttrIndex
+consumer): two new ValueSpec sources (config/models.py), both threaded through as
+`ctx.class_attr_index` (M7 T1, already wired into every FileContext by analyze.py --
+this task is the first actual CONSUMER of it):
+
+  - `settings: "<ClassFQN>.<field>"` -- resolved by `consts.resolve_settings_source`
+    (a THIN wrapper `resolve_value_spec` itself now also calls internally for this
+    source) straight from the service-wide ClassAttrIndex, needing NO call-site at
+    all: a literal default present -> a real static-tier(-quality) channel identity,
+    same as `const:`; no default but an env_name present -> the SAME `config_ref`
+    placeholder shape `env:` already produces (identical downstream channel-name/
+    confidence/props handling, no new machinery); neither, or an unknown class/
+    field -> `Resolved(kind="unresolved")`, reusing the EXISTING
+    producer_unresolved_channel/consumer_unresolved_topic counters (no new counter
+    anywhere in this task). Because it needs no call-site, `settings:` is ALSO
+    sanctioned (config/models.py's ConsumerIdiom._kind_requirements) on
+    kind="base_class"'s `topic` field, alongside the pre-existing `attr:` (which,
+    unlike `settings:`, can NEVER resolve to more than a config-reference label --
+    see `_emit_base_class_topic_containment` below for how the two shapes diverge
+    at emission time despite sharing one function).
+  - `enum: "<EnumClassFQN>"` (Python attribute `enum_`, see ValueSpec's own
+    docstring for the alias) -- NOT a single-value source at all: a class-level enum
+    names a whole FAMILY of possible topics, and a producer call-site match gives no
+    way to statically pick which member the runtime call actually sends (this is
+    EXACTLY the KYCEventPublisher-wrapper shape OPEN R2 diagnosed: `publish(body,
+    payload.topic_name, ...)`'s topic argument is a dynamic attribute, permanently
+    unresolvable via resolve_value_spec alone). `_emit_enum_fanout_produces` below
+    special-cases it BEFORE resolve_value_spec ever sees it (which, if it DID see an
+    enum_-sourced spec -- a defensive belt-and-braces path, since config/models.py's
+    OWN validators already keep this from happening for every DSL-sanctioned shape
+    -- returns `Resolved(kind="unresolved")` rather than guess): one PRODUCES edge +
+    one kafka_topic Channel PER member of `ClassAttrIndex.enum_values(...)`, ALL
+    from the SAME matched call-site, at a fixed (not tier-derived)
+    `("heuristic", 0.8)` resolution/confidence and `props={"mechanism":
+    "enum_fanout"}` -- documented, honest over-approximation (OPEN R2a): every
+    call-site this idiom's `call:` pattern matches is claimed to (over-)produce
+    EVERY topic the enum could ever name, not just the one the runtime call
+    actually picks. Sanctioned ONLY on a producer's topic-identity ValueSpec fields
+    (`ChannelSpec.name_from`/`.topic`) -- `ChannelSpec.event_type_from` and every
+    ConsumerIdiom ValueSpec field reject it at config-load time (see config/
+    models.py's own validators) since neither has an analogous "fan out" semantics
+    to justify the same tradeoff. This module implements the fan-out mechanism
+    itself only for `ChannelSpec.kind="kafka_topic"`'s `name_from` (the scenario
+    OPEN R2 actually needs); an enum source on `ChannelSpec.topic` (the
+    `kind="event_type"` CONTAINS-pairing field) is DSL-valid but has no fan-out
+    implementation here -- it degrades gracefully through resolve_value_spec's own
+    defensive unresolved branch above (silently skips the CONTAINS pairing, same as
+    any other unresolved topic; the event PRODUCES edge itself is unaffected), a
+    documented, deliberate scope narrowing rather than an oversight.
 """
 
 from __future__ import annotations
@@ -128,7 +178,12 @@ from codegraph.extractors.idiom_match import (
     _imports_module,
     match_calls,
 )
-from codegraph.parsing.consts import ConstTable, Resolved, resolve_value_spec
+from codegraph.parsing.consts import (
+    ConstTable,
+    Resolved,
+    resolve_settings_source,
+    resolve_value_spec,
+)
 from codegraph.parsing.facts import ArgFact, CallFact, DefFact
 from codegraph.resolvers.scip.symbols import parse_symbol, symbol_to_node_id
 
@@ -222,14 +277,19 @@ def _props_for(resolved: Resolved) -> dict:
     return {"config_ref": resolved.config_ref} if resolved.kind == "config_ref" else {}
 
 
-def _resolve_event_type_from(spec, call: CallFact, consts: ConstTable) -> Resolved:
+def _resolve_event_type_from(
+    spec, call: CallFact, consts: ConstTable, class_attr_index=None,
+) -> Resolved:
     """channel.event_type_from is `ValueSpec | Literal["dict_key"]` at the model level
     (shared with ConsumerIdiom's dispatch_dict field) -- "dict_key" has no meaning for
     a ProducerIdiom.channel (there's no dict being iterated at a producer call-site);
-    defensively unresolved rather than a resolve_value_spec(str, ...) crash."""
+    defensively unresolved rather than a resolve_value_spec(str, ...) crash. enum_ is
+    never reachable here in practice (config/models.py's ChannelSpec validator
+    rejects it on event_type_from at config-load time) -- resolve_value_spec's own
+    defensive unresolved fallback covers it anyway, belt-and-braces."""
     if not isinstance(spec, ValueSpec):
         return Resolved(kind="unresolved")
-    return resolve_value_spec(spec, call, consts)
+    return resolve_value_spec(spec, call, consts, class_attr_index)
 
 
 # -- producers -------------------------------------------------------------------------
@@ -264,11 +324,57 @@ def _emit_kafka_topic_produces(
     sink.stats["producers_resolved"] += 1
 
 
+def _emit_enum_fanout_produces(
+    ctx: FileContext, enclosing_id: str, m: CallMatch, spec: ValueSpec, sink: _Sink,
+) -> None:
+    """M7 T2 (OPEN R2a): `spec` (channel.name_from) carries an enum_ source -- see
+    this module's own docstring for the full over-approximation rationale. One
+    PRODUCES edge + one kafka_topic Channel PER member of
+    `ClassAttrIndex.enum_values(spec.enum_)`, all from this SAME matched call-site;
+    a fixed `("heuristic", 0.8)` resolution/confidence pair (NOT tier-derived --
+    even a STATIC/1.0 call-site match doesn't make WHICH enum member fired any less
+    uncertain, so the topic-identity penalty is constant regardless of how
+    confidently the call itself was located) and `props={"mechanism":
+    "enum_fanout"}` so a graph consumer can identify (and, if ever needed, filter)
+    this specific edge class. No class_attr_index wired, or the enum FQN unknown/
+    ambiguous (ClassAttrIndex.enum_values' own None contract) -> the SAME
+    producer_unresolved_channel counter every other unresolvable producer source
+    already bumps (no new counter, per this task's own brief: "no new counters
+    expected"). An individual member whose harvested value is the EMPTY string
+    (`_harvest_enum_values`'s own contract only requires a string, not a non-empty
+    one) is skipped silently, same "M2 final review" empty-name crash guard every
+    other make_channel_node call site in this module already carries -- the other
+    (non-empty) members still fan out normally, no counter bump for the one skip
+    (this is a per-member guard, not a whole-call-site miss)."""
+    values = (
+        ctx.class_attr_index.enum_values(spec.enum_)
+        if ctx.class_attr_index is not None else None
+    )
+    if not values:
+        sink.stats["producer_unresolved_channel"] += 1
+        return
+    sink.add_role(enclosing_id, "MessageProducer")
+    for value in values:
+        if not value:
+            continue
+        chan = make_channel_node("kafka_topic", name=value)
+        sink.channels.append(chan)
+        sink.edges.append(EdgeRec(
+            src=enclosing_id, dst=chan.id, type="PRODUCES",
+            resolution="heuristic", confidence=0.8, extractor=_EXTRACTOR,
+            evidence_file=ctx.relpath, evidence_line=m.call.start_line,
+            props={"mechanism": "enum_fanout"},
+        ))
+        sink.stats["producers_resolved"] += 1
+
+
 def _emit_event_type_produces(
     ctx: FileContext, enclosing_id: str, m: CallMatch, channel: ChannelSpec, consts: ConstTable,
     sink: _Sink,
 ) -> None:
-    event_resolved = _resolve_event_type_from(channel.event_type_from, m.call, consts)
+    event_resolved = _resolve_event_type_from(
+        channel.event_type_from, m.call, consts, ctx.class_attr_index,
+    )
     if event_resolved.kind == "unresolved":
         sink.stats["producer_unresolved_channel"] += 1
         return
@@ -294,7 +400,7 @@ def _emit_event_type_produces(
 
     if channel.topic is None:
         return
-    topic_resolved = resolve_value_spec(channel.topic, m.call, consts)
+    topic_resolved = resolve_value_spec(channel.topic, m.call, consts, ctx.class_attr_index)
     if topic_resolved.kind == "unresolved":
         return
     topic_name = _channel_name(topic_resolved)
@@ -325,8 +431,15 @@ def _emit_producer(
         return
     channel = idiom.channel
     if channel.kind == "kafka_topic":
+        if channel.name_from is not None and channel.name_from.enum_ is not None:
+            # M7 T2 (OPEN R2a): enum_ fans out into MULTIPLE channels/edges --
+            # dispatched BEFORE the generic single-value resolve_value_spec path
+            # below, which enum_ deliberately never reaches for a kafka_topic
+            # channel (see this module's own docstring).
+            _emit_enum_fanout_produces(ctx, enclosing_id, m, channel.name_from, sink)
+            return
         resolved = (
-            resolve_value_spec(channel.name_from, m.call, consts)
+            resolve_value_spec(channel.name_from, m.call, consts, ctx.class_attr_index)
             if channel.name_from is not None else Resolved(kind="unresolved")
         )
         _emit_kafka_topic_produces(ctx, enclosing_id, m, resolved, sink)
@@ -363,7 +476,7 @@ def _emit_call_consumer(
     if idiom.topic is None:
         sink.stats["consumer_unresolved_topic"] += 1
         return
-    resolved = resolve_value_spec(idiom.topic, m.call, consts)
+    resolved = resolve_value_spec(idiom.topic, m.call, consts, ctx.class_attr_index)
     if resolved.kind == "unresolved":
         sink.stats["consumer_unresolved_topic"] += 1
         return
@@ -443,7 +556,7 @@ def _emit_dispatch_dict(
 
     if idiom.topic is None or not resolved_events:
         return
-    topic_resolved = resolve_value_spec(idiom.topic, m.call, consts)
+    topic_resolved = resolve_value_spec(idiom.topic, m.call, consts, ctx.class_attr_index)
     if topic_resolved.kind == "unresolved":
         return
     topic_name = _channel_name(topic_resolved)
@@ -670,29 +783,65 @@ def _emit_base_class_topic_containment(
     ctx: FileContext, idiom: ConsumerIdiom, tier: MatchTier, event_chan: NodeRec,
     evidence_line: int, sink: _Sink,
 ) -> None:
-    if idiom.topic is None or idiom.topic.attr is None:
-        return  # config/models.py's _kind_requirements guarantees .attr when topic is set
-    # No call-site to resolve against at all (unlike the call/dispatch_dict consumer
-    # paths) -- idiom.topic.attr is a config-reference LABEL, not something to
-    # resolve; reuses the EXISTING "config_ref" Resolved shape (and its established
-    # always-downgrades-to-heuristic/<=0.6 convention, `_resolution_for`) directly.
-    resolved = Resolved(kind="config_ref", config_ref=idiom.topic.attr)
-    resolution, confidence = _resolution_for(tier, resolved)
-    # Deliberate convention divergence (M6 T3 review Minor-3): unresolved/config_ref
-    # land as NODE props here, whereas this module's other channels carry config_ref
-    # as an EDGE prop only (`_props_for`) and no unresolved marker at all. The
-    # precedent actually followed is linking/http_routes.py's
-    # `_unresolved_channel_and_edge` (Channel(unresolved=True, ...) node props for a
-    # channel whose identity is known-incomplete) -- and it fits: this channel's
-    # NAME itself is a config placeholder ("${self.config.topic}"), so the
-    # unresolvedness is a property of the channel node's identity, not of any one
-    # edge's evidence. The kafka edge-prop convention is kept for the existing
-    # call-site-resolved shapes, where the channel name IS concrete and only the
-    # resolution path varies per edge.
-    topic_chan = make_channel_node(
-        "kafka_topic", name=_channel_name(resolved),
-        unresolved=True, config_ref=idiom.topic.attr,
-    )
+    if idiom.topic is None:
+        # config/models.py's _kind_requirements guarantees attr-or-settings when topic is set
+        return
+    if idiom.topic.settings is not None:
+        # M7 T2 (OPEN R2): UNLIKE .attr just below (always a config-reference LABEL
+        # -- there genuinely is no call-site to read it from), .settings resolves
+        # from the SERVICE-WIDE ClassAttrIndex alone -- no call-site needed at all,
+        # so it CAN legitimately come back as a real literal (a SettingsField
+        # default) instead of a permanent placeholder. Reuses
+        # consts.resolve_settings_source directly -- the EXACT same lookup
+        # resolve_value_spec's own settings branch performs -- rather than
+        # resolve_value_spec itself, since there is still no CallFact to satisfy
+        # that function's signature here (mirrors the .attr branch's own
+        # pre-existing "no call-site, hand-roll the Resolved" precedent).
+        resolved = resolve_settings_source(idiom.topic.settings, ctx.class_attr_index)
+        name = _channel_name(resolved)
+        if resolved.kind == "unresolved" or not name:
+            # Honest miss (unknown class/field, or a bare field with neither
+            # default nor env_name) -- no containment edge. Silent, no counter: the
+            # CONSUMES edge (handler -> event channel) was already emitted by the
+            # caller regardless; this pairing is a best-effort bonus on top of it,
+            # same "silent skip" convention every other empty/unresolved topic-
+            # containment guard in this module already follows (e.g.
+            # _emit_event_type_produces' own unresolved-topic branch).
+            return
+        resolution, confidence = _resolution_for(tier, resolved)
+        if resolved.kind == "config_ref":
+            # Same node-props convention as the .attr branch below (M6 T3 review
+            # Minor-3, kept consistent WITHIN this one function): the channel's own
+            # NAME is a config placeholder ("${ENV_NAME}"), so the unresolvedness is
+            # a property of the channel's identity, not of this one edge's evidence.
+            topic_chan = make_channel_node(
+                "kafka_topic", name=name, unresolved=True, config_ref=resolved.config_ref,
+            )
+        else:
+            topic_chan = make_channel_node("kafka_topic", name=name)
+    else:
+        assert idiom.topic.attr is not None  # _kind_requirements guarantees attr XOR settings
+        # No call-site to resolve against at all (unlike the call/dispatch_dict consumer
+        # paths) -- idiom.topic.attr is a config-reference LABEL, not something to
+        # resolve; reuses the EXISTING "config_ref" Resolved shape (and its established
+        # always-downgrades-to-heuristic/<=0.6 convention, `_resolution_for`) directly.
+        resolved = Resolved(kind="config_ref", config_ref=idiom.topic.attr)
+        resolution, confidence = _resolution_for(tier, resolved)
+        # Deliberate convention divergence (M6 T3 review Minor-3): unresolved/config_ref
+        # land as NODE props here, whereas this module's other channels carry config_ref
+        # as an EDGE prop only (`_props_for`) and no unresolved marker at all. The
+        # precedent actually followed is linking/http_routes.py's
+        # `_unresolved_channel_and_edge` (Channel(unresolved=True, ...) node props for a
+        # channel whose identity is known-incomplete) -- and it fits: this channel's
+        # NAME itself is a config placeholder ("${self.config.topic}"), so the
+        # unresolvedness is a property of the channel node's identity, not of any one
+        # edge's evidence. The kafka edge-prop convention is kept for the existing
+        # call-site-resolved shapes, where the channel name IS concrete and only the
+        # resolution path varies per edge.
+        topic_chan = make_channel_node(
+            "kafka_topic", name=_channel_name(resolved),
+            unresolved=True, config_ref=idiom.topic.attr,
+        )
     sink.channels.append(topic_chan)
     sink.edges.append(EdgeRec(
         src=topic_chan.id, dst=event_chan.id, type="CONTAINS",
