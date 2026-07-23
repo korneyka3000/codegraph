@@ -130,3 +130,39 @@ services:
 
     http_names = [h.name for h in idioms.http_clients]
     assert http_names == ["custom-sdk", "aiohttp-client-convention"]
+
+
+# -- M7 T3 (OPEN R1): env_sources path resolution -- mirrors ServiceConfig.path's own
+# "resolve relative to the workspace yaml's own dir, validate existence" contract
+# (test_load_explicit_yaml_resolves_paths / test_missing_service_path_raises above).
+
+
+def test_env_sources_resolved_relative_to_workspace_yaml_dir(tmp_path):
+    (tmp_path / "helm").mkdir()
+    (tmp_path / "helm" / "values.yaml").write_text(
+        'SERVICE_X_URL: "http://svc-a.ns.svc.cluster.local"\n'
+    )
+    p = _mk_ws(tmp_path, MINIMAL + "env_sources: [helm/values.yaml]\n")
+    cfg = load_workspace(p)
+    assert cfg.env_sources == [(tmp_path / "helm" / "values.yaml").resolve()]
+
+
+def test_env_sources_absolute_path_kept_as_is(tmp_path):
+    (tmp_path / "helm").mkdir()
+    abs_path = (tmp_path / "helm" / "values.yaml").resolve()
+    abs_path.write_text('SERVICE_X_URL: "http://svc-a.ns.svc.cluster.local"\n')
+    p = _mk_ws(tmp_path, MINIMAL + f"env_sources: [{abs_path.as_posix()}]\n")
+    cfg = load_workspace(p)
+    assert cfg.env_sources == [abs_path]
+
+
+def test_env_sources_missing_file_raises(tmp_path):
+    p = _mk_ws(tmp_path, MINIMAL + "env_sources: [helm/missing.yaml]\n")
+    with pytest.raises(ConfigError, match="missing.yaml"):
+        load_workspace(p)
+
+
+def test_env_sources_absent_defaults_to_empty_list(tmp_path):
+    p = _mk_ws(tmp_path, MINIMAL)
+    cfg = load_workspace(p)
+    assert cfg.env_sources == []

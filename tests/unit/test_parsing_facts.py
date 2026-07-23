@@ -1,4 +1,10 @@
-from codegraph.parsing.facts import ArgFact, AssignFact, ParamFact, build_file_facts
+from codegraph.parsing.facts import (
+    ArgFact,
+    AssignFact,
+    ParamFact,
+    SelfAttrFact,
+    build_file_facts,
+)
 
 SRC = b'''"""Module doc."""
 import os
@@ -716,4 +722,134 @@ def test_smoke_all_fixture_files_have_class_attrs_list_populated_where_expected(
         assert isinstance(facts.class_attrs, list)
         for a in facts.class_attrs:
             assert isinstance(a.name, str)
-            assert a.call_args is None or isinstance(a.call_args, list)
+
+
+# -- M7 T3: SelfAttrFact (`self.<attr> = <expr>` assignments, http_client_ext's
+# auto-anchor join surface -- OPEN R1) ---------------------------------------------
+#
+# Pre-step finding (this task's own brief, per T1's precedent -- "check first, ctor-
+# body assigns may already be there"): neither AssignFact nor ClassAttrFact capture
+# an ATTRIBUTE-target assignment at all -- both gate on `left.type == "identifier"`,
+# so `self.host = config.services.x_url` (attribute target, RHS an attribute chain)
+# was invisible to every existing fact type. SelfAttrFact is a brand-new, narrowly-
+# scoped fact type (mirrors ClassAttrFact's own T1 precedent): only a simple
+# `self.<single-identifier> = <expr>` target is captured (a deeper target chain like
+# `self._nested.host = x`, or a non-"self" receiver, is out of scope), and only a
+# plain dotted-chain/bare-name RHS decodes a `rhs_tail` (anything else -- call,
+# literal, subscript -- honestly `None`, never a guess).
+
+
+def test_self_attr_fact_captures_dotted_chain_rhs_tail():
+    facts = build_file_facts(
+        "x.py",
+        b"class C:\n"
+        b"    def __init__(self, config):\n"
+        b"        self.host = config.services.verification_requests_url\n",
+    )
+    init = next(d for d in facts.defs if d.name == "__init__")
+    a = next(a for a in facts.self_attr_assigns if a.attr == "host")
+    assert a.rhs_tail == "verification_requests_url"
+    assert a.rhs_text == "config.services.verification_requests_url"
+    assert a.enclosing_def == init.index
+    assert a.start_line == 3
+
+
+def test_self_attr_fact_bare_name_rhs_is_its_own_tail():
+    facts = build_file_facts(
+        "x.py",
+        b"class C:\n    def __init__(self, url):\n        self.host = url\n",
+    )
+    a = next(a for a in facts.self_attr_assigns if a.attr == "host")
+    assert a.rhs_tail == "url"
+
+
+def test_self_attr_fact_call_rhs_has_no_tail():
+    facts = build_file_facts(
+        "x.py",
+        b"class C:\n    def __init__(self):\n        self.host = get_host()\n",
+    )
+    a = next(a for a in facts.self_attr_assigns if a.attr == "host")
+    assert a.rhs_tail is None
+
+
+def test_self_attr_fact_string_literal_rhs_has_no_tail():
+    facts = build_file_facts(
+        "x.py",
+        b'class C:\n    def __init__(self):\n        self.host = "localhost"\n',
+    )
+    a = next(a for a in facts.self_attr_assigns if a.attr == "host")
+    assert a.rhs_tail is None
+
+
+def test_self_attr_fact_non_self_receiver_not_captured():
+    facts = build_file_facts(
+        "x.py",
+        b"class C:\n    def __init__(self, other):\n        other.host = self.x\n",
+    )
+    assert facts.self_attr_assigns == []
+
+
+def test_self_attr_fact_deeper_target_chain_not_captured():
+    """`self._nested.host = x` -- the ASSIGNMENT TARGET's own object is itself an
+    attribute (`self._nested`), not the bare name "self" -- out of scope (simple
+    `self.<attr>` targets only, the same "complex targets skipped" restriction
+    AssignFact already applies to its own simple-identifier-target contract)."""
+    facts = build_file_facts(
+        "x.py",
+        b"class C:\n    def __init__(self, x):\n        self._nested.host = x\n",
+    )
+    assert facts.self_attr_assigns == []
+
+
+def test_self_attr_fact_different_attr_name_still_captured():
+    """Any `self.<attr>` is captured regardless of name -- `HttpClientIdiom.host_attr`
+    configurability (http_client_ext.py, M7 T3) is a CALLER filter, not a collection
+    gate here."""
+    facts = build_file_facts(
+        "x.py",
+        b"class C:\n    def __init__(self, x):\n        self._host = x\n",
+    )
+    a = next(a for a in facts.self_attr_assigns if a.attr == "_host")
+    assert a.rhs_tail == "x"
+
+
+def test_self_attr_fact_scope_blind_module_level_still_captured():
+    """Same scope-blind "collection unconditional, caller filters" convention as
+    AssignFact/ClassAttrFact -- a module-level `self.host = x` is nonsensical Python
+    but mechanically identical at the tree-sitter level; enclosing_def is None."""
+    facts = build_file_facts("x.py", b"self.host = x\n")
+    a = next(a for a in facts.self_attr_assigns if a.attr == "host")
+    assert a.enclosing_def is None
+
+
+def test_self_attr_fact_field_order_matches_contract():
+    a = SelfAttrFact(
+        "host", "verification_requests_url",
+        "config.services.verification_requests_url", 5, 3,
+    )
+    assert a.attr == "host"
+    assert a.rhs_tail == "verification_requests_url"
+    assert a.rhs_text == "config.services.verification_requests_url"
+    assert a.enclosing_def == 5
+    assert a.start_line == 3
+
+
+def test_file_facts_self_attr_assigns_defaults_to_empty_list_when_omitted():
+    """Same additive-field precedent as `assigns`/`class_attrs`: a construction site
+    that doesn't pass `self_attr_assigns` keeps working, defaulting to an empty
+    list."""
+    from codegraph.parsing.facts import FileFacts
+
+    f = FileFacts(relpath="x.py", module_docstring=None, defs=[], calls=[], imports=[])
+    assert f.self_attr_assigns == []
+
+
+def test_smoke_all_fixture_files_have_self_attr_assigns_list_populated_where_expected():
+    from pathlib import Path
+
+    fixtures = Path(__file__).parents[2] / "fixtures" / "services"
+    for f in fixtures.rglob("*.py"):
+        facts = build_file_facts(str(f), f.read_bytes())
+        assert isinstance(facts.self_attr_assigns, list)
+        for a in facts.self_attr_assigns:
+            assert isinstance(a.attr, str)

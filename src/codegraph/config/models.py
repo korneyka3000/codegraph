@@ -259,6 +259,17 @@ class ConsumerIdiom(_Strict):
 class BaseUrlSpec(_Strict):
     attr: str | None = None
     env: str | None = None
+    # M7 T3 (OPEN R1): explicit alternative to `env` -- "<ClassFQN>.<field>" (same
+    # shape as ValueSpec.settings, M7 T2). http_client_ext.py resolves it via
+    # ClassAttrIndex.settings_field (a PER-CLASS lookup -- unlike the self.host
+    # auto-anchor's service-wide, ambiguity-prone field_by_name join, naming the
+    # class removes any collision risk) and takes priority over auto-anchoring,
+    # exactly like `env` already does. No "exactly one of attr/env/settings"
+    # validator here (unlike ValueSpec) -- `attr` documents WHERE the base-url text
+    # comes from structurally (a fact this extractor does not even read back today),
+    # `env`/`settings` separately anchor the TARGET service; fixtures/workspace.yaml
+    # already relies on attr+env coexisting (`{attr: "self._base_url", env: ...}`).
+    settings: str | None = None
 
 
 class HttpRouteFromSpec(_Strict):
@@ -293,6 +304,14 @@ class HttpClientIdiom(_Strict):
     route_from: HttpRouteFromSpec | None = None
     call: str | None = None  # "recv_tail.callee|recv_tail2.callee2" -- "|"-альтернативы
     verb_from: HttpVerbFromSpec | None = None
+    # M7 T3 (OPEN R1): auto-anchor target attribute name -- http_client_ext.py looks
+    # for a `self.<host_attr> = <dotted-chain-or-name>` assignment inside the matched
+    # client class (any method, AST-walk order) and joins the RHS's last identifier
+    # through the service-wide ClassAttrIndex.field_by_name (env-gated) to recover a
+    # base_url_env the idiom itself never spelled out explicitly. Bare attribute name
+    # only (no "self." prefix -- implicit/fixed); default "host" matches the OPEN R1
+    # pilot's own real convention (`self.host = config.services.x_url`) verbatim.
+    host_attr: str = "host"
 
     @model_validator(mode="after")
     def _decorator_sdk_all_or_nothing(self) -> HttpClientIdiom:
@@ -383,3 +402,11 @@ class WorkspaceConfig(_Strict):
     services: list[ServiceConfig]
     builtin_idioms: list[str] = Field(default_factory=lambda: list(DEFAULT_BUILTIN_IDIOMS))
     processes: list[ProcessDecl] = Field(default_factory=list)
+    # M7 T3 (OPEN R1): YAML files (e.g. helm values) carrying env-var -> URL mappings,
+    # harvested into an env->service map (linking/env_map.py) that anchors http_call
+    # claims whose base_url_env isn't already covered by any ServiceConfig.http.
+    # base_url_env (the pre-existing, PRIMARY registry -- this is an ADDITIVE
+    # fallback, consulted only when that registry finds no owner). Paths are relative
+    # to the workspace yaml's OWN directory -- config/loader.py resolves + validates
+    # existence at load time, mirroring ServiceConfig.path's own contract exactly.
+    env_sources: list[Path] = Field(default_factory=list)

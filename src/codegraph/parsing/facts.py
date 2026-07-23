@@ -100,6 +100,49 @@ class AssignFact:
 
 
 @dataclass(frozen=True)
+class SelfAttrFact:
+    """`self.<attr> = <expr>` assignments -- M7 T3 sanctioned additive extension
+    (mirrors ClassAttrFact's own T1 precedent): http_client_ext.py's auto-anchor
+    (OPEN R1) needs to find a client class's ctor-body `self.host = config.services.
+    x_url` (an ATTRIBUTE assignment TARGET, RHS an attribute-CHAIN expression),
+    which neither AssignFact NOR ClassAttrFact can see -- both gate on `left.type ==
+    "identifier"` (a bare name), so an attribute target was invisible to every
+    existing fact type before this.
+
+    Scope-blind, same "collection unconditional, caller filters" convention as every
+    other Fact type here: populated for `self.<attr> = <expr>` wherever it textually
+    occurs (module/function/class body -- a module-level `self.host = x` is
+    nonsensical Python but mechanically identical at the tree-sitter level) --
+    callers needing "inside THIS class's method" semantics filter by
+    `enclosing_def`'s own DefFact.parent chain, same as `_enclosing_method_and_class`
+    already does for CallFact in http_client_ext.py.
+
+    Only a SIMPLE target is captured: the assignment's own `left` must be an
+    `attribute` node whose `object` is the bare identifier "self" (no deeper chain --
+    `self._nested.host = x` is out of scope, same "complex targets skipped"
+    restriction AssignFact already applies to its own simple-identifier-target
+    contract). `attr` is the single identifier right after `self.` (`self.host` ->
+    "host"; ANY name, not just "host" -- `HttpClientIdiom.host_attr` configurability
+    is a caller filter, not a collection gate here).
+
+    `rhs_tail` is the LAST identifier segment of the RHS IFF it is itself a plain
+    dotted-attribute chain (`config.services.x_url` -> "x_url") or a bare name (`x`
+    -> "x") -- exactly what T3's auto-anchor joins through
+    `ClassAttrIndex.field_by_name`. `None` for any other RHS shape (call, literal,
+    subscript, ...) -- honestly "not this shape", never a guess. `rhs_text` is the
+    RHS's raw source text (mirrors every other Fact type's own "keep the raw text
+    alongside the decoded value" convention), `None` only when there is no RHS at
+    all (never the case for an `assignment` node's own `right` field, but kept
+    optional for symmetry with ClassAttrFact's `value_text`)."""
+
+    attr: str
+    rhs_tail: str | None
+    rhs_text: str | None
+    enclosing_def: int | None
+    start_line: int
+
+
+@dataclass(frozen=True)
 class ClassAttrFact:
     """One simple `name[: annotation] [= value]` assignment -- ANY scope (module,
     function, or class body; `enclosing_def` is the index into `FileFacts.defs` of the
@@ -168,6 +211,9 @@ class FileFacts:
     # construction site (grepped before adding this: only build_file_facts' own return,
     # see below) keeps working unchanged.
     class_attrs: list[ClassAttrFact] = field(default_factory=list)
+    # M7 T3 sanctioned additive extension (same precedent, SelfAttrFact's own
+    # docstring has the full rationale): new LAST field with a default.
+    self_attr_assigns: list[SelfAttrFact] = field(default_factory=list)
 
 
 def _strip_string(text: str) -> str:
@@ -313,6 +359,29 @@ def _call_callee_name(fn_node) -> str | None:
         if attr is not None:
             return attr.text.decode("utf-8", errors="replace")
     return None
+
+
+# -- SelfAttrFact construction (M7 T3) ------------------------------------------------
+#
+# `_dotted_tail` generalizes `_call_callee_name`'s own "attribute reduced to its LAST
+# segment" convention to a non-call RHS: an `attribute` node's own "attribute" field
+# IS already the rightmost identifier by grammar construction (nested `.object` chains
+# of any depth do not need walking), and a bare `identifier` node is a single-segment
+# "chain" of its own. Any other node type (call, string, subscript, ...) -> None,
+# honestly "not a dotted-chain/bare-name shape" -- see SelfAttrFact's own docstring.
+
+
+def _dotted_tail(node) -> str | None:
+    if node.type == "identifier":
+        return node.text.decode("utf-8", errors="replace")
+    if node.type == "attribute":
+        attr = node.child_by_field_name("attribute")
+        return attr.text.decode("utf-8", errors="replace") if attr is not None else None
+    return None
+
+
+def _is_bare_self(node) -> bool:
+    return node.type == "identifier" and node.text == b"self"
 
 
 def _build_class_attr_fact(
@@ -465,6 +534,7 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
     imports: list[ImportFact] = []
     assigns: list[AssignFact] = []
     class_attrs: list[ClassAttrFact] = []
+    self_attr_assigns: list[SelfAttrFact] = []
 
     def visit(node, parent_def: int | None, decorators: list[str]):
         if node.type == "decorated_definition":
@@ -579,6 +649,25 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
                             call_args=_build_call_args(call_node.child_by_field_name("arguments")),
                             start_line=node.start_point[0] + 1,
                         ))
+            # M7 T3 sanctioned additive extension: `self.<attr> = <expr>` -- see
+            # SelfAttrFact's own docstring for the full rationale (http_client_ext's
+            # auto-anchor join surface). Simple target only: `left` is an `attribute`
+            # node whose OWN `object` is the bare identifier "self" (a deeper chain
+            # like `self._nested.host = x` is out of scope, same restriction
+            # AssignFact already applies to ITS OWN simple-identifier-target
+            # contract) -- distinct from the identifier-target branches above, so
+            # both can never fire on the same assignment.
+            if left is not None and left.type == "attribute":
+                obj = left.child_by_field_name("object")
+                attr_node = left.child_by_field_name("attribute")
+                if obj is not None and _is_bare_self(obj) and attr_node is not None:
+                    self_attr_assigns.append(SelfAttrFact(
+                        attr=attr_node.text.decode("utf-8", errors="replace"),
+                        rhs_tail=_dotted_tail(right) if right is not None else None,
+                        rhs_text=_text_or(right),
+                        enclosing_def=parent_def,
+                        start_line=node.start_point[0] + 1,
+                    ))
 
         if node.type == "import_statement":
             for ch in node.named_children:
@@ -641,4 +730,5 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
         imports=imports,
         assigns=assigns,
         class_attrs=class_attrs,
+        self_attr_assigns=self_attr_assigns,
     )

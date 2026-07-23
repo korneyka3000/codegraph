@@ -51,7 +51,22 @@ def load_workspace(target: Path) -> WorkspaceConfig:
         if not path.is_dir():
             raise ConfigError(f"service {svc.name!r}: path does not exist: {path}")
         resolved_services.append(svc.model_copy(update={"path": path}))
-    cfg = cfg.model_copy(update={"services": resolved_services})
+    # M7 T3 (OPEN R1): env_sources paths resolve relative to the workspace yaml's own
+    # dir, mirroring ServiceConfig.path's exact contract just above (relative-vs-
+    # absolute check, .resolve(), loud ConfigError on a missing file) -- validating
+    # existence HERE (config load time) rather than defensively degrading in
+    # linking/env_map.py keeps a typo'd path a loud, immediate signal instead of a
+    # silently-empty env->service map three stages later.
+    resolved_env_sources = []
+    for p in cfg.env_sources:
+        path = p if p.is_absolute() else (base / p)
+        path = path.resolve()
+        if not path.is_file():
+            raise ConfigError(f"env_sources entry not found: {path}")
+        resolved_env_sources.append(path)
+    cfg = cfg.model_copy(
+        update={"services": resolved_services, "env_sources": resolved_env_sources},
+    )
 
     try:
         resolve_builtins(cfg.builtin_idioms)

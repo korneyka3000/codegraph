@@ -201,6 +201,33 @@ report.py reads with `.get(key, 0)`); pipeline/report.py's `print_report` shows 
 yellow "http idiom misses" line whenever any counter is nonzero. `codegraph doctor`
 remains out of the loop by design -- the analyze report dict is the surface these
 belong to, same as `calls_unresolved`.
+
+AUTO-ANCHOR (M7 T3, OPEN R1 -- docs/superpowers/reports/2026-07-23-pilot-rerun-open-
+gaps.md): `base_url_env` was previously ALWAYS `idiom.base_url.env if idiom.base_url
+else None` -- a pure idiom-config lookup, blind to the call site. The pilot's own
+regression: a real idiom named `base_url: {attr: self.host}` with NO `env` (the client's
+host is a dynamic Settings-backed attribute, resolved only at runtime) -- every claim
+from that idiom was therefore PERMANENTLY unanchored, which is what let linking/
+http_routes.py's S7 stage match those claims' paths against EVERY service's routes with
+no narrowing at all (see that module's own docstring for the false-match consequence).
+`base_url_env` is now `_claim_base_url_env(idiom, cls, ...)`: explicit config
+(`base_url.env`, or M7 T3's new `base_url.settings` -- a per-class ClassAttrIndex.
+settings_field lookup) still wins outright when present; otherwise, `_self_attr_env`
+looks for a `self.<host_attr> = <dotted-chain-or-name>` assignment (SelfAttrFact, M7 T3
+sanctioned additive extension to parsing/facts.py -- neither AssignFact nor ClassAttrFact
+could see an ATTRIBUTE assignment target at all before this) ANYWHERE in the matched
+client class's own body, and joins the RHS's LAST identifier through the service-wide
+ClassAttrIndex.field_by_name (already env-gated by T1 -- an ambiguous or env-less field
+name is honestly absent, never guessed). `host_attr` (idiom field, default "host") makes
+the target attribute name configurable, since real SDKs vary (`self.host`, `self._host`,
+...). Both verb-mode (`_emit_claim`'s caller) and decorator-SDK mode compute this
+identically, once per matched class per call-site -- see `_claim_base_url_env`'s own
+docstring for the full precedence and `_self_attr_env`'s for the join mechanics. A claim
+that still resolves to `base_url_env=None` after all of this (no assignment found, RHS
+not a dotted-chain, or the field join misses) stays honestly unanchored -- linking/
+http_routes.py's own anchoring tiers (M7 T3) then refuse to award it static/1.0 confidence
+regardless, so an incomplete auto-anchor degrades to a lower-confidence match, never a
+false one.
 """
 
 from __future__ import annotations
@@ -214,8 +241,9 @@ from codegraph.config.models import (
     HttpVerbFromSpec,
     ServiceIdioms,
 )
+from codegraph.parsing.class_attrs import ClassAttrIndex
 from codegraph.parsing.consts import ConstTable, Resolved, resolve_arg
-from codegraph.parsing.facts import CallFact, DefFact, build_file_facts
+from codegraph.parsing.facts import CallFact, DefFact, SelfAttrFact, build_file_facts
 
 from .base import FileContext
 
@@ -312,6 +340,76 @@ def _enclosing_class(defs_by_index: dict[int, DefFact], d: DefFact) -> DefFact |
             return parent
         idx = parent.parent
     return None
+
+
+# -- M7 T3 (OPEN R1): base_url_env resolution -- explicit idiom config, THEN
+# self.<host_attr>-assignment auto-anchor. See http_client_ext's own module docstring
+# addendum below `extract_http_client` for the full narrative; this is the mechanism.
+
+
+def _explicit_base_url_env(
+    idiom: HttpClientIdiom, class_attr_index: ClassAttrIndex | None,
+) -> str | None:
+    """Explicit idiom-configured anchor -- `base_url.env` (verbatim) or
+    `base_url.settings` (M7 T3: "<ClassFQN>.<field>", a PER-CLASS
+    ClassAttrIndex.settings_field lookup -- mirrors ValueSpec.settings, see
+    parsing/consts.py's resolve_settings_source) -- either WINS over self.host
+    auto-anchoring below, per this task's own "explicit beats auto" rule. `env` is
+    checked first (cheapest, needs no index at all); `settings` degrades to None
+    when no index is wired, same convention resolve_settings_source itself uses."""
+    if idiom.base_url is None:
+        return None
+    if idiom.base_url.env is not None:
+        return idiom.base_url.env
+    if idiom.base_url.settings is not None and class_attr_index is not None:
+        class_fqn, _, field_name = idiom.base_url.settings.rpartition(".")
+        field = class_attr_index.settings_field(class_fqn, field_name)
+        if field is not None:
+            return field.env_name
+    return None
+
+
+def _self_attr_env(
+    cls: DefFact, defs_by_index: dict[int, DefFact],
+    self_attr_assigns: list[SelfAttrFact], host_attr: str,
+    class_attr_index: ClassAttrIndex | None,
+) -> str | None:
+    """Auto-anchor (M7 T3, OPEN R1): the FIRST `self.<host_attr> = <dotted-chain>`
+    assignment found anywhere in `cls`'s own body (any method, AST-walk order --
+    mirrors `_find_verb`'s own first-match precedent) whose RHS tail joins, BY NAME,
+    a real env-carrying Settings field in the service-wide ClassAttrIndex
+    (`field_by_name` -- already env-gated: an ambiguous or env-less name is honestly
+    absent, see class_attrs.py). Returns on the FIRST structurally-matching
+    assignment regardless of whether ITS join succeeds -- deterministic, and matches
+    the realistic shape (one ctor, one `self.host = ...` line) this is modeled on;
+    None whenever no matching assignment exists in this class at all, its RHS isn't
+    a plain dotted-chain/bare-name, or the join misses/collides -- "no auto-anchor"
+    is a perfectly normal, tested outcome (claim stays unanchored, honest), never a
+    guess."""
+    if class_attr_index is None:
+        return None
+    for fact in self_attr_assigns:
+        if fact.attr != host_attr or fact.rhs_tail is None or fact.enclosing_def is None:
+            continue
+        enclosing = defs_by_index.get(fact.enclosing_def)
+        owner = _enclosing_class(defs_by_index, enclosing) if enclosing is not None else None
+        if owner is None or owner.index != cls.index:
+            continue
+        field = class_attr_index.field_by_name(fact.rhs_tail)
+        return field.env_name if field is not None else None
+    return None
+
+
+def _claim_base_url_env(
+    idiom: HttpClientIdiom, cls: DefFact, defs_by_index: dict[int, DefFact],
+    self_attr_assigns: list[SelfAttrFact], class_attr_index: ClassAttrIndex | None,
+) -> str | None:
+    """One claim's base_url_env: explicit idiom config wins outright; self.host
+    auto-anchoring is the fallback when explicit resolution yields nothing."""
+    explicit = _explicit_base_url_env(idiom, class_attr_index)
+    if explicit is not None:
+        return explicit
+    return _self_attr_env(cls, defs_by_index, self_attr_assigns, idiom.host_attr, class_attr_index)
 
 
 def _is_within_def(defs_by_index: dict[int, DefFact], call: CallFact, target_idx: int) -> bool:
@@ -479,11 +577,14 @@ def _extract_decorator_sdk(
             stats["http_call_missing_node_id"] += 1
             continue
 
+        base_url_env = _claim_base_url_env(
+            idiom, cls, defs_by_index, ctx.facts.self_attr_assigns, ctx.class_attr_index,
+        )
         claims.append({
             "src_id": method_id,
             "verb": verb,
             "path_template": path,
-            "base_url_env": idiom.base_url.env if idiom.base_url else None,
+            "base_url_env": base_url_env,
             "resolution_hint": resolution_hint,
             "evidence_line": driver_call.start_line,
         })
@@ -491,8 +592,8 @@ def _extract_decorator_sdk(
 
 
 def _emit_claim(
-    idiom: HttpClientIdiom, call: CallFact, method: DefFact, node_ids: dict[int, str],
-    consts: ConstTable, claims: list[dict], stats: dict[str, int],
+    call: CallFact, method: DefFact, node_ids: dict[int, str],
+    consts: ConstTable, base_url_env: str | None, claims: list[dict], stats: dict[str, int],
 ) -> None:
     method_id = node_ids.get(method.index)
     if method_id is None:
@@ -508,7 +609,7 @@ def _emit_claim(
         "src_id": method_id,
         "verb": call.callee_name.upper(),
         "path_template": path,
-        "base_url_env": idiom.base_url.env if idiom.base_url else None,
+        "base_url_env": base_url_env,
         "resolution_hint": resolution_hint,
         "evidence_line": call.start_line,
     })
@@ -547,6 +648,9 @@ def extract_http_client(
             if not fnmatchcase(cls.name, idiom.class_glob):
                 continue
             claimed_starts.add(call.callee_start_byte)
-            _emit_claim(idiom, call, method, node_ids, consts, claims, stats)
+            base_url_env = _claim_base_url_env(
+                idiom, cls, defs_by_index, ctx.facts.self_attr_assigns, ctx.class_attr_index,
+            )
+            _emit_claim(call, method, node_ids, consts, base_url_env, claims, stats)
 
     return HttpClientResult(claims=claims, stats=stats)

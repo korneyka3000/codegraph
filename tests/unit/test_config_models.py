@@ -3,6 +3,7 @@ import yaml
 from pydantic import ValidationError
 
 from codegraph.config.models import (
+    BaseUrlSpec,
     ChannelSpec,
     ConsumerIdiom,
     EmbeddingConfig,
@@ -501,3 +502,68 @@ def test_base_class_topic_settings_shape_is_valid():
         "topic": {"settings": "app.config.kafka.KafkaSettings.step_topic"},
     })
     assert idiom.topic.settings == "app.config.kafka.KafkaSettings.step_topic"
+
+
+# -- M7 T3 (OPEN R1): BaseUrlSpec.settings, HttpClientIdiom.host_attr,
+# WorkspaceConfig.env_sources --------------------------------------------------------
+
+
+def test_base_url_spec_settings_field_defaults_to_none():
+    assert BaseUrlSpec().settings is None
+
+
+def test_base_url_spec_settings_field_parses():
+    """{settings: "<ClassFQN>.<field>"} -- an explicit, unambiguous alternative to
+    `env:` (same shape as ValueSpec.settings, M7 T2) -- http_client_ext.py resolves
+    it via ClassAttrIndex.settings_field (per-class lookup), and it wins over
+    self.host-based auto-anchoring exactly like `env:` does (see
+    test_http_client_extractor.py)."""
+    spec = BaseUrlSpec.model_validate({
+        "settings": "app.config.ServiceSettings.verification_requests_url",
+    })
+    assert spec.settings == "app.config.ServiceSettings.verification_requests_url"
+    assert spec.env is None
+    assert spec.attr is None
+
+
+def test_base_url_spec_attr_env_settings_may_coexist():
+    """BaseUrlSpec carries no "exactly one source" validator (unlike ValueSpec) --
+    `attr` documents WHERE the base-url text comes from structurally, `env`/
+    `settings` separately anchor the TARGET service; fixtures/workspace.yaml already
+    relies on attr+env coexisting (`{attr: "self._base_url", env: ...}`)."""
+    spec = BaseUrlSpec(attr="self._base_url", env="X_URL", settings="pkg.Settings.x")
+    assert spec.attr == "self._base_url"
+    assert spec.env == "X_URL"
+    assert spec.settings == "pkg.Settings.x"
+
+
+def test_http_client_idiom_host_attr_defaults_to_host():
+    """M7 T3: auto-anchor target attribute name -- default "host" matches the OPEN
+    R1 pilot's own real convention (`self.host = config.services.x_url`)."""
+    idiom = HttpClientIdiom(name="x")
+    assert idiom.host_attr == "host"
+
+
+def test_http_client_idiom_host_attr_configurable():
+    idiom = HttpClientIdiom(name="x", host_attr="_host")
+    assert idiom.host_attr == "_host"
+
+
+def test_workspace_config_env_sources_defaults_to_empty_list():
+    cfg = WorkspaceConfig(
+        graph_name="g", services=[ServiceConfig(name="a", path=".")],
+    )
+    assert cfg.env_sources == []
+
+
+def test_workspace_config_env_sources_parses_path_list():
+    from pathlib import Path
+
+    cfg = WorkspaceConfig.model_validate({
+        "graph_name": "g",
+        "services": [{"name": "a", "path": "."}],
+        "env_sources": ["helm/values/prod.yaml", "helm/values/common.yaml"],
+    })
+    assert cfg.env_sources == [
+        Path("helm/values/prod.yaml"), Path("helm/values/common.yaml"),
+    ]

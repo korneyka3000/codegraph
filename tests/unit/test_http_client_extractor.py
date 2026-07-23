@@ -36,6 +36,7 @@ from codegraph.config.models import (
 from codegraph.extractors.base import FileContext
 from codegraph.extractors.http_client_ext import HttpClientResult, extract_http_client
 from codegraph.extractors.python_core import extract as extract_python_core
+from codegraph.parsing.class_attrs import ClassAttrIndex, SettingsField
 from codegraph.parsing.consts import ConstTable
 from codegraph.parsing.facts import build_file_facts
 
@@ -47,14 +48,24 @@ def _fixture_bytes(relpath: str) -> bytes:
     return (FIXTURES / relpath).read_bytes()
 
 
-def _load(relpath: str, service: str, source: bytes):
+def _load(
+    relpath: str, service: str, source: bytes,
+    class_attr_index: ClassAttrIndex | None = None,
+):
     """Builds (ctx, node_ids, consts) exactly as analyze.py's S5 wiring will: node_ids
     is def-index -> resolved node id, derived from python_core's OWN per-file output
     (Module node first, then exactly one node per facts.defs entry, same order), plus
     the None -> Module-node-id fallback entry T5 introduced (unused by this extractor's
     real fixture/tests -- every call here sits inside a method -- but kept for parity
     with node_ids' documented full shape); consts is the same once-per-file ConstTable
-    analyze.py now builds and shares between kafka_ext and this extractor."""
+    analyze.py now builds and shares between kafka_ext and this extractor.
+
+    `class_attr_index` (M7 T3): trailing optional param, default None -- every
+    pre-existing call site keeps working unchanged (auto-anchor gracefully no-ops
+    without an index, same "every pre-existing FileContext(...) call site keeps
+    working" convention `ref_symbol_lookup`/`class_attr_index` itself already
+    established on FileContext, see extractors/base.py); only the new auto-anchor
+    tests below pass a real one."""
     facts = build_file_facts(relpath, source)
     core_ctx = FileContext(
         service=service, relpath=relpath, source=source, facts=facts,
@@ -69,6 +80,7 @@ def _load(relpath: str, service: str, source: bytes):
     ctx = FileContext(
         service=service, relpath=relpath, source=source, facts=facts,
         def_symbol_lookup=lambda rp, sb: None, module_exists=lambda d: False,
+        class_attr_index=class_attr_index,
     )
     consts = ConstTable.build(facts, source)
     return ctx, node_ids, consts
@@ -753,3 +765,234 @@ def test_real_effective_idioms_custom_sdk_shadows_builtin_base_url_env():
     assert len(result.claims) == 2
     assert all(c["base_url_env"] == "DOCUMENT_MANAGEMENT_URL" for c in result.claims)
     assert all(c["resolution_hint"] == "static" for c in result.claims)
+
+
+# -- M7 T3 (OPEN R1): auto-anchor -- self.<host_attr> assignment -> ClassAttrIndex.
+# field_by_name (env-gated) -> claim.base_url_env auto-filled. Reproduces the pilot's
+# own root cause: `base_url: {attr: self.host}` with NO `env` (dynamic Settings-backed
+# host, see docs/superpowers/reports/2026-07-23-pilot-rerun-open-gaps.md R1) left every
+# claim from that idiom permanently unanchored before this task.
+
+AUTO_ANCHOR_SRC = b'''import aiohttp
+
+
+class AutoAnchorClient:
+    def __init__(self, config):
+        self.host = config.services.verification_requests_url
+
+    async def get_step(self, step_uid):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self.host}/api/v1/steps/{step_uid}") as resp:
+                return await resp.json()
+'''
+
+# `field_by_name` is ENV-GATED (T1 review Important-4) -- ANY entry it returns is
+# guaranteed to carry a real env_name; a synthetic index here only ever needs the
+# `field_index` (the by-name join surface), never `settings_by_class` (per-class,
+# used only by the EXPLICIT {settings: ...} tests further below).
+AUTO_ANCHOR_INDEX = ClassAttrIndex(
+    settings_by_class={}, enums_by_class={},
+    field_index={
+        "verification_requests_url": SettingsField(
+            class_fqn="app.config.ServiceSettings", field="verification_requests_url",
+            default=None, env_name="SERVICE_VERIFICATION_REQUESTS_URL",
+        ),
+    },
+)
+
+AMBIGUOUS_FIELD_INDEX = ClassAttrIndex(
+    settings_by_class={}, enums_by_class={},
+    field_index={"verification_requests_url": None},  # collision -> None, per contract
+)
+
+
+def test_auto_anchor_self_host_assignment_resolves_env_via_field_by_name():
+    ctx, node_ids, consts = _load(
+        "app/clients/autoanchor_client.py", "svc", AUTO_ANCHOR_SRC,
+        class_attr_index=AUTO_ANCHOR_INDEX,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[AIOHTTP_CLIENT_BUILTIN_IDIOM]), consts,
+    )
+    assert len(result.claims) == 1
+    assert result.claims[0]["base_url_env"] == "SERVICE_VERIFICATION_REQUESTS_URL"
+    assert result.claims[0]["path_template"] == "/api/v1/steps/{step_uid}"
+
+
+def test_attr_only_base_url_no_env_still_auto_anchors_the_open_r1_scenario():
+    """Reproduces the OPEN R1 root cause exactly: the idiom names `base_url: {attr:
+    self.host}` with NO `env` -- `attr` alone is metadata, never read as a
+    resolution source by this extractor -- so explicit resolution yields nothing
+    and auto-anchor is what actually anchors the claim."""
+    ctx, node_ids, consts = _load(
+        "app/clients/autoanchor_client.py", "svc", AUTO_ANCHOR_SRC,
+        class_attr_index=AUTO_ANCHOR_INDEX,
+    )
+    idiom = HttpClientIdiom(
+        name="attr-only", file_glob="**/*_client.py", class_glob="*Client",
+        base_url=BaseUrlSpec(attr="self.host"),
+    )
+    result = extract_http_client(ctx, node_ids, ServiceIdioms(http_clients=[idiom]), consts)
+    assert result.claims[0]["base_url_env"] == "SERVICE_VERIFICATION_REQUESTS_URL"
+
+
+def test_explicit_base_url_env_wins_over_auto_anchor():
+    ctx, node_ids, consts = _load(
+        "app/clients/autoanchor_client.py", "svc", AUTO_ANCHOR_SRC,
+        class_attr_index=AUTO_ANCHOR_INDEX,
+    )
+    idiom = HttpClientIdiom(
+        name="explicit", file_glob="**/*_client.py", class_glob="*Client",
+        base_url=BaseUrlSpec(env="EXPLICIT_URL"),
+    )
+    result = extract_http_client(ctx, node_ids, ServiceIdioms(http_clients=[idiom]), consts)
+    assert result.claims[0]["base_url_env"] == "EXPLICIT_URL"
+
+
+def test_explicit_base_url_settings_wins_over_auto_anchor():
+    """{settings: "<ClassFQN>.<field>"} resolves via the PER-CLASS
+    ClassAttrIndex.settings_field lookup (mirrors ValueSpec.settings, M7 T2) -- NOT
+    the auto-anchor's by-name field_by_name join. field_index is deliberately EMPTY
+    here (auto-anchor would find nothing), proving the two resolution paths are
+    genuinely independent."""
+    index = ClassAttrIndex(
+        settings_by_class={
+            "app.config.ServiceSettings": {
+                "verification_requests_url": SettingsField(
+                    class_fqn="app.config.ServiceSettings",
+                    field="verification_requests_url", default=None,
+                    env_name="SERVICE_VERIFICATION_REQUESTS_URL",
+                ),
+            },
+        },
+        enums_by_class={}, field_index={},
+    )
+    ctx, node_ids, consts = _load(
+        "app/clients/autoanchor_client.py", "svc", AUTO_ANCHOR_SRC, class_attr_index=index,
+    )
+    idiom = HttpClientIdiom(
+        name="explicit-settings", file_glob="**/*_client.py", class_glob="*Client",
+        base_url=BaseUrlSpec(settings="app.config.ServiceSettings.verification_requests_url"),
+    )
+    result = extract_http_client(ctx, node_ids, ServiceIdioms(http_clients=[idiom]), consts)
+    assert result.claims[0]["base_url_env"] == "SERVICE_VERIFICATION_REQUESTS_URL"
+
+
+NO_ASSIGN_SRC = b'''import aiohttp
+
+
+class NoAssignClient:
+    async def get_step(self, step_uid):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"/api/v1/steps/{step_uid}") as resp:
+                return await resp.json()
+'''
+
+
+def test_no_self_host_assignment_no_auto_anchor_claim_stays_unanchored():
+    ctx, node_ids, consts = _load(
+        "app/clients/noassign_client.py", "svc", NO_ASSIGN_SRC,
+        class_attr_index=AUTO_ANCHOR_INDEX,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[AIOHTTP_CLIENT_BUILTIN_IDIOM]), consts,
+    )
+    assert len(result.claims) == 1
+    assert result.claims[0]["base_url_env"] is None
+
+
+def test_ambiguous_field_by_name_collision_no_auto_anchor():
+    """Two unrelated classes both defining a `verification_requests_url` Settings
+    field would collide in field_by_name -> None (honest ambiguity, ClassAttrIndex's
+    own contract) -- auto-anchor must not guess either candidate."""
+    ctx, node_ids, consts = _load(
+        "app/clients/autoanchor_client.py", "svc", AUTO_ANCHOR_SRC,
+        class_attr_index=AMBIGUOUS_FIELD_INDEX,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[AIOHTTP_CLIENT_BUILTIN_IDIOM]), consts,
+    )
+    assert result.claims[0]["base_url_env"] is None
+
+
+def test_no_class_attr_index_wired_no_auto_anchor_gracefully():
+    """No ClassAttrIndex at all (None, the default -- every OTHER test in this
+    module) -- auto-anchor gracefully no-ops rather than crashing, same "degrades
+    safely when unwired" convention resolve_settings_source already established."""
+    ctx, node_ids, consts = _load("app/clients/autoanchor_client.py", "svc", AUTO_ANCHOR_SRC)
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[AIOHTTP_CLIENT_BUILTIN_IDIOM]), consts,
+    )
+    assert result.claims[0]["base_url_env"] is None
+
+
+CUSTOM_HOST_ATTR_SRC = b'''import aiohttp
+
+
+class CustomAttrClient:
+    def __init__(self, config):
+        self._host = config.services.verification_requests_url
+
+    async def get_step(self, step_uid):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self._host}/api/v1/steps/{step_uid}") as resp:
+                return await resp.json()
+'''
+
+
+def test_host_attr_default_does_not_match_a_differently_named_attribute():
+    """`host_attr` defaults to "host" -- a class using `self._host` instead is NOT
+    auto-anchored by the DEFAULT idiom (no structural match at the default name)."""
+    ctx, node_ids, consts = _load(
+        "app/clients/customattr_client.py", "svc", CUSTOM_HOST_ATTR_SRC,
+        class_attr_index=AUTO_ANCHOR_INDEX,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[AIOHTTP_CLIENT_BUILTIN_IDIOM]), consts,
+    )
+    assert result.claims[0]["base_url_env"] is None
+
+
+def test_host_attr_configured_to_match_the_real_attribute_name():
+    ctx, node_ids, consts = _load(
+        "app/clients/customattr_client.py", "svc", CUSTOM_HOST_ATTR_SRC,
+        class_attr_index=AUTO_ANCHOR_INDEX,
+    )
+    idiom = HttpClientIdiom(
+        name="custom-attr", file_glob="**/*_client.py", class_glob="*Client",
+        host_attr="_host",
+    )
+    result = extract_http_client(ctx, node_ids, ServiceIdioms(http_clients=[idiom]), consts)
+    assert result.claims[0]["base_url_env"] == "SERVICE_VERIFICATION_REQUESTS_URL"
+
+
+DECORATOR_AUTO_ANCHOR_SRC = b'''from some_sdk import BaseClient, Method, Request, path_template
+
+
+class AutoAnchorDecoratorClient(BaseClient):
+    def __init__(self, config):
+        self.host = config.services.verification_requests_url
+
+    @path_template("/v1/steps/{step_uid}")
+    async def get_step(self, step_uid, **kwargs):
+        request = Request(Method.GET, self.host, step_uid=step_uid)
+        return await self.driver.fetch_content(request)
+'''
+
+
+def test_decorator_sdk_mode_auto_anchor_also_applies():
+    """Auto-anchor is NOT verb-mode-specific -- the decorator-SDK candidate-discovery
+    path (M6 T2) shares the exact same class-scoped self.<host_attr> lookup."""
+    ctx, node_ids, consts = _load(
+        "app/clients/autoanchordec_client.py", "svc", DECORATOR_AUTO_ANCHOR_SRC,
+        class_attr_index=AUTO_ANCHOR_INDEX,
+    )
+    idiom = HttpClientIdiom(
+        name="decorator-sdk", file_glob="**/clients/*.py", class_glob="*Client",
+        route_from=HttpRouteFromSpec(decorator="path_template", arg=0),
+        call="driver.fetch_content",
+        verb_from=HttpVerbFromSpec(request_ctor="Request", enum="Method"),
+    )
+    result = extract_http_client(ctx, node_ids, ServiceIdioms(http_clients=[idiom]), consts)
+    assert len(result.claims) == 1
+    assert result.claims[0]["base_url_env"] == "SERVICE_VERIFICATION_REQUESTS_URL"
