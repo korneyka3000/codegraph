@@ -67,6 +67,9 @@ def test_analyze_degraded_report_dict_fields(tmp_path):
         # M6 T3: same precedent, kafka's own base_class honest-miss counter (0 when
         # kafka is inactive or no base_class idiom is configured).
         "consumer_base_class_no_generic",
+        # M6 T4: same precedent again, kafka's own producer_unresolved_channel
+        # honest-miss counter (0 when kafka is inactive or every producer resolved).
+        "producer_unresolved_channel",
         "degraded", "reason", "from_cache",
     }
     assert expected_keys <= report.keys()
@@ -627,6 +630,68 @@ def test_analyze_incremental_report_carries_kafka_base_class_no_generic_counter(
 
     assert report["mode"] == "incremental"
     assert report["consumer_base_class_no_generic"] == 1
+
+
+# -- M6 T4 (GAPS §6/pilot gap 5): kafka's producer_unresolved_channel counter flows
+# into the per-service report dict too, same precedent as base_class_no_generic just
+# above. kafka_ext.py's _Sink.stats already counted producer_unresolved_channel
+# (kafka_topic/event_type producer paths bump it on any unresolved value -- missing
+# kwarg, a dynamic attribute expression like `payload.topic_name`, ...) well before
+# this task -- but analyze.py's own kafka_stats aggregator only ever picked up
+# consumer_base_class_no_generic, so a would-be PRODUCES claim that died on an
+# unresolved topic/event_type value vanished from the report without a trace.
+
+WRAPPER_PRODUCER_IDIOM = ProducerIdiom(
+    name="kyc-event-publisher-wrapper",
+    call="app.services.producer.KYCEventPublisher.publish",
+    channel=ChannelSpec(kind="kafka_topic", name_from=ValueSpec(arg=1)),
+)
+
+# Dynamic topic argument (`payload.topic_name`, an attribute expression) -- the
+# exact pilot gap 5 shape: resolve_arg can't statically know an arbitrary
+# attribute's runtime value, so the topic never resolves.
+_DYNAMIC_TOPIC_WRAPPER_SRC = (
+    "from app.services.producer import KYCEventPublisher\n"
+    "\n"
+    "\n"
+    "async def use(publisher: KYCEventPublisher, payload):\n"
+    "    await publisher.publish(payload.body, payload.topic_name, payload.customer_uid)\n"
+)
+
+
+def _wrapper_producer_service_tree(tmp_path):
+    svc_root = tmp_path / "svc"
+    (svc_root / "app" / "activities").mkdir(parents=True)
+    (svc_root / "app" / "__init__.py").write_text("")
+    (svc_root / "app" / "activities" / "__init__.py").write_text("")
+    (svc_root / "app" / "activities" / "kafka_events.py").write_text(_DYNAMIC_TOPIC_WRAPPER_SRC)
+    return svc_root
+
+
+def test_analyze_full_report_carries_producer_unresolved_channel_counter(tmp_path):
+    svc = ServiceConfig(name="svc", path=_wrapper_producer_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        idioms=ServiceIdioms(producers=[WRAPPER_PRODUCER_IDIOM]),
+    )
+
+    assert report["producer_unresolved_channel"] == 1
+    assert not any(n.roles for n in st.iter_nodes())
+    assert not any(e.type == "PRODUCES" for e in st.iter_edges())
+
+
+def test_analyze_incremental_report_carries_producer_unresolved_channel_counter(tmp_path):
+    svc = ServiceConfig(name="svc", path=_wrapper_producer_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=False),
+        idioms=ServiceIdioms(producers=[WRAPPER_PRODUCER_IDIOM]),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["producer_unresolved_channel"] == 1
 
 
 # -- M4 T5: incremental analyze_service -- mode tagging, skip precondition,

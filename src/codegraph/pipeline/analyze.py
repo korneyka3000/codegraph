@@ -225,11 +225,12 @@ def _extract_join_and_stage(
 
     Returns {"nodes": int, "edges": int, "imports_external": int, "join_stats":
     JoinStats, "http_url_unresolved": int, "http_verb_unresolved": int,
-    "http_route_unresolved": int, "consumer_base_class_no_generic": int} (the http_*
-    trio: M6 T2 review Important-1; the last one: M6 T3, same precedent -- kafka_ext's
-    base_class honest-miss counter summed across `relpaths`, always present, 0 when
-    kafka is inactive or no base_class idiom is configured) -- everything the
-    caller's own report dict still needs to assemble
+    "http_route_unresolved": int, "consumer_base_class_no_generic": int,
+    "producer_unresolved_channel": int} (the http_* trio: M6 T2 review Important-1;
+    the next one: M6 T3; the last one: M6 T4 (GAPS §6/pilot gap 5), same precedent --
+    kafka_ext's own base_class/producer honest-miss counters summed across
+    `relpaths`, always present, 0 when kafka is inactive or nothing failed to
+    resolve) -- everything the caller's own report dict still needs to assemble
     (service/files/defs/refs/malformed_ranges/degraded/reason/from_cache/mode/
     stale_files are all OUTSIDE this function's concern -- it only ever runs S5/S6
     and reports what THAT did)."""
@@ -264,7 +265,14 @@ def _extract_join_and_stage(
     # the SAME way -- before this, kr.stats was discarded entirely (only kr.roles/
     # channels/edges were consumed), so a class matching a base_class idiom's target
     # base but lacking a usable generic argument vanished without a trace.
-    kafka_stats = {"consumer_base_class_no_generic": 0}
+    # M6 T4 (GAPS §6/pilot gap 5): producer_unresolved_channel joins the same dict,
+    # same reasoning -- kafka_ext's producer paths (_emit_kafka_topic_produces/
+    # _emit_event_type_produces) already bump this stat on any unresolved topic/
+    # event_type value (a missing kwarg, a dynamic attribute expression like
+    # `payload.topic_name`, ...); before this, only consumer_base_class_no_generic
+    # was ever picked up from kr.stats, so a would-be PRODUCES claim that died this
+    # way vanished from the report exactly as silently as the consumer-side gap did.
+    kafka_stats = {"consumer_base_class_no_generic": 0, "producer_unresolved_channel": 0}
     domain_roles: dict[str, set[str]] = {}
     domain_node_props: dict[str, dict] = {}
     domain_channels: list[NodeRec] = []
@@ -474,6 +482,7 @@ def _analyze_full(
         "http_verb_unresolved": ej["http_verb_unresolved"],
         "http_route_unresolved": ej["http_route_unresolved"],
         "consumer_base_class_no_generic": ej["consumer_base_class_no_generic"],
+        "producer_unresolved_channel": ej["producer_unresolved_channel"],
         "degraded": degraded,
         "reason": reason,
         "from_cache": from_cache,
@@ -581,6 +590,7 @@ def _analyze_incremental(
         "http_verb_unresolved": ej["http_verb_unresolved"],
         "http_route_unresolved": ej["http_route_unresolved"],
         "consumer_base_class_no_generic": ej["consumer_base_class_no_generic"],
+        "producer_unresolved_channel": ej["producer_unresolved_channel"],
         "degraded": False,
         "reason": None,
         "from_cache": from_cache,

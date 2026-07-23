@@ -398,6 +398,62 @@ def test_print_report_kafka_base_class_line_defaults_when_key_absent():
     assert "kafka idiom misses" not in console.export_text()
 
 
+# -- M6 T4 (GAPS §6/pilot gap 5): the SAME "kafka idiom misses" line also carries
+# producer_unresolved_channel -- one line per extractor family, same defensive
+# .get(key, 0)/any-nonzero-shows precedent as base_class_no_generic just above.
+
+
+def test_print_report_shows_kafka_producer_unresolved_channel_when_nonzero():
+    svc_with_misses = {**SERVICE_OK, "producer_unresolved_channel": 3}
+    report = build_report([svc_with_misses, SERVICE_DEGRADED], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "kafka idiom misses" in text
+    assert "producer_unresolved_channel = 3" in text
+
+
+def test_print_report_kafka_producer_unresolved_channel_sums_across_services():
+    svc_a = {**SERVICE_OK, "producer_unresolved_channel": 1}
+    svc_b = {**SERVICE_DEGRADED, "producer_unresolved_channel": 2}
+    report = build_report([svc_a, svc_b], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "producer_unresolved_channel = 3" in text
+
+
+def test_print_report_kafka_producer_unresolved_channel_and_base_class_both_shown_together():
+    svc = {
+        **SERVICE_OK,
+        "consumer_base_class_no_generic": 1, "producer_unresolved_channel": 2,
+    }
+    report = build_report([svc], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "base_class_no_generic = 1" in text
+    assert "producer_unresolved_channel = 2" in text
+
+
+def test_print_report_no_kafka_line_when_producer_unresolved_channel_alone_is_zero():
+    svc = {**SERVICE_OK, "producer_unresolved_channel": 0}
+    report = build_report([svc], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    assert "kafka idiom misses" not in console.export_text()
+
+
+def test_print_report_kafka_producer_unresolved_channel_defaults_when_key_absent():
+    """SERVICE_OK/SERVICE_DEGRADED (pre-M6-T4 shapes, no producer_unresolved_channel
+    key at all) must not KeyError -- .get(0) makes them contribute nothing and the
+    line stays absent."""
+    report = build_report([SERVICE_OK, SERVICE_DEGRADED], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise
+    assert "kafka idiom misses" not in console.export_text()
+
+
 # -- M2 T7: print_report linking summary (additive) --
 
 

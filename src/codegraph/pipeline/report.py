@@ -215,13 +215,26 @@ def print_report(report: dict, console: Console) -> None:
     # subscript carries). Yellow: a would-be CONSUMES claim that silently died
     # inside kafka_ext, a coverage warning rather than an error. Plain int, no
     # foreign text -- no escape() needed.
+    #
+    # M6 T4 (GAPS §6/pilot gap 5, same line, same precedent): producer_unresolved_
+    # channel -- a producer call matched an idiom but its configured topic/
+    # event_type source (arg/kwarg/env/const) resolved to nothing usable (a missing
+    # kwarg, a dynamic attribute expression like `payload.topic_name`, ...); see
+    # kafka_ext.py's _emit_kafka_topic_produces/_emit_event_type_produces. A would-be
+    # PRODUCES claim that silently died the same way, so it shares the SAME yellow
+    # line (one line per extractor family) rather than getting its own -- gated on
+    # EITHER counter being nonzero, same "any nonzero" convention as the http trio.
     kafka_base_class_no_generic = sum(
         s.get("consumer_base_class_no_generic", 0) for s in report["services"]
     )
-    if kafka_base_class_no_generic:
+    kafka_producer_unresolved_channel = sum(
+        s.get("producer_unresolved_channel", 0) for s in report["services"]
+    )
+    if kafka_base_class_no_generic or kafka_producer_unresolved_channel:
         console.print(
             f"[yellow]kafka idiom misses: "
-            f"base_class_no_generic = {kafka_base_class_no_generic}[/]"
+            f"base_class_no_generic = {kafka_base_class_no_generic}, "
+            f"producer_unresolved_channel = {kafka_producer_unresolved_channel}[/]"
         )
 
     degraded_services = health.get("degraded_services", [])

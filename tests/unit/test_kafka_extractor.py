@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from codegraph.config.builtin_idioms import resolve_builtins
 from codegraph.config.models import (
     ChannelSpec,
     ConsumerIdiom,
@@ -1145,3 +1146,194 @@ def test_base_class_nested_subscript_generic_arg_uses_raw_text_channel_name():
     consumes = [e for e in result.edges if e.type == "CONSUMES"]
     assert len(consumes) == 1
     assert consumes[0].dst == "chan:event_type:dict[str, OCRDataEvent]"
+
+
+# -- M6 T4 (GAPS §6/pilot gap 5 -- Kafka producer wrapper + kwarg-sourced topic):
+#
+# Real convention (camunda-gateway's app/services/producer.py):
+#     class KYCEventPublisher:
+#         async def publish(self, body, topic_name, customer_uid):
+#             producer = await self.producer()                        # local var
+#             await producer.send_and_wait(topic=topic_name, ...)      # topic=KWARG
+# Call site: `publisher.publish(body, payload.topic_name, payload.customer_uid)` --
+# topic_name is itself DYNAMIC (an attribute expression, not a literal).
+#
+# ValueSpec.kwarg (config/models.py), ArgFact.keyword (parsing/facts.py's
+# _build_call_args), and resolve_value_spec's kwarg branch (parsing/consts.py) all
+# ALREADY existed before this task -- kafka_ext.py itself needed NO production
+# changes: `_emit_producer`/`_emit_kafka_topic_produces`/`_emit_event_type_produces`
+# resolve `channel.name_from`/`channel.event_type_from` generically via
+# `resolve_value_spec`, regardless of which of the 5 ValueSpec sources is
+# configured. The tests below PIN that already-correct, already-generic behavior
+# for the specific kwarg/wrapper shapes gap 5 needs -- none of them are expected to
+# RED against this module; the one genuinely NEW piece of this task (surfacing
+# `producer_unresolved_channel` in the per-service report) lives in
+# test_pipeline_analyze.py/test_pipeline_report.py instead, since kr.stats already
+# counts this case (see _Sink.stats above) -- only the PIPELINE was silently
+# dropping it.
+
+
+KWARG_TOPIC_SRC = b'''from aiokafka import AIOKafkaProducer
+
+
+async def use():
+    producer = AIOKafkaProducer()
+    await producer.send_and_wait(topic="orders.created", value=b"payload")
+'''
+
+
+def test_producer_user_idiom_kwarg_topic_source_produces_channel():
+    """Builtin `aiokafka-send-and-wait` (config/builtin_idioms.py, UNTOUCHED by this
+    task) uses `name_from={arg: 0}` and still can't see this call at all -- no
+    ArgFact has index==0 when topic is passed as `topic=...` with no positional args
+    (see the contrast test just below). A CUSTOM idiom with `name_from={kwarg:
+    "topic"}` resolves it directly -- find-the-arg-by-keyword-instead-of-position,
+    exactly what gap 5 needs. RECEIVER tier (0.8): `producer = AIOKafkaProducer()`
+    is a same-scope AssignFact."""
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(relpath, "svc", KWARG_TOPIC_SRC)
+    idiom = ProducerIdiom(
+        name="kwarg-topic", call="aiokafka.AIOKafkaProducer.send_and_wait",
+        channel=ChannelSpec(kind="kafka_topic", name_from=ValueSpec(kwarg="topic")),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    assert produces[0].dst == "chan:kafka_topic:orders.created"
+    assert produces[0].resolution == "heuristic" and produces[0].confidence == 0.8
+    assert result.stats["producers_resolved"] == 1
+
+
+def test_producer_builtin_arg0_idiom_misses_the_same_kwarg_call_by_constraint():
+    """Sanity/contrast, using the REAL builtin idiom set unmodified: confirms the
+    custom kwarg idiom above does genuinely new work rather than duplicating
+    existing builtin coverage -- `aiokafka-send-and-wait`'s own `name_from={arg: 0}`
+    really does miss a topic passed ONLY as a kwarg (pilot gap 5's own root cause)."""
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(relpath, "svc", KWARG_TOPIC_SRC)
+    result = extract_kafka(ctx, node_ids, resolve_builtins(["aiokafka"]), consts)
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.stats["producer_unresolved_channel"] == 1
+
+
+def test_producer_kwarg_missing_from_call_is_unresolved_with_counter_not_crash():
+    """The idiom names a kwarg this particular call simply never passes at all
+    (topic is entirely absent, not just positional) -- an honest miss, not a crash:
+    no edge/channel, `producer_unresolved_channel` bumped."""
+    relpath = "m.py"
+    src = b'''from aiokafka import AIOKafkaProducer
+
+
+async def use():
+    producer = AIOKafkaProducer()
+    await producer.send_and_wait(value=b"payload")
+'''
+    ctx, node_ids, consts = _load(relpath, "svc", src)
+    idiom = ProducerIdiom(
+        name="kwarg-topic", call="aiokafka.AIOKafkaProducer.send_and_wait",
+        channel=ChannelSpec(kind="kafka_topic", name_from=ValueSpec(kwarg="topic")),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+    assert result.edges == []
+    assert result.channels == []
+    assert result.roles == {}
+    assert result.stats["producer_unresolved_channel"] == 1
+
+
+# -- wrapper idiom (pilot gap 5's actual fix): match the business-level wrapper
+# method itself (`KYCEventPublisher.publish`), sidestepping BOTH the low-level
+# `send_and_wait` call's kwarg AND its local-variable-receiver problem (`producer =
+# await self.producer()` -- a differently-named local each call, same shape as the
+# builtin aiokafka producer's own documented RECEIVER-tier miss, config/
+# builtin_idioms.py's module docstring).
+
+WRAPPER_LITERAL_SRC = b'''from app.services.producer import KYCEventPublisher
+
+
+async def use(publisher: KYCEventPublisher):
+    await publisher.publish("body-bytes", "orders.created", "cust-1")
+'''
+
+WRAPPER_DYNAMIC_SRC = b'''from app.services.producer import KYCEventPublisher
+
+
+async def use(publisher: KYCEventPublisher, payload):
+    await publisher.publish(payload.body, payload.topic_name, payload.customer_uid)
+'''
+
+WRAPPER_IDIOM = ProducerIdiom(
+    name="kyc-event-publisher-wrapper",
+    call="app.services.producer.KYCEventPublisher.publish",
+    channel=ChannelSpec(kind="kafka_topic", name_from=ValueSpec(arg=1)),
+)
+
+
+def test_producer_wrapper_call_arg_index_literal_topic_produces():
+    """`publish(body, topic_name, customer_uid)` -- topic is arg index 1 (0-based;
+    `self` is never part of CallFact.args, it's the receiver). A literal there
+    resolves exactly like any other arg-indexed producer idiom (the outbox idiom's
+    own arg=0 precedent above) -- IMPORT_NAME tier: `publisher` is a bare parameter
+    (no same-file `publisher = KYCEventPublisher(...)` AssignFact), so RECEIVER
+    doesn't apply, but the file DOES `from app.services.producer import
+    KYCEventPublisher` (module `app` imported)."""
+    relpath = "app/kyc_engine/activities/kafka_events.py"
+    ctx, node_ids, consts = _load(relpath, "camunda-gateway", WRAPPER_LITERAL_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[WRAPPER_IDIOM]), consts)
+    use_id = node_ids[_def(ctx, "use").index]
+
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    p = produces[0]
+    assert p.src == use_id
+    assert p.dst == "chan:kafka_topic:orders.created"
+    assert p.resolution == "heuristic" and p.confidence == 0.6
+    assert result.roles[use_id] == {"MessageProducer"}
+    assert result.stats["producers_resolved"] == 1
+
+
+def test_producer_wrapper_call_dynamic_attr_topic_is_unresolved_with_counter():
+    """Real pilot shape: `publisher.publish(body, payload.topic_name, ...)` -- the
+    topic argument is an attribute EXPRESSION (`payload.topic_name`), not a literal.
+    `resolve_arg` has no way to statically know an arbitrary attribute's runtime
+    value (unlike a bare name found in ConstTable, or the settings./os.environ[]/
+    os.getenv() textual conventions it DOES detect) -- honest unresolved: no
+    PRODUCES edge, no Channel node, `producer_unresolved_channel` bumped, no crash.
+    This is the exact call this task's brief calls out as needing to be
+    read-and-pinned rather than silently doing nothing."""
+    relpath = "app/kyc_engine/activities/kafka_events.py"
+    ctx, node_ids, consts = _load(relpath, "camunda-gateway", WRAPPER_DYNAMIC_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[WRAPPER_IDIOM]), consts)
+
+    assert result.edges == []
+    assert result.channels == []
+    assert result.roles == {}
+    assert result.stats["producer_unresolved_channel"] == 1
+    assert result.stats["producers_resolved"] == 0
+
+
+def test_producer_wrapper_const_event_type_produces_event_channel():
+    """Documented manual fallback for a fixed-event-type producer wrapper: when the
+    call site can't give a resolvable channel identity via the topic argument (the
+    dynamic case just above), `event_type: {const: "..."}` fixes the event's TYPE at
+    config time -- a human-authored escape hatch for exactly this shape (topic
+    dynamic, but the call site itself is monomorphic in event type). Proves the
+    combination end to end: wrapper call match + const event_type -> PRODUCES into
+    an event_type channel (no CONTAINS: channel.topic is unset here)."""
+    relpath = "app/kyc_engine/activities/kafka_events.py"
+    ctx, node_ids, consts = _load(relpath, "camunda-gateway", WRAPPER_DYNAMIC_SRC)
+    idiom = ProducerIdiom(
+        name="kyc-event-publisher-wrapper-fixed-type",
+        call="app.services.producer.KYCEventPublisher.publish",
+        channel=ChannelSpec(kind="event_type", event_type_from=ValueSpec(const="OrderCreated")),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+    use_id = node_ids[_def(ctx, "use").index]
+
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    p = produces[0]
+    assert p.src == use_id
+    assert p.dst == "chan:event_type:OrderCreated"
+    assert p.resolution == "heuristic" and p.confidence == 0.6
+    assert result.roles[use_id] == {"MessageProducer"}
+    assert not any(e.type == "CONTAINS" for e in result.edges)

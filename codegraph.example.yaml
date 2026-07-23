@@ -29,6 +29,24 @@ services:
             kind: event_type
             event_type_from: { arg: 0 }                  # или {kwarg: event_type}
             topic: { const: "orders.events" }            # → CONTAINS topic→event_type
+        - name: kafka-kwarg-topic                         # топик передан как KWARG, не позиционно
+          call: "app.events.kafka.RawProducer.send_and_wait"
+          channel:
+            kind: kafka_topic
+            name_from: { kwarg: "topic" }                # builtin-идиом ждёт arg0 — здесь topic=X
+        - name: event-publisher-wrapper                  # producer — бизнес-обёртка над низкоуровневым
+                                                          # send_and_wait(topic=X, ...); топик там сам
+                                                          # kwarg И часто динамический (напр. атрибут
+                                                          # payload.topic_name — не резолвится статически,
+                                                          # см. docs/superpowers/reports/
+                                                          # 2026-07-23-pilot-real-services-gaps.md §6) —
+                                                          # честный ручной вариант при фиксированном типе
+                                                          # события на этой точке вызова: фиксируем
+                                                          # event_type константой вместо топика
+          call: "app.services.producer.EventPublisher.publish"
+          channel:
+            kind: event_type
+            event_type_from: { const: "OrderShipped" }
   - name: kyc-worker
     path: ../kyc-worker
     idioms:

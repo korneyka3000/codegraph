@@ -175,6 +175,35 @@ def test_call_arg_name_span_and_other_kind_from_workflow_fixture():
     assert kw_arg.keyword == "start_to_close_timeout" and kw_arg.value_kind == "other"
 
 
+def test_call_args_skips_splat_arguments_entirely():
+    """M6 T4 (GAPS §6, elaborated scenario list): `*args`/`**kwargs` splats AT A
+    CALL SITE (contrast test_param_fact_star_args_and_kwargs_and_bare_separators
+    below, which is about a function's own PARAMETER list -- a different grammar
+    production entirely) carry no field name at all in the tree-sitter grammar --
+    not addressable by index OR keyword -- so _build_call_args skips them outright
+    (module docstring's own documented convention, `_SPLAT_ARG_TYPES`) rather than
+    inventing a placeholder ArgFact neither an `arg` nor a `kwarg` ValueSpec source
+    could ever correctly address. Load-bearing honesty for kafka_ext's kwarg
+    producer-topic source: a call that forwards its topic through a splat (`producer
+    .send_and_wait(**opts)`) must not be silently misattributed to some OTHER
+    positional/keyword slot -- pinned here as the same honest "no matching ArgFact"
+    shape as a keyword that's simply absent (see test_kafka_extractor.py's
+    test_producer_kwarg_missing_from_call_is_unresolved_with_counter_not_crash)."""
+    src = b'''def use(a, b, **extra):
+    pass
+
+
+x = [1, 2]
+y = {"c": 3}
+use(*x, **y, d=4)
+'''
+    facts = build_file_facts("m.py", src)
+    call = next(c for c in facts.calls if c.callee_name == "use")
+    assert len(call.args) == 1
+    assert call.args[0].keyword == "d" and call.args[0].index is None
+    assert call.args[0].value_kind == "other" and call.args[0].text == "4"
+
+
 # -- CallFact.receiver_text --
 
 
