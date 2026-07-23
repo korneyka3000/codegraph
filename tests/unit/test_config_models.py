@@ -6,6 +6,7 @@ from codegraph.config.models import (
     ChannelSpec,
     ConsumerIdiom,
     EmbeddingConfig,
+    GenericArgSpec,
     HttpClientIdiom,
     HttpRouteFromSpec,
     HttpVerbFromSpec,
@@ -222,3 +223,116 @@ def test_decorator_sdk_all_three_fields_is_valid():
 def test_route_from_arg_defaults_to_zero():
     spec = HttpRouteFromSpec(decorator="path_template")
     assert spec.arg == 0
+
+
+# -- M6 T3: kind="base_class" ConsumerIdiom (GAPS §4/pilot gap 4: shared-lib
+# BaseConsumer[Event] subclasses, CONSUMES=0) --
+
+BASE_CLASS_YAML = """
+name: base-consumer-subclass
+kind: base_class
+base_class: "kyc_base_consumer.base.BaseConsumer"
+handler_method: "process_event"
+event_type_from: { generic_arg: 0 }
+topic: { attr: "self.config.topic" }
+"""
+
+
+def test_base_class_yaml_shape_parses():
+    """Exact YAML shape from the M6 T3 brief -- base_class/handler_method/
+    event_type_from/topic round-trip."""
+    idiom = ConsumerIdiom.model_validate(yaml.safe_load(BASE_CLASS_YAML))
+    assert idiom.kind == "base_class"
+    assert idiom.base_class == "kyc_base_consumer.base.BaseConsumer"
+    assert idiom.handler_method == "process_event"
+    assert idiom.event_type_from == GenericArgSpec(generic_arg=0)
+    assert idiom.topic.attr == "self.config.topic"
+
+
+def test_generic_arg_spec_defaults_to_zero():
+    assert GenericArgSpec().generic_arg == 0
+
+
+def test_base_class_topic_is_optional():
+    idiom = ConsumerIdiom.model_validate({
+        "name": "x", "kind": "base_class",
+        "base_class": "pkg.Base", "handler_method": "process_event",
+        "event_type_from": {"generic_arg": 0},
+    })
+    assert idiom.topic is None
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"handler_method": "process_event", "event_type_from": {"generic_arg": 0}},
+        {"base_class": "pkg.Base", "event_type_from": {"generic_arg": 0}},
+        {"base_class": "pkg.Base", "handler_method": "process_event"},
+        {"base_class": "pkg.Base"},
+        {"handler_method": "process_event"},
+        {"event_type_from": {"generic_arg": 0}},
+        {},
+    ],
+    ids=[
+        "no-base_class", "no-handler_method", "no-event_type_from",
+        "base_class-only", "handler_method-only", "event_type_from-only", "none",
+    ],
+)
+def test_base_class_partial_field_matrix_is_config_error_fail_closed(fields):
+    """Fail-closed DSL matrix (same precedent as HttpClientIdiom's route_from
+    all-or-nothing, M6 T2): base_class/handler_method/event_type_from are all
+    required together -- a partial combination is a dead-forever config (missing
+    base_class -> nothing to match against; missing handler_method -> nowhere to
+    put the CONSUMES edge; missing event_type_from -> no way to name the channel),
+    rejected at config-load time rather than silently producing zero claims."""
+    with pytest.raises(ValidationError):
+        ConsumerIdiom.model_validate({"name": "x", "kind": "base_class", **fields})
+
+
+def test_base_class_all_three_fields_is_valid():
+    idiom = ConsumerIdiom.model_validate({
+        "name": "x", "kind": "base_class",
+        "base_class": "pkg.Base", "handler_method": "process_event",
+        "event_type_from": {"generic_arg": 0},
+    })
+    assert idiom.base_class == "pkg.Base"
+    assert idiom.handler_method == "process_event"
+    assert idiom.event_type_from == GenericArgSpec(generic_arg=0)
+
+
+@pytest.mark.parametrize(
+    "event_type_from",
+    ["dict_key", {"arg": 0}, {"kwarg": "event_type"}, {"const": "X"}],
+    ids=["dict_key", "arg", "kwarg", "const"],
+)
+def test_base_class_event_type_from_must_be_generic_arg_shape(event_type_from):
+    """event_type_from shapes borrowed from the call-site-based idioms (ValueSpec's
+    arg/kwarg/const/env/attr, or dispatch_dict's "dict_key") all presuppose a
+    CallFact call-site, which a class definition never has -- only
+    {generic_arg: N} is meaningful for kind=base_class, and the DSL rejects the
+    others at load time instead of silently matching zero classes forever."""
+    with pytest.raises(ValidationError):
+        ConsumerIdiom.model_validate({
+            "name": "x", "kind": "base_class",
+            "base_class": "pkg.Base", "handler_method": "process_event",
+            "event_type_from": event_type_from,
+        })
+
+
+@pytest.mark.parametrize(
+    "topic",
+    [{"const": "orders.events"}, {"arg": 0}, {"kwarg": "topic"}, {"env": "TOPIC"}],
+    ids=["const", "arg", "kwarg", "env"],
+)
+def test_base_class_topic_only_supports_attr_shape(topic):
+    """kind=base_class has no call-site to resolve const/arg/kwarg/env against
+    (unlike call/dispatch_dict's topic, resolved via resolve_value_spec against a
+    CallFact) -- only {attr: ...} (a config-reference LABEL, always emitted as an
+    unresolved channel) is meaningful here."""
+    with pytest.raises(ValidationError):
+        ConsumerIdiom.model_validate({
+            "name": "x", "kind": "base_class",
+            "base_class": "pkg.Base", "handler_method": "process_event",
+            "event_type_from": {"generic_arg": 0},
+            "topic": topic,
+        })

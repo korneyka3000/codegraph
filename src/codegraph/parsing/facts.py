@@ -46,6 +46,19 @@ class DefFact:
     docstring: str | None
     decorators: list[str] = field(default_factory=list)
     params: list[ParamFact] = field(default_factory=list)
+    # M6 T3 sanctioned extension (GAPS §4/pilot gap 4 pre-step): raw source TEXT of
+    # each of a class's base expressions (see module-level `_base_exprs`) -- e.g.
+    # ("BaseConsumer[OCRDataEvent]",) for `class C(BaseConsumer[OCRDataEvent])`.
+    # Empty tuple for functions (no bases at all) and for a class with no bases
+    # (`class C:` / `class C():`). Text only -- no byte spans: the base name token's
+    # absolute position (needed by kafka_ext's scip ref-lookup) is recovered by a
+    # SEPARATE, narrowly-scoped tree-sitter walk over the file there (mirrors
+    # ConstTable.build's own independent pass, see extractors/kafka_ext.py's
+    # `_scan_class_bases`) -- kept out of FileFacts on purpose, additive and minimal
+    # per this task's brief. New LAST field with a default so every pre-existing
+    # positional/keyword DefFact(...) construction still works (same precedent as
+    # ParamFact.annotation_start_byte, M2 T4).
+    base_exprs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -296,6 +309,31 @@ def _build_params(params_node) -> list[ParamFact]:
     return result
 
 
+
+# -- DefFact.base_exprs construction (M6 T3) ------------------------------------------
+#
+# Grammar facts (verified via probe script, tree-sitter-python 0.25): class_definition's
+# bases live under its "superclasses" field (an argument_list, ABSENT entirely for a
+# bare `class C:`, present-but-empty for `class C():`); each base is one of:
+# identifier (bare name), attribute (dotted name), subscript (generic, e.g.
+# "Base[Arg]" -- itself has value= the base expr and repeated subscript= fields for
+# each bracket item, "Base[A, B]" style), or keyword_argument ("metaclass=X" and
+# similar -- NOT a base, excluded). function_definition has no "superclasses" field at
+# all, so `child_by_field_name("superclasses")` naturally returns None there --
+# `_base_exprs` needs no kind check to stay a no-op for functions.
+
+
+def _base_exprs(node) -> tuple[str, ...]:
+    supers = node.child_by_field_name("superclasses")
+    if supers is None:
+        return ()
+    return tuple(
+        ch.text.decode("utf-8", errors="replace")
+        for ch in supers.named_children
+        if ch.type != "keyword_argument"
+    )
+
+
 def build_file_facts(relpath: str, source: bytes) -> FileFacts:
     from codegraph.parsing.ts import parse
 
@@ -353,6 +391,7 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
                 docstring=_docstring_of_block(body, source) if body else None,
                 decorators=decorators,
                 params=param_facts,
+                base_exprs=_base_exprs(node),
             ))
             if body is not None:
                 for ch in body.children:

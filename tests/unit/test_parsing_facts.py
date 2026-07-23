@@ -452,3 +452,102 @@ def test_smoke_all_fixture_files_have_populated_args_params_assigns():
     assert assigns_total >= 5
     assert dict_args_seen >= 2  # register_handlers (1 pair) + add_event (2 pairs)
     assert fstring_args_seen >= 2  # get_document + create_document base_url interpolation
+
+
+# -- M6 T3: DefFact.base_exprs (class bases, pilot gap 4 pre-step) --
+#
+# GAPS §4 pre-step: build_file_facts did not carry class bases at all before this --
+# kafka_ext's new base_class consumer idiom needs to know (a) whether a class has any
+# bases at all worth checking and (b) each base's raw text (a subscript base like
+# "BaseConsumer[OCRDataEvent]" carries the generic-arg text a base_class idiom resolves
+# event_type from). base_exprs is deliberately TEXT ONLY -- no byte spans -- see
+# extractors/kafka_ext.py's own `_scan_class_bases` for why the scip-lookup byte
+# position is recovered via a separate, narrowly-scoped walk instead.
+
+
+def test_base_exprs_empty_for_class_with_no_bases():
+    facts = build_file_facts("x.py", b"class Plain:\n    pass\n")
+    cls = next(d for d in facts.defs if d.name == "Plain")
+    assert cls.base_exprs == ()
+
+
+def test_base_exprs_empty_for_class_with_empty_parens():
+    facts = build_file_facts("x.py", b"class Plain():\n    pass\n")
+    cls = next(d for d in facts.defs if d.name == "Plain")
+    assert cls.base_exprs == ()
+
+
+def test_base_exprs_single_generic_subscript_base():
+    src = b"class OCRDataConsumer(BaseConsumer[OCRDataEvent]):\n    pass\n"
+    facts = build_file_facts("x.py", src)
+    cls = next(d for d in facts.defs if d.name == "OCRDataConsumer")
+    assert cls.base_exprs == ("BaseConsumer[OCRDataEvent]",)
+
+
+def test_base_exprs_bare_non_generic_base():
+    src = b"class OCRDataConsumer(BaseConsumer):\n    pass\n"
+    facts = build_file_facts("x.py", src)
+    cls = next(d for d in facts.defs if d.name == "OCRDataConsumer")
+    assert cls.base_exprs == ("BaseConsumer",)
+
+
+def test_base_exprs_unrelated_base_untouched():
+    src = b"class Other(SomeOtherBase):\n    pass\n"
+    facts = build_file_facts("x.py", src)
+    cls = next(d for d in facts.defs if d.name == "Other")
+    assert cls.base_exprs == ("SomeOtherBase",)
+
+
+def test_base_exprs_multi_inherit_mixin_plus_generic_base():
+    src = b"class C(Mixin, BaseConsumer[FooEvent]):\n    pass\n"
+    facts = build_file_facts("x.py", src)
+    cls = next(d for d in facts.defs if d.name == "C")
+    assert cls.base_exprs == ("Mixin", "BaseConsumer[FooEvent]")
+
+
+def test_base_exprs_attribute_chain_base_and_generic_arg():
+    src = b"class AttrBase(pkgmod.BaseConsumer[evtmod.OCRDataEvent]):\n    pass\n"
+    facts = build_file_facts("x.py", src)
+    cls = next(d for d in facts.defs if d.name == "AttrBase")
+    assert cls.base_exprs == ("pkgmod.BaseConsumer[evtmod.OCRDataEvent]",)
+
+
+def test_base_exprs_multi_generic_args():
+    src = b"class MultiGeneric(Base[A, B]):\n    pass\n"
+    facts = build_file_facts("x.py", src)
+    cls = next(d for d in facts.defs if d.name == "MultiGeneric")
+    assert cls.base_exprs == ("Base[A, B]",)
+
+
+def test_base_exprs_keyword_argument_metaclass_excluded():
+    src = b"class WithMeta(Base, metaclass=ABCMeta):\n    pass\n"
+    facts = build_file_facts("x.py", src)
+    cls = next(d for d in facts.defs if d.name == "WithMeta")
+    assert cls.base_exprs == ("Base",)
+
+
+def test_base_exprs_empty_for_function():
+    facts = build_file_facts("x.py", b"def f():\n    pass\n")
+    fn = next(d for d in facts.defs if d.name == "f")
+    assert fn.base_exprs == ()
+
+
+def test_def_fact_base_exprs_appended_field_defaults_to_empty_tuple():
+    """Sanctioned additive extension (M6 T3, same precedent as
+    ParamFact.annotation_start_byte, M2 T4): base_exprs is a new LAST field with a
+    default -- construction sites that don't pass it keep working unchanged."""
+    from codegraph.parsing.facts import DefFact
+
+    d = DefFact(
+        index=0, kind="class", name="C", name_start_byte=0, name_end_byte=1,
+        start_byte=0, end_byte=10, start_line=1, end_line=2, parent=None,
+        is_async=False, signature="class C", docstring=None,
+    )
+    assert d.base_exprs == ()
+    d2 = DefFact(
+        index=0, kind="class", name="C", name_start_byte=0, name_end_byte=1,
+        start_byte=0, end_byte=10, start_line=1, end_line=2, parent=None,
+        is_async=False, signature="class C", docstring=None,
+        base_exprs=("Base[X]",),
+    )
+    assert d2.base_exprs == ("Base[X]",)

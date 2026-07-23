@@ -355,6 +355,49 @@ def test_print_report_http_idiom_misses_defaults_when_keys_absent():
     assert "http idiom misses" not in console.export_text()
 
 
+# -- M6 T3: print_report kafka base_class honest-miss counter line -- same precedent
+# as the http idiom misses block just above (services-list iteration, defensive
+# .get(key, 0), no line at all when every count is zero/absent).
+
+
+def test_print_report_shows_kafka_base_class_no_generic_line_when_nonzero():
+    svc_with_misses = {**SERVICE_OK, "consumer_base_class_no_generic": 2}
+    report = build_report([svc_with_misses, SERVICE_DEGRADED], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "kafka idiom misses" in text
+    assert "base_class_no_generic = 2" in text
+
+
+def test_print_report_kafka_base_class_no_generic_line_sums_across_services():
+    svc_a = {**SERVICE_OK, "consumer_base_class_no_generic": 1}
+    svc_b = {**SERVICE_DEGRADED, "consumer_base_class_no_generic": 2}
+    report = build_report([svc_a, svc_b], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "base_class_no_generic = 3" in text
+
+
+def test_print_report_no_kafka_base_class_line_when_zero():
+    svc = {**SERVICE_OK, "consumer_base_class_no_generic": 0}
+    report = build_report([svc], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    assert "kafka idiom misses" not in console.export_text()
+
+
+def test_print_report_kafka_base_class_line_defaults_when_key_absent():
+    """SERVICE_OK/SERVICE_DEGRADED (pre-M6 T3 shapes, no consumer_base_class_no_generic
+    key at all) must not KeyError -- .get(0) makes them contribute nothing and the
+    line stays absent."""
+    report = build_report([SERVICE_OK, SERVICE_DEGRADED], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise
+    assert "kafka idiom misses" not in console.export_text()
+
+
 # -- M2 T7: print_report linking summary (additive) --
 
 

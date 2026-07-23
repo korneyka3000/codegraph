@@ -49,7 +49,20 @@ class ValueSpec(_Strict):
         return self
 
 
-EventTypeFrom = ValueSpec | Literal["dict_key"]
+class GenericArgSpec(_Strict):
+    """M6 T3 (GAPS §4/pilot gap 4): base_class-kind ConsumerIdiom's event_type
+    source -- the Nth subscript argument of the matched base class (`Base[EventA]`
+    -> generic_arg: 0 == EventA; `Base[K, V]` -> generic_arg: 1 == V). The ONLY
+    EventTypeFrom shape kind="base_class" accepts (enforced by
+    ConsumerIdiom._kind_requirements): ValueSpec's arg/kwarg/const/env/attr and
+    dispatch_dict's "dict_key" all presuppose a CallFact call-site, which a class
+    definition never has.
+    """
+
+    generic_arg: int = 0
+
+
+EventTypeFrom = ValueSpec | Literal["dict_key"] | GenericArgSpec
 
 
 class ChannelSpec(_Strict):
@@ -78,25 +91,60 @@ class ConsumerIdiom(_Strict):
     a codegraph.yaml still specifying `dict_assign:` fails loading with pydantic's
     extra="forbid" ValidationError (unknown field), a loud signal to migrate to
     registrar_call, instead of the previous silent no-op coverage gap.
+
+    M6 T3 (GAPS §4/pilot gap 4 -- CONSUMES=0 on shared-lib `BaseConsumer[Event]`
+    subclasses): kind="base_class" -- a class whose bases contain a subscript
+    `Base[...]` resolving to `base_class` (FQN) marks its OWN `handler_method` (NOT
+    the class itself, not ctor/setup) role MessageConsumer; the CONSUMES edge goes
+    handler_method -> Channel(event_type from the subscript's generic_arg-th
+    argument). Requires base_class + handler_method + event_type_from all three
+    (fail-closed all-or-nothing, same precedent as HttpClientIdiom's route_from
+    matrix, eff706e) -- event_type_from must be a GenericArgSpec (a ValueSpec/
+    dict_key source presupposes a call-site, which a class definition never has).
+    `topic`, if given, only supports {attr: ...}: there is no call-site to resolve
+    const/arg/kwarg/env against either -- it names a config-reference LABEL (e.g.
+    "self.config.topic"), always emitted as an unresolved kafka_topic Channel +
+    CONTAINS(topic -> event). See extractors/kafka_ext.py for the extraction side.
     """
 
     name: str
-    kind: Literal["call", "decorator", "dispatch_dict"]
+    kind: Literal["call", "decorator", "dispatch_dict", "base_class"]
     call: str | None = None
     decorator: str | None = None
     registrar_call: str | None = None
     topic: ValueSpec | None = None
     event_type_from: EventTypeFrom | None = None
+    base_class: str | None = None
+    handler_method: str | None = None
 
     @model_validator(mode="after")
     def _kind_requirements(self) -> ConsumerIdiom:
+        # M6 T3: base_class needs ALL THREE of (base_class, handler_method,
+        # event_type_from) -- call/decorator/dispatch_dict each name exactly ONE
+        # required field, so switching this check from "any" to "all" changes
+        # nothing for them (a 1-tuple's any/all coincide) while giving base_class's
+        # 3-tuple the fail-closed all-or-nothing shape (HttpClientIdiom precedent).
         required = {
             "call": ("call",),
             "decorator": ("decorator",),
             "dispatch_dict": ("registrar_call",),
+            "base_class": ("base_class", "handler_method", "event_type_from"),
         }[self.kind]
-        if not any(getattr(self, f) is not None for f in required):
-            raise ValueError(f"consumer kind={self.kind} requires one of {required}")
+        missing = [f for f in required if getattr(self, f) is None]
+        if missing:
+            raise ValueError(f"consumer kind={self.kind} requires {required}, missing {missing}")
+        if self.kind == "base_class":
+            if not isinstance(self.event_type_from, GenericArgSpec):
+                raise ValueError(
+                    "consumer kind=base_class requires event_type_from={generic_arg: N} "
+                    "(GenericArgSpec) -- ValueSpec/dict_key presuppose a call-site a class "
+                    f"definition never has; got {self.event_type_from!r}"
+                )
+            if self.topic is not None and self.topic.attr is None:
+                raise ValueError(
+                    "consumer kind=base_class topic only supports {attr: ...} -- there is "
+                    f"no call-site to resolve const/arg/kwarg/env against here; got {self.topic!r}"
+                )
         return self
 
 

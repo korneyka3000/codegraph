@@ -11,6 +11,7 @@ from codegraph.config.models import (
     BaseUrlSpec,
     ChannelSpec,
     ConsumerIdiom,
+    GenericArgSpec,
     HttpClientIdiom,
     HttpRouteFromSpec,
     HttpVerbFromSpec,
@@ -63,6 +64,9 @@ def test_analyze_degraded_report_dict_fields(tmp_path):
         # M6 T2 review Important-1: http idiom failure counters are part of every
         # full/incremental report shape (0 when the http_client extractor never ran).
         "http_url_unresolved", "http_verb_unresolved", "http_route_unresolved",
+        # M6 T3: same precedent, kafka's own base_class honest-miss counter (0 when
+        # kafka is inactive or no base_class idiom is configured).
+        "consumer_base_class_no_generic",
         "degraded", "reason", "from_cache",
     }
     assert expected_keys <= report.keys()
@@ -562,6 +566,62 @@ def test_analyze_incremental_report_carries_http_idiom_failure_counters(tmp_path
     assert report["http_verb_unresolved"] == 1
     assert report["http_url_unresolved"] == 0
     assert report["http_route_unresolved"] == 0
+
+
+# -- M6 T3: kafka's own base_class honest-miss counter flows into the per-service
+# report dict, same precedent as the http_* counters just above (kr.stats was
+# discarded entirely before this -- only kr.roles/channels/edges were consumed).
+
+BASE_CLASS_NO_GENERIC_IDIOM = ConsumerIdiom(
+    name="base-consumer-subclass", kind="base_class",
+    base_class="kyc_base_consumer.base.BaseConsumer",
+    handler_method="process_event",
+    event_type_from=GenericArgSpec(generic_arg=0),
+)
+
+# Bare (non-generic) subclass -- base_class idiom's target base matches textually,
+# but there is no subscript at all, so extract_kafka bumps consumer_base_class_no_generic
+# instead of producing a claim (see test_kafka_extractor.py's own unit-level proof).
+_NO_GENERIC_CONSUMER_SRC = (
+    "class OCRDataConsumer(BaseConsumer):\n"
+    "    async def process_event(self, event) -> bool:\n"
+    "        return True\n"
+)
+
+
+def _base_class_no_generic_service_tree(tmp_path):
+    svc_root = tmp_path / "svc"
+    (svc_root / "app" / "consumers").mkdir(parents=True)
+    (svc_root / "app" / "__init__.py").write_text("")
+    (svc_root / "app" / "consumers" / "__init__.py").write_text("")
+    (svc_root / "app" / "consumers" / "ocr.py").write_text(_NO_GENERIC_CONSUMER_SRC)
+    return svc_root
+
+
+def test_analyze_full_report_carries_kafka_base_class_no_generic_counter(tmp_path):
+    svc = ServiceConfig(name="svc", path=_base_class_no_generic_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        idioms=ServiceIdioms(consumers=[BASE_CLASS_NO_GENERIC_IDIOM]),
+    )
+
+    assert report["consumer_base_class_no_generic"] == 1
+    assert not any(n.roles for n in st.iter_nodes())
+    assert not any(e.type == "CONSUMES" for e in st.iter_edges())
+
+
+def test_analyze_incremental_report_carries_kafka_base_class_no_generic_counter(tmp_path):
+    svc = ServiceConfig(name="svc", path=_base_class_no_generic_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=False),
+        idioms=ServiceIdioms(consumers=[BASE_CLASS_NO_GENERIC_IDIOM]),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["consumer_base_class_no_generic"] == 1
 
 
 # -- M4 T5: incremental analyze_service -- mode tagging, skip precondition,

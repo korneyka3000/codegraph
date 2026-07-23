@@ -208,6 +208,22 @@ def print_report(report: dict, console: Console) -> None:
             f"verb_unresolved = {http_verb}, route_unresolved = {http_route}[/]"
         )
 
+    # M6 T3 (additive, same precedent as the http idiom misses block just above):
+    # kafka's own base_class honest-miss counter -- a class matches a base_class
+    # idiom's target base but has no usable generic argument at all (bare
+    # `class C(Base):`, or event_type_from.generic_arg past the end of what the
+    # subscript carries). Yellow: a would-be CONSUMES claim that silently died
+    # inside kafka_ext, a coverage warning rather than an error. Plain int, no
+    # foreign text -- no escape() needed.
+    kafka_base_class_no_generic = sum(
+        s.get("consumer_base_class_no_generic", 0) for s in report["services"]
+    )
+    if kafka_base_class_no_generic:
+        console.print(
+            f"[yellow]kafka idiom misses: "
+            f"base_class_no_generic = {kafka_base_class_no_generic}[/]"
+        )
+
     degraded_services = health.get("degraded_services", [])
     if degraded_services:
         detail = ", ".join(

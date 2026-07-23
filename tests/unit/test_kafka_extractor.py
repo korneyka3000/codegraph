@@ -33,6 +33,7 @@ from pathlib import Path
 from codegraph.config.models import (
     ChannelSpec,
     ConsumerIdiom,
+    GenericArgSpec,
     ProducerIdiom,
     ServiceIdioms,
     ValueSpec,
@@ -655,3 +656,249 @@ def test_producer_module_level_call_uses_module_node_id_fallback():
     assert len(produces) == 1
     assert produces[0].src == node_ids[None]
     assert result.roles[node_ids[None]] == {"MessageProducer"}
+
+
+# -- M6 T3: base_class consumer idiom (GAPS §4/pilot gap 4: shared-lib
+# BaseConsumer[Event] subclasses, CONSUMES=0 on the real KYC stack) --
+#
+# Real convention (pilot GAPS §5): `class OCRDataConsumer(BaseConsumer[OCRDataEvent]):`
+# with a `process_event` handler method; the base's generic argument IS the event's
+# stable static identity (unlike the dynamic `self.config.topic` attribute the same
+# class's own `setup()` uses to build the raw aiokafka consumer).
+
+BASE_CLASS_IDIOM = ConsumerIdiom(
+    name="base-consumer-subclass", kind="base_class",
+    base_class="kyc_base_consumer.base.BaseConsumer",
+    handler_method="process_event",
+    event_type_from=GenericArgSpec(generic_arg=0),
+)
+
+BASE_CLASS_SRC = b'''class OCRDataConsumer(BaseConsumer[OCRDataEvent]):
+    async def process_event(self, event) -> bool:
+        return True
+
+    async def setup(self) -> None:
+        pass
+'''
+
+
+def _base_class_ref_lookup(relpath: str):
+    """Stubbed SCIP ref-lookup resolving the base name token ("BaseConsumer" in
+    `BaseConsumer[OCRDataEvent]`) to the configured FQN's own class symbol -- mirrors
+    this file's existing "юнит: стаб; интеграцию покроет T9" stubbing pattern (real
+    scip-python integration is out of scope at this unit level, same as every other
+    STATIC-tier proof here). A class descriptor ends with "#" (core/ids.py's own
+    `structural_descriptor`), not "()." like a method/function."""
+    span = BASE_CLASS_SRC.index(b"BaseConsumer[")
+
+    def lookup(rp, sb):
+        if (rp, sb) == (relpath, span):
+            return "scip-python python some-lib 0.0 `kyc_base_consumer.base`/BaseConsumer#"
+        return None
+
+    return lookup
+
+
+def test_base_class_static_tier_scip_resolved_consumes_event_channel():
+    relpath = "app/consumers/ocr.py"
+    ctx, node_ids, consts = _load(
+        relpath, "kyc-worker", BASE_CLASS_SRC,
+        ref_symbol_lookup=_base_class_ref_lookup(relpath),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    handler_id = node_ids[_def(ctx, "process_event").index]
+
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    c = consumes[0]
+    assert c.src == handler_id
+    assert c.dst == "chan:event_type:OCRDataEvent"
+    assert c.resolution == "static" and c.confidence == 1.0
+    assert c.props == {"dispatch": "event_type"}
+    assert c.extractor == "kafka"
+    assert c.evidence_file == relpath
+    assert result.roles[handler_id] == {"MessageConsumer"}
+    assert result.stats["consumers_resolved"] == 1
+    assert result.stats["consumer_base_class_no_generic"] == 0
+    chan_ids = {chan.id for chan in result.channels}
+    assert chan_ids == {"chan:event_type:OCRDataEvent"}
+
+
+def test_base_class_textual_fallback_tier_without_scip_stub():
+    """No ref_symbol_lookup wired at all (SCIP unavailable) -- the base name's bare
+    text ("BaseConsumer") still equals the configured base_class's last FQN segment,
+    so the IMPORT_NAME-tier textual fallback fires (0.6/heuristic) instead of
+    silently producing nothing; pins the scip-resolved vs textual-fallback
+    confidence difference against the STATIC-tier test above."""
+    relpath = "app/consumers/ocr.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", BASE_CLASS_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].resolution == "heuristic" and consumes[0].confidence == 0.6
+    assert consumes[0].dst == "chan:event_type:OCRDataEvent"
+
+
+DIFFERENT_BASE_SRC = b'''class NotAConsumer(SomeOtherBase[Whatever]):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_subclass_of_different_base_is_a_noop():
+    relpath = "app/consumers/other.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", DIFFERENT_BASE_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    assert result.edges == []
+    assert result.channels == []
+    assert result.roles == {}
+    assert result.stats["consumer_base_class_no_generic"] == 0
+
+
+NO_GENERIC_SRC = b'''class OCRDataConsumer(BaseConsumer):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_no_generic_param_no_claim_and_stat_incremented_not_crash():
+    relpath = "app/consumers/ocr.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", NO_GENERIC_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    assert result.edges == []
+    assert result.channels == []
+    assert result.roles == {}
+    assert result.stats["consumer_base_class_no_generic"] == 1
+
+
+TOPIC_ATTR_IDIOM = ConsumerIdiom(
+    name="base-consumer-subclass", kind="base_class",
+    base_class="kyc_base_consumer.base.BaseConsumer",
+    handler_method="process_event",
+    event_type_from=GenericArgSpec(generic_arg=0),
+    topic=ValueSpec(attr="self.config.topic"),
+)
+
+
+def test_base_class_topic_attr_emits_unresolved_channel_and_containment():
+    relpath = "app/consumers/ocr.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", BASE_CLASS_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[TOPIC_ATTR_IDIOM]), consts)
+
+    assert result.stats["consumers_resolved"] == 1
+    contains = [e for e in result.edges if e.type == "CONTAINS"]
+    assert len(contains) == 1
+    c = contains[0]
+    assert c.src == "chan:kafka_topic:${self.config.topic}"
+    assert c.dst == "chan:event_type:OCRDataEvent"
+    assert c.resolution == "heuristic" and c.confidence == 0.6
+    assert c.extractor == "kafka"
+
+    topic_chan = next(
+        ch for ch in result.channels if ch.id == "chan:kafka_topic:${self.config.topic}"
+    )
+    assert topic_chan.props["unresolved"] is True
+    assert topic_chan.props["config_ref"] == "self.config.topic"
+    assert topic_chan.props["channel_kind"] == "kafka_topic"
+
+
+MULTI_INHERIT_SRC = b'''class C(Mixin, BaseConsumer[FooEvent]):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_multi_inherit_finds_generic_base_not_just_first():
+    """`Mixin` (the FIRST base) does not match -- proves the extractor checks every
+    base, not just bases[0]."""
+    relpath = "app/consumers/multi.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", MULTI_INHERIT_SRC)
+    idiom = ConsumerIdiom(
+        name="x", kind="base_class", base_class="pkg.BaseConsumer",
+        handler_method="process_event", event_type_from=GenericArgSpec(generic_arg=0),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[idiom]), consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].dst == "chan:event_type:FooEvent"
+
+
+ATTR_GENERIC_SRC = b'''class AttrBase(BaseConsumer[evtmod.OCRDataEvent]):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_generic_arg_attribute_chain_reduces_to_last_identifier():
+    relpath = "app/consumers/attr.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", ATTR_GENERIC_SRC)
+    idiom = ConsumerIdiom(
+        name="x", kind="base_class", base_class="pkg.BaseConsumer",
+        handler_method="process_event", event_type_from=GenericArgSpec(generic_arg=0),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[idiom]), consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].dst == "chan:event_type:OCRDataEvent"
+
+
+MULTI_GENERIC_SRC = b'''class C(Base[A, B]):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_generic_arg_index_selects_second_param():
+    relpath = "app/consumers/multigeneric.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", MULTI_GENERIC_SRC)
+    idiom = ConsumerIdiom(
+        name="x", kind="base_class", base_class="pkg.Base",
+        handler_method="process_event", event_type_from=GenericArgSpec(generic_arg=1),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[idiom]), consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].dst == "chan:event_type:B"
+
+
+def test_base_class_missing_handler_method_no_crash_stat_incremented():
+    """Class structurally/texually matches the configured base (WITH a generic
+    param) but lacks the configured handler_method entirely (e.g. renamed) -- must
+    degrade gracefully (no claim), not crash on a None def lookup."""
+    relpath = "app/consumers/nohandler.py"
+    src = b'''class OCRDataConsumer(BaseConsumer[OCRDataEvent]):
+    async def some_other_method(self, event) -> bool:
+        return True
+'''
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", src)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    assert result.edges == []
+    assert result.stats["consumer_missing_node_id"] == 1
+
+
+def test_base_class_missing_node_id_for_handler_skips_gracefully():
+    """Handler def exists but node_ids has no entry for it -- defensive parity with
+    the call/dispatch_dict consumer paths' own missing-node-id guard."""
+    relpath = "app/consumers/ocr.py"
+    ctx, _real_node_ids, consts = _load(relpath, "kyc-worker", BASE_CLASS_SRC)
+    result = extract_kafka(ctx, {}, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    assert result.edges == []
+    assert result.roles == {}
+    assert result.stats["consumer_missing_node_id"] == 1
+
+
+def test_base_class_kind_ignored_by_call_and_dispatch_dict_extraction_paths():
+    """Sanity: a base_class-kind idiom mixed into the SAME consumers list as
+    call/dispatch_dict idioms doesn't confuse either of those paths (each kind
+    filters its own idioms explicitly, see kafka_ext._extract_call_consumers /
+    _extract_dispatch_dict_consumers's `idiom.kind != ...` guards)."""
+    relpath = "app/consumers/ocr.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", BASE_CLASS_SRC)
+    result = extract_kafka(
+        ctx, node_ids, _idioms(consumers=[CONSUMER_CTOR_IDIOM, BASE_CLASS_IDIOM]), consts,
+    )
+    # CONSUMER_CTOR_IDIOM (kind="call") matches nothing in this file (no aiokafka
+    # ctor call at all) -- only the base_class match should produce an edge.
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].props == {"dispatch": "event_type"}

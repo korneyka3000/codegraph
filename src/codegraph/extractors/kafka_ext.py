@@ -72,15 +72,43 @@ abbreviated signature in favor of what the prose actually specifies (progress.md
 the way fastapi's http_method/path_template or temporal's workflow_name do --
 MessageProducer/MessageConsumer are plain roles, and dispatch is an EDGE prop, not a
 node prop).
+
+M6 T3 (GAPS §4/pilot gap 4 -- CONSUMES=0 on shared-lib `BaseConsumer[Event]`
+subclasses): a FOURTH, independent ConsumerIdiom shape, kind="base_class" -- a class
+whose bases contain a subscript `Base[...]` resolving (scip ref-lookup on the base
+name token, falling back to a textual FQN-suffix match at idiom_match's IMPORT_NAME
+tier confidence when scip has no opinion) to `idiom.base_class` marks its OWN
+`handler_method` (not the class, not ctor/setup) MessageConsumer; CONSUMES goes
+handler_method -> Channel(event_type from the subscript's generic_arg-th argument,
+`idiom.event_type_from` a GenericArgSpec). Unlike the other three shapes, there is no
+CallFact call-site at all to match_calls/resolve_value_spec against -- base
+resolution and generic-argument extraction instead walk the class's OWN bases via
+`_scan_class_bases`, a SEPARATE tree-sitter pass over `ctx.source` (mirrors
+ConstTable.build's own independent top-level walk, see parsing/consts.py) keyed by
+(name_start_byte, name_end_byte), the same join key FileFacts' DefFact.name_start_byte/
+name_end_byte already carries. A class matching the base textually/structurally but
+whose base has NO subscript (bare `class C(BaseConsumer):`) is an honest miss, not a
+crash: no claim, `consumer_base_class_no_generic` stat bump (surfaced in the
+per-service report, pipeline/analyze.py, same as T2's http_* counters). `idiom.topic`,
+when given, only ever carries `.attr` (enforced at config load,
+config/models.py ConsumerIdiom._kind_requirements) -- there is no call-site to resolve
+const/arg/kwarg/env against here either, so it is treated as an ALWAYS-unresolved
+config-ref straight through the existing `Resolved(kind="config_ref")` /
+`_resolution_for` / `_channel_name` machinery (no new resolution kind needed): an
+unresolved kafka_topic Channel(unresolved=True, config_ref=<attr text>) +
+CONTAINS(topic -> event), same edge shape _emit_event_type_produces already builds
+for its own topic/event pairing.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 
 from codegraph.config.models import (
     ChannelSpec,
     ConsumerIdiom,
+    GenericArgSpec,
     ProducerIdiom,
     ServiceIdioms,
     ValueSpec,
@@ -89,7 +117,7 @@ from codegraph.core.ids import display_qualified
 from codegraph.core.schema import EdgeRec, NodeRec, make_channel_node
 from codegraph.extractors.idiom_match import CallMatch, MatchTier, match_calls
 from codegraph.parsing.consts import ConstTable, Resolved, resolve_value_spec
-from codegraph.parsing.facts import ArgFact, CallFact
+from codegraph.parsing.facts import ArgFact, CallFact, DefFact
 from codegraph.resolvers.scip.symbols import parse_symbol, symbol_to_node_id
 
 from .base import FileContext
@@ -121,6 +149,13 @@ class _Sink:
         "consumers_resolved": 0,
         "consumer_unresolved_topic": 0,
         "consumer_missing_node_id": 0,
+        # M6 T3: honest-miss counter -- a class matches base_class's target base
+        # (textually or via scip) but has no usable generic argument at all (bare
+        # `class C(Base):`, or event_type_from.generic_arg indexes past the end of
+        # what the subscript actually carries) -- no claim, not a crash. See
+        # pipeline/analyze.py for how this flows into the per-service report (same
+        # precedent as T2's http_* failure counters).
+        "consumer_base_class_no_generic": 0,
         "dispatch_handlers_resolved": 0,
         "dispatch_handler_unresolved": 0,
         "dispatch_dict_missing": 0,
@@ -438,6 +473,248 @@ def _extract_dispatch_dict_consumers(
             _emit_dispatch_dict(ctx, idiom, m, consts, sink)
 
 
+# -- consumers: kind="base_class" --------------------------------------------------------
+#
+# No CallFact call-site exists for this shape at all (the "call site" is a CLASS
+# DEFINITION), so none of match_calls/resolve_value_spec applies -- base resolution and
+# generic-argument extraction instead walk the class's own bases directly, via a
+# SEPARATE tree-sitter pass (`_scan_class_bases`) over ctx.source. FileFacts'
+# DefFact.base_exprs (parsing/facts.py, M6 T3) carries only each base's raw TEXT --
+# sufficient for the honest-miss/no-bases prefilter below, but NOT the base name
+# token's absolute byte position ctx.ref_symbol_lookup (an occurrence table keyed by
+# byte offset) needs for the STATIC tier -- same "own independent walk" reasoning as
+# ConstTable.build (parsing/consts.py's own module docstring).
+
+
+@dataclass(frozen=True)
+class _ClassBaseToken:
+    """One non-keyword base expression of a class_definition, located by
+    `_scan_class_bases`. name_start_byte/name_end_byte/name_text already point at the
+    LAST identifier segment for an attribute-form base (`pkgmod.BaseConsumer` -> just
+    "BaseConsumer") -- mirrors ArgFact's own "attr" value_kind span convention
+    (parsing/facts.py's `_build_argfact`). generic_arg_texts is only meaningful when
+    is_subscript is True; each entry is likewise already reduced to its last
+    identifier segment if it was itself an attribute chain (`Base[evtmod.Event]` ->
+    "Event") -- brief: "attribute chain -> last identifier"."""
+
+    is_subscript: bool
+    name_start_byte: int
+    name_end_byte: int
+    name_text: str
+    generic_arg_texts: tuple[str, ...] = ()
+
+
+def _base_token_name(node):
+    """`node` is a base expr itself (identifier/attribute) or a subscript's `value`
+    field -- returns the tree-sitter node to take name_text/byte-span from (the
+    LAST identifier segment for an attribute), or None for an unrecognized shape."""
+    if node.type == "identifier":
+        return node
+    if node.type == "attribute":
+        return node.child_by_field_name("attribute")
+    return None
+
+
+def _generic_arg_text(node) -> str:
+    if node.type == "attribute":
+        last = node.child_by_field_name("attribute")
+        if last is not None:
+            return last.text.decode("utf-8", errors="replace")
+    return node.text.decode("utf-8", errors="replace")
+
+
+def _scan_class_bases(source: bytes) -> dict[tuple[int, int], list[_ClassBaseToken]]:
+    """Every class_definition's non-keyword bases in `source`, keyed by
+    (name_start_byte, name_end_byte) of the CLASS's own name token -- the exact join
+    key DefFact.name_start_byte/name_end_byte already carries, so a class_def can look
+    its own bases up here by identity, with no dependence on traversal-order parity
+    between this walk and build_file_facts' own. Grammar facts (tree-sitter-python
+    0.25, verified via probe script): a class_definition's bases live under its
+    "superclasses" field (an argument_list, entirely ABSENT for a bare `class C:`);
+    each base is identifier / attribute / subscript (generic, itself `value`= the
+    base expr + repeated `subscript`= fields for each bracket item, e.g. "Base[A, B]")
+    / keyword_argument ("metaclass=X" and similar -- not a base, skipped)."""
+    from codegraph.parsing.ts import parse
+
+    tree = parse(source)
+    result: dict[tuple[int, int], list[_ClassBaseToken]] = {}
+
+    def visit(node) -> None:
+        if node.type == "class_definition":
+            name_node = node.child_by_field_name("name")
+            supers = node.child_by_field_name("superclasses")
+            if name_node is not None and supers is not None:
+                tokens: list[_ClassBaseToken] = []
+                for base in supers.named_children:
+                    if base.type == "keyword_argument":
+                        continue
+                    if base.type == "subscript":
+                        value = base.child_by_field_name("value")
+                        name_tok = _base_token_name(value) if value is not None else None
+                        if name_tok is None:
+                            continue  # unrecognized base-expr shape -- no fixture needs it
+                        arg_texts = tuple(
+                            _generic_arg_text(a)
+                            for a in base.children_by_field_name("subscript")
+                        )
+                        tokens.append(_ClassBaseToken(
+                            is_subscript=True,
+                            name_start_byte=name_tok.start_byte, name_end_byte=name_tok.end_byte,
+                            name_text=name_tok.text.decode("utf-8", errors="replace"),
+                            generic_arg_texts=arg_texts,
+                        ))
+                    else:
+                        name_tok = _base_token_name(base)
+                        if name_tok is None:
+                            continue
+                        tokens.append(_ClassBaseToken(
+                            is_subscript=False,
+                            name_start_byte=name_tok.start_byte, name_end_byte=name_tok.end_byte,
+                            name_text=name_tok.text.decode("utf-8", errors="replace"),
+                        ))
+                result[(name_node.start_byte, name_node.end_byte)] = tokens
+        for child in node.children:
+            visit(child)
+
+    visit(tree.root_node)
+    return result
+
+
+def _match_base_tier(
+    ctx: FileContext, tok: _ClassBaseToken, base_class_fqn: str,
+) -> MatchTier | None:
+    """STATIC (scip ref-lookup at the base name token's own span -> display_qualified,
+    fnmatchcase against base_class_fqn -- same glob forms idiom_match._match_static
+    uses) tried first; IMPORT_NAME fallback (bare name-text equality against the
+    configured FQN's last segment) when scip has no opinion (lookup unwired, symbol
+    not found, or a local/unparseable symbol) -- mirrors match_calls' own
+    "first tier that fires wins" priority (idiom_match.py). RECEIVER has no meaning
+    here at all (no call-site/receiver, only a class's own base expression)."""
+    if ctx.ref_symbol_lookup is not None:
+        sym = ctx.ref_symbol_lookup(ctx.relpath, tok.name_start_byte)
+        if sym is not None:
+            parsed = parse_symbol(sym)
+            if not parsed.is_local and parsed.descriptors is not None:
+                qualified = display_qualified(parsed.descriptors)
+                if fnmatchcase(qualified, base_class_fqn) or fnmatchcase(
+                    qualified, "*." + base_class_fqn
+                ):
+                    return MatchTier.STATIC
+    last_segment = base_class_fqn.rsplit(".", 1)[-1]
+    if tok.name_text == last_segment:
+        return MatchTier.IMPORT_NAME
+    return None
+
+
+def _first_base_match(
+    ctx: FileContext, tokens: list[_ClassBaseToken], base_class_fqn: str,
+) -> tuple[_ClassBaseToken, MatchTier] | None:
+    for tok in tokens:
+        tier = _match_base_tier(ctx, tok, base_class_fqn)
+        if tier is not None:
+            return tok, tier
+    return None
+
+
+def _emit_base_class_topic_containment(
+    ctx: FileContext, idiom: ConsumerIdiom, tier: MatchTier, event_chan: NodeRec,
+    evidence_line: int, sink: _Sink,
+) -> None:
+    if idiom.topic is None or idiom.topic.attr is None:
+        return  # config/models.py's _kind_requirements guarantees .attr when topic is set
+    # No call-site to resolve against at all (unlike the call/dispatch_dict consumer
+    # paths) -- idiom.topic.attr is a config-reference LABEL, not something to
+    # resolve; reuses the EXISTING "config_ref" Resolved shape (and its established
+    # always-downgrades-to-heuristic/<=0.6 convention, `_resolution_for`) directly.
+    resolved = Resolved(kind="config_ref", config_ref=idiom.topic.attr)
+    resolution, confidence = _resolution_for(tier, resolved)
+    topic_chan = make_channel_node(
+        "kafka_topic", name=_channel_name(resolved),
+        unresolved=True, config_ref=idiom.topic.attr,
+    )
+    sink.channels.append(topic_chan)
+    sink.edges.append(EdgeRec(
+        src=topic_chan.id, dst=event_chan.id, type="CONTAINS",
+        resolution=resolution, confidence=confidence, extractor=_EXTRACTOR,
+        evidence_file=ctx.relpath, evidence_line=evidence_line,
+    ))
+
+
+def _emit_base_class_consumer(
+    ctx: FileContext, node_ids: dict, class_def: DefFact, idiom: ConsumerIdiom,
+    tok: _ClassBaseToken, tier: MatchTier, sink: _Sink,
+) -> None:
+    if not tok.is_subscript:
+        sink.stats["consumer_base_class_no_generic"] += 1
+        return
+
+    # config/models.py's _kind_requirements guarantees event_type_from is a
+    # GenericArgSpec whenever kind="base_class" validates at all.
+    assert isinstance(idiom.event_type_from, GenericArgSpec)
+    idx = idiom.event_type_from.generic_arg
+    if idx < 0 or idx >= len(tok.generic_arg_texts):
+        sink.stats["consumer_base_class_no_generic"] += 1
+        return
+    event_name = tok.generic_arg_texts[idx]
+
+    handler_def = next(
+        (d for d in ctx.facts.defs
+         if d.kind == "function" and d.parent == class_def.index
+         and d.name == idiom.handler_method),
+        None,
+    )
+    handler_id = node_ids.get(handler_def.index) if handler_def is not None else None
+    if handler_id is None:
+        # Covers BOTH "handler_method doesn't exist on this class at all" (renamed/
+        # removed) and "it exists but node_ids has no entry for it" -- both are, from
+        # this extractor's point of view, "nowhere to put the CONSUMES edge",
+        # the same defensive counter the call/dispatch_dict consumer paths already
+        # use for their own missing-node-id case.
+        sink.stats["consumer_missing_node_id"] += 1
+        return
+
+    event_chan = make_channel_node("event_type", name=event_name)
+    sink.channels.append(event_chan)
+    sink.edges.append(EdgeRec(
+        src=handler_id, dst=event_chan.id, type="CONSUMES",
+        resolution=tier.resolution, confidence=tier.confidence, extractor=_EXTRACTOR,
+        evidence_file=ctx.relpath, evidence_line=handler_def.start_line,
+        props={"dispatch": "event_type"},
+    ))
+    sink.add_role(handler_id, "MessageConsumer")
+    sink.stats["consumers_resolved"] += 1
+
+    _emit_base_class_topic_containment(ctx, idiom, tier, event_chan, handler_def.start_line, sink)
+
+
+def _extract_base_class_consumers(
+    ctx: FileContext, node_ids: dict, idioms: list[ConsumerIdiom], sink: _Sink,
+) -> None:
+    base_idioms = [i for i in idioms if i.kind == "base_class"]
+    if not base_idioms:
+        return
+    class_defs = [d for d in ctx.facts.defs if d.kind == "class" and d.base_exprs]
+    if not class_defs:
+        return
+    base_tokens = _scan_class_bases(ctx.source)
+
+    for class_def in class_defs:
+        tokens = base_tokens.get((class_def.name_start_byte, class_def.name_end_byte), [])
+        if not tokens:
+            continue
+        for idiom in base_idioms:
+            # config/models.py's _kind_requirements guarantees base_class is set
+            # whenever kind="base_class" validates at all -- narrows the field's
+            # `str | None` type for the checker without changing runtime behavior
+            # (same precedent as pipeline/analyze.py's own `assert consts is not None`).
+            assert idiom.base_class is not None
+            match = _first_base_match(ctx, tokens, idiom.base_class)
+            if match is None:
+                continue
+            tok, tier = match
+            _emit_base_class_consumer(ctx, node_ids, class_def, idiom, tok, tier, sink)
+
+
 # -- entry point -------------------------------------------------------------------------
 
 
@@ -449,5 +726,6 @@ def extract_kafka(
     _extract_producers(ctx, node_ids, idioms.producers, consts, sink)
     _extract_call_consumers(ctx, node_ids, idioms.consumers, consts, sink)
     _extract_dispatch_dict_consumers(ctx, idioms.consumers, consts, sink)
+    _extract_base_class_consumers(ctx, node_ids, idioms.consumers, sink)
 
     return KafkaResult(roles=sink.roles, channels=sink.channels, edges=sink.edges, stats=sink.stats)

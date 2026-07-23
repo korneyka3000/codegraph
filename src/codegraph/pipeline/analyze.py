@@ -225,10 +225,11 @@ def _extract_join_and_stage(
 
     Returns {"nodes": int, "edges": int, "imports_external": int, "join_stats":
     JoinStats, "http_url_unresolved": int, "http_verb_unresolved": int,
-    "http_route_unresolved": int} (the last three: M6 T2 review Important-1 --
-    http_client_ext's per-file failure counters summed across `relpaths`, always
-    present, 0 when http_client is inactive) -- everything the caller's own report
-    dict still needs to assemble
+    "http_route_unresolved": int, "consumer_base_class_no_generic": int} (the http_*
+    trio: M6 T2 review Important-1; the last one: M6 T3, same precedent -- kafka_ext's
+    base_class honest-miss counter summed across `relpaths`, always present, 0 when
+    kafka is inactive or no base_class idiom is configured) -- everything the
+    caller's own report dict still needs to assemble
     (service/files/defs/refs/malformed_ranges/degraded/reason/from_cache/mode/
     stale_files are all OUTSIDE this function's concern -- it only ever runs S5/S6
     and reports what THAT did)."""
@@ -259,6 +260,11 @@ def _extract_join_and_stage(
     http_stats = {
         "http_url_unresolved": 0, "http_verb_unresolved": 0, "http_route_unresolved": 0,
     }
+    # M6 T3: kafka_ext's own base_class honest-miss counter, aggregated across files
+    # the SAME way -- before this, kr.stats was discarded entirely (only kr.roles/
+    # channels/edges were consumed), so a class matching a base_class idiom's target
+    # base but lacking a usable generic argument vanished without a trace.
+    kafka_stats = {"consumer_base_class_no_generic": 0}
     domain_roles: dict[str, set[str]] = {}
     domain_node_props: dict[str, dict] = {}
     domain_channels: list[NodeRec] = []
@@ -318,6 +324,8 @@ def _extract_join_and_stage(
                     domain_roles.setdefault(nid, set()).update(rs)
                 domain_channels.extend(kr.channels)
                 domain_edges.extend(kr.edges)
+                for key in kafka_stats:
+                    kafka_stats[key] += kr.stats[key]
 
             if temporal_active:
                 tr = extract_temporal(ctx, node_ids)
@@ -389,6 +397,7 @@ def _extract_join_and_stage(
         "imports_external": imports_external,
         "join_stats": join_stats,
         **http_stats,
+        **kafka_stats,
     }
 
 
@@ -464,6 +473,7 @@ def _analyze_full(
         "http_url_unresolved": ej["http_url_unresolved"],
         "http_verb_unresolved": ej["http_verb_unresolved"],
         "http_route_unresolved": ej["http_route_unresolved"],
+        "consumer_base_class_no_generic": ej["consumer_base_class_no_generic"],
         "degraded": degraded,
         "reason": reason,
         "from_cache": from_cache,
@@ -570,6 +580,7 @@ def _analyze_incremental(
         "http_url_unresolved": ej["http_url_unresolved"],
         "http_verb_unresolved": ej["http_verb_unresolved"],
         "http_route_unresolved": ej["http_route_unresolved"],
+        "consumer_base_class_no_generic": ej["consumer_base_class_no_generic"],
         "degraded": False,
         "reason": None,
         "from_cache": from_cache,
