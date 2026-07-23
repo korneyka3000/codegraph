@@ -138,23 +138,23 @@ this task is the first actual CONSUMER of it):
     "enum_fanout"}` -- documented, honest over-approximation (OPEN R2a): every
     call-site this idiom's `call:` pattern matches is claimed to (over-)produce
     EVERY topic the enum could ever name, not just the one the runtime call
-    actually picks. Sanctioned ONLY on a producer's topic-identity ValueSpec fields
-    (`ChannelSpec.name_from`/`.topic`) -- `ChannelSpec.event_type_from` and every
-    ConsumerIdiom ValueSpec field reject it at config-load time (see config/
-    models.py's own validators) since neither has an analogous "fan out" semantics
-    to justify the same tradeoff. This module implements the fan-out mechanism
-    itself only for `ChannelSpec.kind="kafka_topic"`'s `name_from` (the scenario
-    OPEN R2 actually needs); an enum source on `ChannelSpec.topic` (the
-    `kind="event_type"` CONTAINS-pairing field) is DSL-valid but has no fan-out
-    implementation here -- it degrades gracefully through resolve_value_spec's own
-    defensive unresolved branch above (silently skips the CONTAINS pairing, same as
-    any other unresolved topic; the event PRODUCES edge itself is unaffected), a
-    documented, deliberate scope narrowing rather than an oversight.
+    actually picks. Sanctioned ONLY on `ChannelSpec.name_from` (a producer
+    kafka_topic channel's own identity, the one field this module implements
+    fan-out for) -- `ChannelSpec.event_type_from`, `ChannelSpec.topic` (M7 T2
+    review Important-1: no fan-out exists for the event_type kind's
+    CONTAINS-pairing field either, so an enum there was a validated-but-
+    guaranteed-inert config cell -- now fail-closed at load time instead) and
+    every ConsumerIdiom ValueSpec field reject it at config-load time (see
+    config/models.py's own validators), since none of them has an analogous
+    "fan out" semantics to justify the same tradeoff. Multiple matched
+    call-sites sharing one enclosing def dedup to one edge per (src, dst) with a
+    `callsite_count` prop (M7 T2 review Important-2, CALLS precedent) -- see
+    `_emit_enum_fanout_produces`'s own docstring.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 
 from codegraph.config.models import (
@@ -227,6 +227,12 @@ class _Sink:
         "dispatch_handler_unresolved": 0,
         "dispatch_dict_missing": 0,
     })
+    # M7 T2 review Important-2: (src, dst) -> index into `edges` for enum-fanout
+    # PRODUCES edges only -- the emission-time dedup registry
+    # `_emit_enum_fanout_produces` uses to merge repeat call-sites into one edge
+    # (bumping its callsite_count prop in place) instead of appending a PK-colliding
+    # duplicate. Private bookkeeping, never part of KafkaResult.
+    enum_fanout_edge_index: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def add_role(self, node_id: str, role: str) -> None:
         self.roles.setdefault(node_id, set()).add(role)
@@ -345,7 +351,28 @@ def _emit_enum_fanout_produces(
     one) is skipped silently, same "M2 final review" empty-name crash guard every
     other make_channel_node call site in this module already carries -- the other
     (non-empty) members still fan out normally, no counter bump for the one skip
-    (this is a per-member guard, not a whole-call-site miss)."""
+    (this is a per-member guard, not a whole-call-site miss).
+
+    Emission-time (src, dst) dedup (M7 T2 review Important-2, reviewer-proven
+    evidence-clobber): TWO+ matched call-sites sharing one enclosing def would
+    otherwise emit PK-identical (src, dst, type, via_channel) edge rows -- N per
+    enum member -- and staging's INSERT OR REPLACE silently keeps only the LAST
+    site's evidence. Mirrors the CALLS precedent exactly (extractors/calls.py:
+    "aggregated per (src, dst) into one CALLS edge with a callsite_count and
+    evidence from the first call site encountered"): one edge per (src, dst),
+    `props["callsite_count"]` ALWAYS present (1 for a single site, CALLS parity),
+    incremented in place (dataclasses.replace via sink.enum_fanout_edge_index) on
+    each repeat site, evidence_file/evidence_line kept from the FIRST site in
+    traversal order (facts.calls is source order; idiom order is stable) --
+    deterministic, and the channel NodeRec is not re-appended either.
+    `producers_resolved` counts DISTINCT edges, not raw sites (its pre-existing
+    "counter == emitted edges" pairing everywhere else in this file). The
+    neighboring single-channel emit paths (_emit_kafka_topic_produces /
+    _emit_event_type_produces / the consumer paths) architecturally share the same
+    staged-PK property -- two same-def call-sites resolving the identical channel
+    collapse to one staged row, last write's evidence winning -- but at 1 edge per
+    site (not xN members) it predates M7 unchanged and stays as-is; only fan-out
+    MULTIPLIES the collision, hence only fan-out dedups at emission."""
     values = (
         ctx.class_attr_index.enum_values(spec.enum_)
         if ctx.class_attr_index is not None else None
@@ -358,12 +385,22 @@ def _emit_enum_fanout_produces(
         if not value:
             continue
         chan = make_channel_node("kafka_topic", name=value)
+        key = (enclosing_id, chan.id)
+        existing_idx = sink.enum_fanout_edge_index.get(key)
+        if existing_idx is not None:
+            prev = sink.edges[existing_idx]
+            sink.edges[existing_idx] = replace(
+                prev,
+                props={**prev.props, "callsite_count": prev.props["callsite_count"] + 1},
+            )
+            continue
         sink.channels.append(chan)
+        sink.enum_fanout_edge_index[key] = len(sink.edges)
         sink.edges.append(EdgeRec(
             src=enclosing_id, dst=chan.id, type="PRODUCES",
             resolution="heuristic", confidence=0.8, extractor=_EXTRACTOR,
             evidence_file=ctx.relpath, evidence_line=m.call.start_line,
-            props={"mechanism": "enum_fanout"},
+            props={"mechanism": "enum_fanout", "callsite_count": 1},
         ))
         sink.stats["producers_resolved"] += 1
 

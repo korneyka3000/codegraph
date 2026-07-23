@@ -1512,13 +1512,63 @@ def test_producer_enum_fanout_three_members_three_produces_and_channels():
     for e in produces:
         assert e.src == use_id
         assert e.resolution == "heuristic" and e.confidence == 0.8
-        assert e.props == {"mechanism": "enum_fanout"}
+        # callsite_count always present (CALLS-precedent parity, M7 T2 review
+        # Important-2 -- extractors/calls.py's own props={"callsite_count": ...}
+        # carries 1 for a single site too, never conditionally absent).
+        assert e.props == {"mechanism": "enum_fanout", "callsite_count": 1}
         assert e.extractor == "kafka"
     assert {c.name for c in result.channels} == expected_names
     assert len(result.channels) == 3
     assert result.roles[use_id] == {"MessageProducer"}
     assert result.stats["producers_resolved"] == 3
     assert result.stats["producer_unresolved_channel"] == 0
+
+
+ENUM_TWO_SITES_SRC = b'''from pkg import Client
+
+
+def use():
+    client = Client()
+    client.send("first")
+    client.send("second")
+'''
+
+
+def test_producer_enum_fanout_two_call_sites_dedup_to_one_edge_per_pair_with_count():
+    """M7 T2 review Important-2 (reviewer-verified evidence-clobber): TWO matched
+    call-sites in the SAME function x 3-member enum used to emit 6 PRODUCES edges
+    -- 3 PK-identical (src, dst, type, via_channel) pairs -- and staging's INSERT
+    OR REPLACE silently kept only the LAST site's evidence. Per the CALLS precedent
+    (extractors/calls.py: "aggregated per (src, dst) into one CALLS edge with a
+    callsite_count and evidence from the first call site encountered"): exactly 3
+    edges, each callsite_count=2, evidence_line of the FIRST site in traversal
+    order (facts.calls is source order -- `client.send("first")`, line 6), and one
+    channel NodeRec per distinct topic (not re-appended per site)."""
+    relpath = "m.py"
+    ctx, node_ids, consts = _load(
+        relpath, "svc", ENUM_TWO_SITES_SRC, class_attr_index=KAFKA_SETTINGS_INDEX,
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[ENUM_FANOUT_IDIOM]), consts)
+    use_id = node_ids[_def(ctx, "use").index]
+
+    first_site_line = next(
+        c for c in ctx.facts.calls if c.callee_name == "send"
+    ).start_line
+    assert first_site_line == 6  # sanity: the FIRST send call's own source line
+
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 3
+    assert {e.dst for e in produces} == {
+        "chan:kafka_topic:kyc.camunda.step_changed.basic_survey",
+        "chan:kafka_topic:kyc.camunda.step_changed.basic_kyc",
+        "chan:kafka_topic:kyc.camunda.restrictions_changed",
+    }
+    for e in produces:
+        assert e.src == use_id
+        assert e.props == {"mechanism": "enum_fanout", "callsite_count": 2}
+        assert e.evidence_line == first_site_line
+    assert len(result.channels) == 3
+    assert result.stats["producers_resolved"] == 3
 
 
 def test_producer_enum_fanout_unknown_enum_is_unresolved_with_existing_counter():

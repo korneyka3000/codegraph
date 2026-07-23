@@ -63,11 +63,14 @@ class ValueSpec(_Strict):
     # "app.enums.KycTopicName"` (see _Strict's populate_by_name comment above for how
     # BOTH spellings populate this one field). Unlike every other source, an enum
     # does not name a SINGLE value at all -- kafka_ext.py fans it out into one
-    # PRODUCES edge/channel PER member -- so its placement is fail-closed to the one
-    # shape that sanctions that over-approximation (a producer's topic identity,
-    # ChannelSpec.name_from/.topic); ChannelSpec.event_type_from and every
-    # ConsumerIdiom ValueSpec field reject it at config-load time (see those models'
-    # own validators below) rather than silently doing something nobody asked for.
+    # PRODUCES edge/channel PER member -- so its placement is fail-closed to the ONE
+    # field that sanctions (and implements) that over-approximation:
+    # ChannelSpec.name_from, a producer kafka_topic channel's own identity.
+    # ChannelSpec.event_type_from, ChannelSpec.topic (M7 T2 review Important-1: no
+    # fan-out is implemented for the CONTAINS-pairing field, so an enum there was a
+    # validated-but-dead cell) and every ConsumerIdiom ValueSpec field all reject it
+    # at config-load time (see those models' own validators below) rather than
+    # silently doing something nobody asked for.
     enum_: str | None = Field(default=None, alias="enum")
 
     @model_validator(mode="after")
@@ -117,17 +120,31 @@ class ChannelSpec(_Strict):
 
     @model_validator(mode="after")
     def _enum_only_on_topic_identity(self) -> ChannelSpec:
-        # M7 T2 (OPEN R2a): enum's fan-out over-approximation is sanctioned ONLY for
-        # a producer's TOPIC identity -- name_from (the kafka_topic kind's own
-        # channel identity) and topic (the event_type kind's CONTAINS-pairing field)
-        # -- both left unrestricted here. event_type_from names the PRODUCED EVENT's
-        # type, a different identity fanning out has no sanctioned semantics for
-        # (see ValueSpec.enum_'s own docstring) -- rejected at config-load time.
+        # M7 T2 (OPEN R2a): enum's fan-out over-approximation is sanctioned -- and
+        # implemented (kafka_ext._emit_enum_fanout_produces) -- ONLY for name_from,
+        # the kafka_topic kind's own channel identity. event_type_from names the
+        # PRODUCED EVENT's type, a different identity fanning out has no sanctioned
+        # semantics for (see ValueSpec.enum_'s own docstring) -- rejected at
+        # config-load time.
         if _is_enum_source(self.event_type_from):
             raise ValueError(
                 "ChannelSpec.event_type_from does not support an enum source -- enum "
                 "fan-out is sanctioned only for a producer's topic identity "
-                f"(name_from/topic); got {self.event_type_from!r}"
+                f"(name_from); got {self.event_type_from!r}"
+            )
+        # M7 T2 review Important-1 (fail-closed): an enum on `topic` is structurally
+        # GUARANTEED inert -- the event_type kind's CONTAINS-pairing resolution goes
+        # through resolve_value_spec, whose enum_ branch is unconditionally
+        # unresolved (kafka_ext implements fan-out only for name_from), and the
+        # kafka_topic kind never reads `topic` at all -- so it could only ever be a
+        # validated-but-dead config cell (zero edges, zero counters, forever).
+        # Unconditional (not event_type-kind-gated), mirroring the
+        # event_type_from check's own unconditional shape just above.
+        if _is_enum_source(self.topic):
+            raise ValueError(
+                "ChannelSpec.topic does not support an enum source -- enum fan-out is "
+                "implemented only for name_from (the kafka_topic kind's channel "
+                f"identity); an enum here would be structurally inert; got {self.topic!r}"
             )
         return self
 

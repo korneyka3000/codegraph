@@ -422,16 +422,33 @@ def test_channel_spec_name_from_enum_source_is_allowed():
     assert ch.name_from.enum_ == "app.models.enums.KycTopicName"
 
 
-def test_channel_spec_topic_enum_source_is_allowed():
-    """Same contrast on the OTHER topic-shaped field (event_type kind's CONTAINS-
-    pairing `topic`) -- also unrestricted at the DSL layer (kafka_ext.py documents
-    why it doesn't implement fan-out there today, a runtime/extraction decision, not
-    a config-validity one)."""
-    ch = ChannelSpec.model_validate({
-        "kind": "event_type", "event_type_from": {"arg": 0},
-        "topic": {"enum": "app.models.enums.KycTopicName"},
-    })
-    assert ch.topic.enum_ == "app.models.enums.KycTopicName"
+def test_channel_spec_topic_enum_source_rejected():
+    """M7 T2 review Important-1 (fail-closed): an enum source on ChannelSpec.topic
+    is structurally GUARANTEED inert -- kafka_ext implements fan-out only for
+    name_from (the kafka_topic kind's channel identity); on the event_type kind's
+    CONTAINS-pairing `topic` field it would fall through resolve_value_spec's
+    defensive unresolved branch unconditionally (zero edges, zero counters,
+    forever). A validated-but-dead config cell -- rejected at load time, same
+    fail-closed principle as every other dead-forever DSL matrix cell (M6 T2's
+    route_from precedent)."""
+    with pytest.raises(ValidationError):
+        ChannelSpec.model_validate({
+            "kind": "event_type", "event_type_from": {"arg": 0},
+            "topic": {"enum": "app.models.enums.KycTopicName"},
+        })
+
+
+def test_channel_spec_topic_enum_source_rejected_on_kafka_topic_kind_too():
+    """The rejection is unconditional (not event_type-kind-gated), mirroring the
+    event_type_from check's own unconditional shape: on kind="kafka_topic" the
+    `topic` field is never read at all (only name_from is), so an enum there is
+    just as dead -- rejecting the whole column is strictly more fail-closed than
+    gating on the one kind where the field is otherwise meaningful."""
+    with pytest.raises(ValidationError):
+        ChannelSpec.model_validate({
+            "kind": "kafka_topic", "name_from": {"arg": 0},
+            "topic": {"enum": "app.models.enums.KycTopicName"},
+        })
 
 
 def test_consumer_topic_enum_source_rejected():
