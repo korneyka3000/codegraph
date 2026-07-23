@@ -106,6 +106,19 @@ conflating two unrelated concerns) -- fixed as part of this same task (see
 `extractors/python_core.py`'s own `add_edge` comment): without that fix, a stale
 CONTAINS edge pointing at a since-renamed/removed node would survive incremental
 re-analyze forever, since nothing would ever match it for deletion.
+
+M7 T1 (class_attrs harvesting, open-gaps R1/R2 foundation): `_extract_join_and_stage`
+gained a pre-loop pass, BEFORE its own python_core/domain-extractor loop, that
+harvests every `relpaths` file's class-body literals (pydantic-Settings fields,
+Enum/StrEnum member values -- `parsing.class_attrs.harvest_class_attrs`) into
+per-file "class_attrs" claims and assembles the resulting SERVICE-WIDE
+`ClassAttrIndex` from those claims (`staging.claims_for`) -- reused claims plumbing,
+no schema bump; see that function's own docstring for the full incremental-
+coherence argument (claims are per-file-keyed and already survive/get wiped
+correctly across full and incremental runs alike). The index is threaded into every
+file's `FileContext.class_attr_index` this call builds. No consumer reads it yet
+(T2/T3, later in this milestone, will) -- this task ships only the harvester, the
+index, and this wiring.
 """
 
 from __future__ import annotations
@@ -123,6 +136,7 @@ from codegraph.extractors.http_client_ext import extract_http_client
 from codegraph.extractors.kafka_ext import extract_kafka
 from codegraph.extractors.python_core import extract as extract_python_core
 from codegraph.extractors.temporal_ext import extract_temporal
+from codegraph.parsing.class_attrs import build_class_attr_index, harvest_class_attrs
 from codegraph.parsing.consts import ConstTable
 from codegraph.parsing.facts import FileFacts, build_file_facts
 from codegraph.resolvers import fallback
@@ -233,11 +247,38 @@ def _extract_join_and_stage(
     resolve) -- everything the caller's own report dict still needs to assemble
     (service/files/defs/refs/malformed_ranges/degraded/reason/from_cache/mode/
     stale_files are all OUTSIDE this function's concern -- it only ever runs S5/S6
-    and reports what THAT did)."""
+    and reports what THAT did).
+
+    M7 T1 (class_attrs harvesting foundation, open-gaps R1/R2): a pre-loop pass,
+    BEFORE the per-file python_core/domain-extractor loop below, harvests every
+    `relpaths` file's class-body literals (`parsing.class_attrs.harvest_class_attrs`)
+    into per-file "class_attrs" claims (`staging.add_claims`, the same claims table
+    T6/T7/kafka/http_client already use -- no schema bump) and assembles the
+    resulting SERVICE-WIDE `ClassAttrIndex` from `staging.claims_for("class_attrs",
+    svc.name)` -- reading claims back rather than using the just-harvested list
+    in-memory is what makes this identical in full and incremental mode: incremental
+    `relpaths` is only the STALE subset, but `claims_for` still returns every
+    unchanged file's PERSISTED claims alongside this call's freshly-rewritten stale
+    ones (claims are per-file-keyed and `delete_file_layer` already wipes them by
+    relpath before this runs -- see that method's own docstring). The two-pass split
+    (harvest ALL of `relpaths` first, THEN loop) is load-bearing, not cosmetic: T2/T3
+    (later in M7) will consume the index from WITHIN the same per-file loop that
+    python_core/kafka_ext/http_client_ext already run in, so the index must be fully
+    assembled before file 1 of that loop even starts -- a class defined in file B
+    must be visible from file A's extractor call, including when A sorts (and is
+    therefore processed) before B. `class_attr_index` is then threaded into every
+    `FileContext` below (one field, same value, every file) -- this task itself reads
+    it from nowhere else (no consumer yet, T2/T3 ship later)."""
     module_set = staging.module_set(svc.name)
     def_symbol_lookup = partial(staging.def_symbol_at, svc.name)
     ref_symbol_lookup = partial(staging.ref_symbol_at, svc.name)
     module_exists = module_set.__contains__
+
+    for rp in relpaths:
+        staging.add_claims(
+            svc.name, rp, "class_attrs", harvest_class_attrs(rp, facts_by_file[rp]),
+        )
+    class_attr_index = build_class_attr_index(staging.claims_for("class_attrs", svc.name))
     fastapi_active = "fastapi" in active_idioms
     # T5: kafka is DATA-driven (effective ServiceIdioms), not active_idioms-gated --
     # see module docstring. idioms=None (default, matches active_idioms=frozenset()'s
@@ -281,7 +322,7 @@ def _extract_join_and_stage(
         ctx = FileContext(
             service=svc.name, relpath=rp, source=files[rp], facts=facts_by_file[rp],
             def_symbol_lookup=def_symbol_lookup, module_exists=module_exists,
-            ref_symbol_lookup=ref_symbol_lookup,
+            ref_symbol_lookup=ref_symbol_lookup, class_attr_index=class_attr_index,
         )
         res = extract_python_core(ctx)
         nodes.extend(res.nodes)

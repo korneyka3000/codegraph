@@ -100,6 +100,55 @@ class AssignFact:
 
 
 @dataclass(frozen=True)
+class ClassAttrFact:
+    """One simple `name[: annotation] [= value]` assignment -- ANY scope (module,
+    function, or class body; `enclosing_def` is the index into `FileFacts.defs` of the
+    immediately-enclosing def, `None` at module level -- exactly the same scope-
+    blind-collection/caller-filters convention `AssignFact` already used, just with the
+    scope itself now recorded). M7 T1 sanctioned additive extension (class_attrs
+    harvesting pre-step, mirrors the M6 T3 `base_exprs` precedent): `AssignFact` turned
+    out to carry NEITHER any enclosing-scope field AT ALL, NOR a representation for a
+    non-call right-hand side -- a plain string default (`field: str = "x"`, the common
+    pydantic-Settings/enum-member shape) or a bare annotation with no value at all
+    (`field: str`, "field exists, no default") produced no fact whatsoever before this.
+    A brand-new fact type (rather than broadening `AssignFact`'s own call-only
+    contract) keeps `AssignFact`'s existing consumers (`idiom_match.py`,
+    `fastapi_ext.py`) and its own docstring's documented shape completely untouched.
+
+    Populated for EVERY simple-identifier assignment regardless of scope or RHS shape
+    (also module/function-level, also non-string/non-call RHS) -- `class_attrs.py`'s
+    own harvest is what filters to class-body-only (`enclosing_def` pointing at a
+    `kind == "class"` def) and to the two RHS shapes it actually decodes; keeping
+    collection itself unconditional keeps this fact self-contained and reusable for any
+    FUTURE class-body-literal consumer, the same reasoning `CallFact`/`AssignFact`
+    already apply to their own unconditional, caller-filtered collection.
+
+    `has_value` is False ONLY for a bare annotation with no `=` at all (`field: str`) --
+    the "field exists, no default" shape Settings semantics need distinctly from "field
+    has some non-string default" (`has_value=True, string_value=None`). `string_value`
+    is populated for a plain string literal RHS (never for an f-string or a
+    plain+f-string `concatenated_string` mix -- mirrors `_build_argfact`'s own
+    fstring-exclusion convention exactly). `call_callee`/`call_args` mirror
+    `AssignFact`'s own call-shaped-RHS handling (last attribute segment or bare name;
+    `call_args` via the same `_build_call_args`/`ArgFact` machinery) -- populated for
+    ANY call-shaped RHS, not just `SettingsConfigDict(...)`: a per-field
+    `Field(default=..., alias=...)` call needs its OWN kwargs read the identical way.
+    `value_text` is the RHS's raw source text (`None` iff `has_value` is False) --
+    kept for the same reason every other Fact type here keeps raw text alongside its
+    decoded value (debugging/future consumers, `ArgFact.text`'s own precedent)."""
+
+    name: str
+    enclosing_def: int | None
+    annotation_text: str | None
+    has_value: bool
+    value_text: str | None
+    string_value: str | None
+    call_callee: str | None
+    call_args: list[ArgFact] | None
+    start_line: int
+
+
+@dataclass(frozen=True)
 class ImportFact:
     target_module: str
     names: list[str]
@@ -114,6 +163,11 @@ class FileFacts:
     calls: list[CallFact]
     imports: list[ImportFact]
     assigns: list[AssignFact] = field(default_factory=list)
+    # M7 T1 sanctioned additive extension (same precedent as `assigns` above): new LAST
+    # field with a default -- every pre-existing positional/keyword FileFacts(...)
+    # construction site (grepped before adding this: only build_file_facts' own return,
+    # see below) keeps working unchanged.
+    class_attrs: list[ClassAttrFact] = field(default_factory=list)
 
 
 def _strip_string(text: str) -> str:
@@ -241,6 +295,73 @@ def _build_call_args(args_node) -> list[ArgFact]:
     return result
 
 
+# -- ClassAttrFact construction (M7 T1) -------------------------------------------------
+#
+# `_call_callee_name` is a pure extraction of AssignFact's own pre-existing callee-name
+# logic (identifier as-is; attribute reduced to its LAST segment, mirroring ArgFact's
+# "attr" value_kind span convention) -- no behavior change for AssignFact's own
+# construction below, just shared with ClassAttrFact's own call-RHS branch.
+
+
+def _call_callee_name(fn_node) -> str | None:
+    if fn_node is None:
+        return None
+    if fn_node.type == "identifier":
+        return fn_node.text.decode("utf-8", errors="replace")
+    if fn_node.type == "attribute":
+        attr = fn_node.child_by_field_name("attribute")
+        if attr is not None:
+            return attr.text.decode("utf-8", errors="replace")
+    return None
+
+
+def _build_class_attr_fact(
+    left, type_node, right, parent_def: int | None, start_line: int,
+) -> ClassAttrFact:
+    """`right` (the assignment's `right` field, possibly None for a bare annotation)
+    classified into ClassAttrFact's shape: string-literal (`_strip_string`-free --
+    `string_literal_value` already un-quotes) or call-shaped are the only two RHS
+    shapes `class_attrs.py`'s harvest actually decodes; every other shape (int/bool/
+    name/attr/dict/... RHS) still produces a complete fact (`has_value=True`, every
+    value-field None past `value_text`) rather than being skipped, per this fact's own
+    docstring."""
+    base = {
+        "name": left.text.decode("utf-8", errors="replace"),
+        "enclosing_def": parent_def,
+        "annotation_text": _text_or(type_node),
+        "start_line": start_line,
+    }
+    if right is None:
+        return ClassAttrFact(
+            **base, has_value=False, value_text=None, string_value=None,
+            call_callee=None, call_args=None,
+        )
+    value_text = right.text.decode("utf-8", errors="replace")
+    is_plain_string = (
+        (right.type == "string" and not is_fstring_node(right))
+        or (
+            right.type == "concatenated_string"
+            and not any(is_fstring_node(c) for c in right.named_children if c.type == "string")
+        )
+    )
+    if is_plain_string:
+        return ClassAttrFact(
+            **base, has_value=True, value_text=value_text,
+            string_value=string_literal_value(right), call_callee=None, call_args=None,
+        )
+    if right.type == "call":
+        call_fn = right.child_by_field_name("function")
+        return ClassAttrFact(
+            **base, has_value=True, value_text=value_text, string_value=None,
+            call_callee=_call_callee_name(call_fn),
+            call_args=_build_call_args(right.child_by_field_name("arguments")),
+        )
+    return ClassAttrFact(
+        **base, has_value=True, value_text=value_text, string_value=None,
+        call_callee=None, call_args=None,
+    )
+
+
 # -- ParamFact construction ------------------------------------------------------------
 #
 # Грамматические факты (проверено node-walk'ом): "parameters" может содержать (помимо
@@ -343,6 +464,7 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
     calls: list[CallFact] = []
     imports: list[ImportFact] = []
     assigns: list[AssignFact] = []
+    class_attrs: list[ClassAttrFact] = []
 
     def visit(node, parent_def: int | None, decorators: list[str]):
         if node.type == "decorated_definition":
@@ -427,6 +549,18 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
             # обычной рекурсией, как и раньше (нужно для CallFact-сбора того же вызова).
             left = node.child_by_field_name("left")
             right = node.child_by_field_name("right")
+            # M7 T1 sanctioned extension (ClassAttrFact's own docstring has the full
+            # rationale): EVERY simple `name[: Type] [= value]` assignment, any scope/
+            # RHS shape -- unlike the AssignFact branch below, `right` may be None here
+            # (a bare `field: str` annotation with no value at all -- the pydantic-
+            # Settings "field without a default" shape) and need not be call-shaped (a
+            # plain string-literal RHS, the common Settings-default/enum-member case,
+            # produces no AssignFact at all).
+            if left is not None and left.type == "identifier":
+                class_attrs.append(_build_class_attr_fact(
+                    left, node.child_by_field_name("type"), right, parent_def,
+                    node.start_point[0] + 1,
+                ))
             if left is not None and left.type == "identifier" and right is not None:
                 call_node = None
                 if right.type == "call":
@@ -437,13 +571,7 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
                         call_node = inner
                 if call_node is not None:
                     call_fn = call_node.child_by_field_name("function")
-                    callee_name = None
-                    if call_fn is not None and call_fn.type == "identifier":
-                        callee_name = call_fn.text.decode("utf-8", errors="replace")
-                    elif call_fn is not None and call_fn.type == "attribute":
-                        attr = call_fn.child_by_field_name("attribute")
-                        if attr is not None:
-                            callee_name = attr.text.decode("utf-8", errors="replace")
+                    callee_name = _call_callee_name(call_fn)
                     if call_fn is not None and call_fn.type in ("identifier", "attribute"):
                         assigns.append(AssignFact(
                             target=left.text.decode("utf-8", errors="replace"),
@@ -512,4 +640,5 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
         calls=calls,
         imports=imports,
         assigns=assigns,
+        class_attrs=class_attrs,
     )

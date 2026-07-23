@@ -580,3 +580,140 @@ def test_def_fact_base_exprs_appended_field_defaults_to_empty_tuple():
         base_exprs=("Base[X]",),
     )
     assert d2.base_exprs == ("Base[X]",)
+
+
+# -- M7 T1: ClassAttrFact (class-body literal assignments, class_attrs harvesting
+# pre-step) -----------------------------------------------------------------------
+#
+# Pre-step finding (brief Step 1): AssignFact carries NEITHER any scope/enclosing-def
+# field AT ALL, NOR non-call right-hand sides (a plain string default like
+# `field: str = "x"`, or a bare `field: str` annotation with no value, produces no
+# AssignFact today -- only `name = Callee(...)`/`name = await Callee(...)` does).
+# Settings-field harvesting needs both: which CLASS a class-body attribute belongs to,
+# and its literal (non-call) value. ClassAttrFact is a brand-new fact type (rather than
+# broadening AssignFact's own call-only contract) -- AssignFact's existing consumers
+# (idiom_match.py, fastapi_ext.py) and its own docstring stay completely untouched.
+
+
+def test_class_attr_fact_annotated_string_default():
+    facts = build_file_facts(
+        "x.py", b'class C:\n    x: str = "http://localhost:8000"\n',
+    )
+    cls = next(d for d in facts.defs if d.name == "C")
+    attrs = [a for a in facts.class_attrs if a.enclosing_def == cls.index]
+    assert len(attrs) == 1
+    a = attrs[0]
+    assert a.name == "x"
+    assert a.annotation_text == "str"
+    assert a.has_value is True
+    assert a.value_text == '"http://localhost:8000"'
+    assert a.string_value == "http://localhost:8000"
+    assert a.call_callee is None
+    assert a.call_args is None
+    assert a.start_line == 2
+
+
+def test_class_attr_fact_bare_annotation_no_value():
+    facts = build_file_facts("x.py", b"class C:\n    x: str\n")
+    cls = next(d for d in facts.defs if d.name == "C")
+    a = next(a for a in facts.class_attrs if a.enclosing_def == cls.index)
+    assert a.name == "x"
+    assert a.annotation_text == "str"
+    assert a.has_value is False
+    assert a.value_text is None
+    assert a.string_value is None
+
+
+def test_class_attr_fact_plain_assignment_no_annotation():
+    facts = build_file_facts("x.py", b'class C:\n    x = "v"\n')
+    cls = next(d for d in facts.defs if d.name == "C")
+    a = next(a for a in facts.class_attrs if a.enclosing_def == cls.index)
+    assert a.annotation_text is None
+    assert a.has_value is True
+    assert a.string_value == "v"
+
+
+def test_class_attr_fact_call_rhs_keeps_callee_and_kwargs():
+    facts = build_file_facts(
+        "x.py",
+        b'class C:\n    model_config = SettingsConfigDict(env_prefix="service_")\n',
+    )
+    cls = next(d for d in facts.defs if d.name == "C")
+    a = next(a for a in facts.class_attrs if a.enclosing_def == cls.index)
+    assert a.name == "model_config"
+    assert a.has_value is True
+    assert a.string_value is None
+    assert a.call_callee == "SettingsConfigDict"
+    assert a.call_args is not None and len(a.call_args) == 1
+    assert a.call_args[0].keyword == "env_prefix"
+    assert a.call_args[0].value_kind == "string"
+    assert a.call_args[0].string_value == "service_"
+
+
+def test_class_attr_fact_fstring_rhs_not_treated_as_string():
+    facts = build_file_facts("x.py", b'class C:\n    x: str = f"{a}"\n')
+    cls = next(d for d in facts.defs if d.name == "C")
+    a = next(a for a in facts.class_attrs if a.enclosing_def == cls.index)
+    assert a.has_value is True
+    assert a.string_value is None
+    assert a.call_callee is None
+
+
+def test_class_attr_fact_non_string_literal_rhs():
+    facts = build_file_facts("x.py", b"class C:\n    x: int = 5\n")
+    cls = next(d for d in facts.defs if d.name == "C")
+    a = next(a for a in facts.class_attrs if a.enclosing_def == cls.index)
+    assert a.has_value is True
+    assert a.value_text == "5"
+    assert a.string_value is None
+    assert a.call_callee is None
+
+
+def test_class_attr_fact_enclosing_def_none_at_module_level():
+    facts = build_file_facts("x.py", b'x = "v"\n')
+    a = next(a for a in facts.class_attrs if a.name == "x")
+    assert a.enclosing_def is None
+
+
+def test_class_attr_fact_enclosing_def_points_to_function_not_class():
+    """A local variable assignment inside a METHOD body is still captured (AssignFact-
+    style scope-blindness, unchanged) -- class_attrs.py's own harvester is what filters
+    by `defs[enclosing_def].kind == "class"`, not this fact-collection layer."""
+    facts = build_file_facts(
+        "x.py", b'class C:\n    def f(self):\n        y = "local"\n',
+    )
+    fn = next(d for d in facts.defs if d.name == "f")
+    a = next(a for a in facts.class_attrs if a.name == "y")
+    assert a.enclosing_def == fn.index
+    assert facts.defs[a.enclosing_def].kind == "function"
+
+
+def test_class_attr_fact_multiple_members_preserve_declaration_order():
+    facts = build_file_facts(
+        "x.py",
+        b'class C:\n    A = "a"\n    B = "b"\n    C_ = "c"\n',
+    )
+    cls = next(d for d in facts.defs if d.name == "C")
+    names = [a.name for a in facts.class_attrs if a.enclosing_def == cls.index]
+    assert names == ["A", "B", "C_"]
+
+
+def test_file_facts_class_attrs_defaults_to_empty_list_when_omitted():
+    """Same additive-field precedent as `assigns`/`base_exprs`: a construction site
+    that doesn't pass `class_attrs` keeps working, defaulting to an empty list."""
+    from codegraph.parsing.facts import FileFacts
+
+    f = FileFacts(relpath="x.py", module_docstring=None, defs=[], calls=[], imports=[])
+    assert f.class_attrs == []
+
+
+def test_smoke_all_fixture_files_have_class_attrs_list_populated_where_expected():
+    from pathlib import Path
+
+    fixtures = Path(__file__).parents[2] / "fixtures" / "services"
+    for f in fixtures.rglob("*.py"):
+        facts = build_file_facts(str(f), f.read_bytes())
+        assert isinstance(facts.class_attrs, list)
+        for a in facts.class_attrs:
+            assert isinstance(a.name, str)
+            assert a.call_args is None or isinstance(a.call_args, list)

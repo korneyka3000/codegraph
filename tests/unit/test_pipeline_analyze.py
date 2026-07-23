@@ -905,3 +905,144 @@ def test_analyze_full_and_skipped_reports_have_no_stale_relpaths_key(tmp_path):
     )
     assert skip_report["mode"] == "skipped"
     assert "stale_relpaths" not in skip_report
+
+
+# -- M7 T1: class_attrs harvesting -- claims written in S5 (kind="class_attrs"),
+# service-wide ClassAttrIndex assembled from those claims BEFORE the per-file
+# extractor loop and exposed via FileContext.class_attr_index. Unconditional (not
+# gated behind active_idioms/idioms -- no fixture here activates fastapi/kafka/
+# temporal/http_client at all), same "cheap, always-on structural harvest" status as
+# python_core's own CONTAINS/IMPORTS edges. Degraded (_AlwaysFailRunner) path used
+# throughout except where the scenario itself needs mode="incremental" (which,
+# per this file's own established convention above, needs a runner that actually
+# succeeds -- _FakeSuccessRunner).
+
+_SETTINGS_SRC = (
+    "from pydantic_settings import BaseSettings, SettingsConfigDict\n"
+    "\n"
+    "\n"
+    "class ServiceSettings(BaseSettings):\n"
+    '    model_config = SettingsConfigDict(env_prefix="service_")\n'
+    "\n"
+    '    verification_requests_url: str = "http://localhost:8000"\n'
+)
+
+
+def _class_attrs_service_tree(tmp_path):
+    svc_root = tmp_path / "svc"
+    (svc_root / "app").mkdir(parents=True)
+    (svc_root / "app" / "__init__.py").write_text("")
+    (svc_root / "app" / "config.py").write_text(_SETTINGS_SRC)
+    (svc_root / "app" / "other.py").write_text("class Other:\n    def f(self):\n        pass\n")
+    return svc_root
+
+
+def test_analyze_full_writes_class_attrs_claims_unconditionally(tmp_path):
+    """No idioms/active_idioms passed at all -- proves the harvest pass is NOT gated
+    behind any domain-extractor activation flag."""
+    svc = ServiceConfig(name="svc", path=_class_attrs_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+
+    claims = st.claims_for("class_attrs", "svc")
+    by_class = {c["class_fqn"]: c for c in claims}
+    assert "app.config.ServiceSettings" in by_class
+    assert by_class["app.config.ServiceSettings"]["fields"]["verification_requests_url"] == {
+        "default": "http://localhost:8000",
+        "env_name": "SERVICE_VERIFICATION_REQUESTS_URL",
+    }
+    # a class-body-literal-free file (app/other.py) contributes nothing -- no claim
+    # emitted for it at all (harvest_class_attrs' own "nothing to index" skip).
+    assert all(rp != "app/other.py" for rp in (c["_relpath"] for c in claims))
+
+
+def test_analyze_wires_service_wide_class_attr_index_into_every_file_context(
+    tmp_path, monkeypatch,
+):
+    """The index handed to EACH file's FileContext must already be the FULLY
+    assembled, service-wide index -- not accumulated incrementally as the per-file
+    loop progresses. Proven by checking it from app/__init__.py's own ctx too: that
+    file sorts (and is therefore processed) BEFORE app/config.py alphabetically, so
+    an incorrectly-incremental implementation would hand it an index that doesn't
+    know about ServiceSettings yet."""
+    from codegraph.extractors.python_core import extract as real_extract_python_core
+    from codegraph.parsing.class_attrs import ClassAttrIndex
+
+    captured: dict[str, ClassAttrIndex | None] = {}
+
+    def spy(ctx):
+        captured[ctx.relpath] = ctx.class_attr_index
+        return real_extract_python_core(ctx)
+
+    monkeypatch.setattr("codegraph.pipeline.analyze.extract_python_core", spy)
+
+    svc = ServiceConfig(name="svc", path=_class_attrs_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+
+    assert set(captured) == {"app/__init__.py", "app/config.py", "app/other.py"}
+    for relpath, idx in captured.items():
+        assert isinstance(idx, ClassAttrIndex), relpath
+        sf = idx.settings_field("ServiceSettings", "verification_requests_url")
+        assert sf is not None, relpath
+        assert sf.default == "http://localhost:8000"
+        assert sf.env_name == "SERVICE_VERIFICATION_REQUESTS_URL"
+
+
+def test_analyze_incremental_first_run_writes_class_attrs_claims_for_all_files(tmp_path):
+    """Same 'first-run incremental, no prior state, every file added->stale' shape
+    as this file's own pre-existing http/kafka counter tests above."""
+    svc = ServiceConfig(name="svc", path=_class_attrs_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=False),
+        incremental=True,
+    )
+    assert report["mode"] == "incremental"
+    claims = st.claims_for("class_attrs", "svc")
+    assert any(c["class_fqn"] == "app.config.ServiceSettings" for c in claims)
+
+
+def test_analyze_incremental_class_attr_index_sees_unchanged_file_via_persisted_claims(
+    tmp_path, monkeypatch,
+):
+    """Incremental coherence (task brief scenario): a FULL run stages both files'
+    claims; a LATER incremental run that only re-harvests the STALE file (app/
+    other.py -- app/config.py's own content never changes) must still see
+    ServiceSettings in the assembled index, because claims_for reads the WHOLE
+    service, not just what THIS call's harvest pass touched -- exactly mirroring
+    delete_file_layer's own relpath-scoped claims deletion (staging.py) on the
+    write side."""
+    from codegraph.extractors.python_core import extract as real_extract_python_core
+
+    svc_root = _class_attrs_service_tree(tmp_path)
+    svc = ServiceConfig(name="svc", path=svc_root)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    (svc_root / "app" / "other.py").write_text(
+        "class Other:\n    def f(self):\n        return 2\n",
+    )
+
+    captured = {}
+
+    def spy(ctx):
+        captured[ctx.relpath] = ctx.class_attr_index
+        return real_extract_python_core(ctx)
+
+    monkeypatch.setattr("codegraph.pipeline.analyze.extract_python_core", spy)
+
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["stale_relpaths"] == ("app/other.py",)  # only the changed file
+    assert set(captured) == {"app/other.py"}
+
+    idx = captured["app/other.py"]
+    sf = idx.settings_field("ServiceSettings", "verification_requests_url")
+    assert sf is not None
+    assert sf.default == "http://localhost:8000"
+    assert sf.env_name == "SERVICE_VERIFICATION_REQUESTS_URL"

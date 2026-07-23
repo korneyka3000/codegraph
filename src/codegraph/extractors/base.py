@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from codegraph.core.schema import EdgeRec, NodeRec
+from codegraph.parsing.class_attrs import ClassAttrIndex
 from codegraph.parsing.facts import FileFacts
 
 
@@ -24,6 +25,17 @@ class FileContext:
     # grepped before adding this field) keeps working unchanged; a None-valued lookup
     # degrades safely (fastapi_ext treats "no lookup wired" same as "lookup found nothing").
     ref_symbol_lookup: Callable[[str, int], str | None] | None = None
+    # M7 T1 sanctioned extension: the SERVICE-WIDE class_attrs index (parsing/
+    # class_attrs.py -- pydantic-Settings fields + Enum/StrEnum values), built ONCE
+    # per analyze_service call (pipeline/analyze.py's own S5 pre-loop pass, from
+    # staged "class_attrs" claims) and handed identically to EVERY file's FileContext
+    # in that call -- not per-file, so a claim harvested from one file is visible from
+    # every other file's ctx in the same service. Default None (same "every
+    # pre-existing call site keeps working unchanged" convention as ref_symbol_lookup
+    # above) for any FileContext built outside analyze.py's own wiring (e.g. the
+    # extractor unit tests' own `_load` helpers) -- this task ships no consumer that
+    # reads it yet (T2/T3, later in M7).
+    class_attr_index: ClassAttrIndex | None = None
 
 
 @dataclass(frozen=True)
