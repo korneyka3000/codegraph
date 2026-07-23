@@ -41,8 +41,10 @@ the live-probe evidence backing every claim below):
   first climbed UP to its owning segment entry via `_entry_of` -- reverse-adjacency over
   the staged INTRA edges (CALLS/DEPENDS_ON/INVOKES_ACTIVITY, including a temporal_start-
   tagged CALLS -- workspace.py's `_apply_temporal_start_marks` writes exactly this type) --
-  stopping at the first node (starting at the src itself) that either carries a
-  RouteHandler/MessageConsumer/TemporalWorkflow role, or has no incoming intra edge at all
+  stopping at the first node (starting at the src itself) that either carries an
+  `_ENTRY_ROLES` role (RouteHandler/MessageConsumer/TemporalWorkflow;
+  + TemporalSignalHandler since M7 T4 -- see the constant's own comment), or has no
+  incoming intra edge at all
   (a "root" of its own local call subgraph -- the climb has nowhere further to go, so
   that's the best available entry). `_entry_graph` then builds an entry->entry adjacency:
   for every NEXT_SEGMENT edge (src -> dst), an entry-graph edge (_entry_of(src) -> dst) --
@@ -110,7 +112,20 @@ from codegraph.stores.staging import Staging
 
 _EXTRACTOR = "linking"
 _INTRA_EDGE_TYPES = frozenset({"CALLS", "DEPENDS_ON", "INVOKES_ACTIVITY"})
-_ENTRY_ROLES = frozenset({"RouteHandler", "MessageConsumer", "TemporalWorkflow"})
+# M7 T4 (OPEN R3): TemporalSignalHandler joins -- a @workflow.signal/@workflow.update
+# handler is an externally-invoked segment entry (the Temporal server wakes it, exactly
+# like Kafka wakes a MessageConsumer or HTTP wakes a RouteHandler; it is a CONSUMES
+# src, so segments.py already makes it a NEXT_SEGMENT dst by construction), and the
+# climb must stop AT it even when it also has a local same-service caller -- without
+# this, the handler's own onward NEXT_SEGMENT edges get keyed under whichever ancestor
+# the climb reaches instead, breaking the signal->downstream chain in _trace_segments'
+# BFS for the local-caller/relay pattern. (@workflow.query handlers also carry this
+# role but never have channel edges at all -- role-only, see temporal_ext.py -- so
+# treating one as a would-be entry is inert: no NEXT_SEGMENT edge can start or end at
+# a node with no channel-boundary edges.)
+_ENTRY_ROLES = frozenset({
+    "RouteHandler", "MessageConsumer", "TemporalWorkflow", "TemporalSignalHandler",
+})
 _MAX_PART_OF_PROCESS_NODES = 100
 
 

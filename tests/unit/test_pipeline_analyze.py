@@ -70,6 +70,10 @@ def test_analyze_degraded_report_dict_fields(tmp_path):
         # M6 T4: same precedent again, kafka's own producer_unresolved_channel
         # honest-miss counter (0 when kafka is inactive or every producer resolved).
         "producer_unresolved_channel",
+        # M7 T4 (OPEN R3): same precedent again, temporal's own signal-sender
+        # honest-miss counter (0 when temporal is inactive or every `.signal(...)`
+        # call resolved/was silently skipped as non-signal-shaped noise).
+        "signal_name_unresolved",
         "degraded", "reason", "from_cache",
     }
     assert expected_keys <= report.keys()
@@ -692,6 +696,139 @@ def test_analyze_incremental_report_carries_producer_unresolved_channel_counter(
 
     assert report["mode"] == "incremental"
     assert report["producer_unresolved_channel"] == 1
+
+
+# -- M7 T4 (OPEN R3): temporal's own signal_name_unresolved counter flows into the
+# per-service report dict too, same precedent as producer_unresolved_channel just
+# above. temporal is active_idioms-gated (unlike kafka's idioms-object gating --
+# see analyze.py's own module docstring), so active_idioms=frozenset({"temporal"})
+# is what turns the extractor on here, not an `idioms=ServiceIdioms(...)` kwarg.
+#
+# The RESOLVED path gets its own end-to-end wiring test too (M7 T4 review: the
+# `domain_channels.extend(tr.channels)` glue is temporal's FIRST-ever channels
+# output, and the extractor's own unit tests bypass analyze.py's node_ids/consts/
+# upsert wiring entirely) -- same template as
+# test_analyze_kafka_active_wires_producer_role_channel_and_produces_edge above.
+
+_SIGNAL_HANDLER_AND_SENDER_SRC = (
+    "class SurveyWorkflow:\n"
+    '    @workflow.signal(name="complete-survey")\n'
+    "    async def complete_survey(self, payload):\n"
+    "        pass\n"
+    "\n"
+    "\n"
+    "async def notify(handle, payload):\n"
+    '    await handle.signal("complete-survey", payload)\n'
+)
+
+
+def _signal_handler_and_sender_service_tree(tmp_path):
+    svc_root = tmp_path / "svc"
+    (svc_root / "app" / "workflows").mkdir(parents=True)
+    (svc_root / "app" / "__init__.py").write_text("")
+    (svc_root / "app" / "workflows" / "__init__.py").write_text("")
+    (svc_root / "app" / "workflows" / "survey.py").write_text(_SIGNAL_HANDLER_AND_SENDER_SRC)
+    return svc_root
+
+
+def test_analyze_temporal_active_wires_signal_handler_channel_and_both_edges(tmp_path):
+    svc = ServiceConfig(name="svc", path=_signal_handler_and_sender_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        active_idioms=frozenset({"temporal"}),
+    )
+
+    handler = next(
+        n for n in st.iter_nodes() if n.kind == "Function" and n.name == "complete_survey"
+    )
+    assert handler.roles == ("TemporalSignalHandler",)
+    assert handler.props["signal_kind"] == "signal"
+
+    channels = [n for n in st.iter_nodes() if n.kind == "Channel"]
+    assert [c.id for c in channels] == ["chan:temporal_signal:complete-survey"]
+    assert channels[0].props["channel_kind"] == "temporal_signal"
+
+    consumes = [e for e in st.iter_edges() if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].src == handler.id
+    assert consumes[0].dst == "chan:temporal_signal:complete-survey"
+    assert consumes[0].resolution == "static" and consumes[0].confidence == 1.0
+
+    notify = next(n for n in st.iter_nodes() if n.kind == "Function" and n.name == "notify")
+    produces = [e for e in st.iter_edges() if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    assert produces[0].src == notify.id
+    assert produces[0].dst == "chan:temporal_signal:complete-survey"
+    assert produces[0].resolution == "heuristic" and produces[0].confidence == 0.6
+    assert produces[0].props["mechanism"] == "temporal_signal"
+
+    assert report["signal_name_unresolved"] == 0
+
+
+_UNRESOLVABLE_SIGNAL_SRC = (
+    "async def notify(handle, signal_name, payload):\n"
+    "    await handle.signal(signal_name, payload)\n"
+)
+
+
+def _signal_sender_service_tree(tmp_path):
+    svc_root = tmp_path / "svc"
+    (svc_root / "app" / "workflows").mkdir(parents=True)
+    (svc_root / "app" / "__init__.py").write_text("")
+    (svc_root / "app" / "workflows" / "__init__.py").write_text("")
+    (svc_root / "app" / "workflows" / "notify.py").write_text(_UNRESOLVABLE_SIGNAL_SRC)
+    return svc_root
+
+
+def test_analyze_full_report_carries_signal_name_unresolved_counter(tmp_path):
+    svc = ServiceConfig(name="svc", path=_signal_sender_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_AlwaysFailRunner(),
+        active_idioms=frozenset({"temporal"}),
+    )
+
+    assert report["signal_name_unresolved"] == 1
+    assert not any(e.type == "PRODUCES" for e in st.iter_edges())
+
+
+def test_analyze_incremental_report_carries_signal_name_unresolved_counter(tmp_path):
+    svc = ServiceConfig(name="svc", path=_signal_sender_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=False),
+        active_idioms=frozenset({"temporal"}),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["signal_name_unresolved"] == 1
+
+
+def test_analyze_skip_report_has_signal_name_unresolved_key_defaulted_to_zero(tmp_path):
+    """_skip_report's own hardcoded-zeros convention (analyze.py: "keeping all three
+    report shapes (full/incremental/skipped) key-uniform") -- a skipped service ran
+    no extractors, so signal_name_unresolved is definitionally 0, same as every
+    other M6/M7 honest-miss counter."""
+    svc = ServiceConfig(name="svc", path=_signal_sender_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        active_idioms=frozenset({"temporal"}),
+    )
+
+    empty_delta = ServiceDelta(
+        added=(), changed=(), deleted=(), unchanged=("app/workflows/notify.py",),
+    )
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FailIfCalledRunner(),
+        active_idioms=frozenset({"temporal"}), incremental=True,
+        prior_delta=empty_delta, fingerprint_ok=True,
+    )
+
+    assert report["mode"] == "skipped"
+    assert report["signal_name_unresolved"] == 0
 
 
 # -- M4 T5: incremental analyze_service -- mode tagging, skip precondition,

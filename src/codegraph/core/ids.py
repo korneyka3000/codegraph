@@ -13,6 +13,10 @@ M5 T3 (pilot Bug 7.1): `disambiguate` -- ordinal-suffix helper for within-file i
 collisions (same-named class/function redefined in mutually-exclusive if/elif
 branches). Единственный вызыватель -- extractors/python_core.py::extract, см. её
 собственный докстринг/комментарий у `def_ids` за полным разбором первопричины.
+
+M7 T4 (OPEN R3): `chan_temporal_signal` -- same name-only shape as chan_kafka/
+chan_event ("chan:temporal_signal:<name>"), added for Temporal signal/update
+handler+sender channels (see extractors/temporal_ext.py's module docstring).
 """
 
 from __future__ import annotations
@@ -88,6 +92,10 @@ def chan_kafka(name: str) -> str:
 
 def chan_event(name: str) -> str:
     return f"chan:event_type:{name}"
+
+
+def chan_temporal_signal(name: str) -> str:
+    return f"chan:temporal_signal:{name}"
 
 
 def chan_http(owner: str | None, method: str, template: str) -> str:

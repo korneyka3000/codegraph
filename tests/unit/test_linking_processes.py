@@ -317,8 +317,8 @@ def test_resolve_selector_malformed_selector_without_colon_returns_none(tmp_path
 
 
 # -- _entry_of: climb reverse-intra-edges (CALLS/DEPENDS_ON/INVOKES_ACTIVITY) up to a
-# RouteHandler/MessageConsumer/TemporalWorkflow-tagged node, or a node with no
-# incoming intra edge at all (M3 T2) --
+# RouteHandler/MessageConsumer/TemporalWorkflow-tagged node (+ TemporalSignalHandler,
+# M7 T4), or a node with no incoming intra edge at all (M3 T2) --
 
 
 def test_entry_of_returns_node_itself_when_it_has_no_incoming_intra_edges():
@@ -344,6 +344,23 @@ def test_entry_of_climbs_multiple_hops_through_role_less_intermediates():
     intra_reverse_adj = {"leaf": ["mid"], "mid": ["mid2"], "mid2": ["entry"]}
     roles_by_id = {"entry": ("MessageConsumer",)}
     assert processes._entry_of("leaf", intra_reverse_adj, roles_by_id, set()) == "entry"
+
+
+def test_entry_of_stops_at_temporal_signal_handler_role():
+    """M7 T4 (OPEN R3) review finding: a @workflow.signal/@workflow.update handler is
+    an externally-invoked segment entry (Temporal server wakes it -- exactly like
+    Kafka wakes a MessageConsumer or HTTP wakes a RouteHandler), so the climb must
+    stop AT it even when it also has a local same-service caller. Without
+    TemporalSignalHandler in _ENTRY_ROLES the climb walked PAST the handler to its
+    caller -- misattributing PART_OF_PROCESS entries for the local-caller/relay
+    pattern AND, worse, keying the handler's own onward NEXT_SEGMENT edges under the
+    wrong entry so the signal->downstream chain broke in _trace_segments' BFS (the
+    BFS reaches the handler as a dst but its outgoing edges sit under another key)."""
+    roles_by_id = {"handler": ("TemporalSignalHandler",)}
+    # the handler HAS a local caller -- the role check must short-circuit the climb
+    # (the no-predecessor fallback alone would NOT cover this shape).
+    intra_reverse_adj = {"handler": ["local_caller"]}
+    assert processes._entry_of("handler", intra_reverse_adj, roles_by_id, set()) == "handler"
 
 
 def test_entry_of_stops_at_first_node_with_no_predecessor_when_no_role_ever_found():

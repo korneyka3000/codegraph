@@ -237,6 +237,21 @@ def print_report(report: dict, console: Console) -> None:
             f"producer_unresolved_channel = {kafka_producer_unresolved_channel}[/]"
         )
 
+    # M7 T4 (OPEN R3, same precedent as the http/kafka blocks above): temporal's own
+    # signal-sender honest-miss counter -- a `.signal(...)` call site that LOOKED
+    # like a genuine signal-name reference (a bare variable/attribute) but couldn't
+    # be resolved to a concrete channel identity (extractors/temporal_ext.py's
+    # `_resolve_signal_arg0`). A would-be PRODUCES claim that silently died this
+    # way, same "coverage warning, not an error" framing as every counter above.
+    temporal_signal_name_unresolved = sum(
+        s.get("signal_name_unresolved", 0) for s in report["services"]
+    )
+    if temporal_signal_name_unresolved:
+        console.print(
+            f"[yellow]temporal idiom misses: "
+            f"signal_name_unresolved = {temporal_signal_name_unresolved}[/]"
+        )
+
     degraded_services = health.get("degraded_services", [])
     if degraded_services:
         detail = ", ".join(

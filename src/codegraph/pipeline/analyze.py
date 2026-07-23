@@ -36,8 +36,9 @@ temporal, ничего не пишет в domain_roles/domain_node_props/domain_
 ref_symbol_lookup вовсе (consts + resolve_arg, чисто структурно), так что
 резолвится идентично что в degraded fallback, что при реальном SCIP -- см. модульный
 докстринг extractors/http_client_ext.py. T6-ревью фикс: ConstTable строится ОДИН раз на
-файл (при kafka_active|http_client_active) и передаётся в оба consts-потребляющих
-экстрактора. node_ids -- та же
+файл и передаётся во ВСЕ consts-потребляющие экстракторы (изначально kafka+http_client;
+M7 T4 добавил temporal третьим -- гейт теперь
+kafka_active|http_client_active|temporal_active, см. сам ternary ниже). node_ids -- та же
 def-index -> node-id карта, что уже строилась для fastapi, дополненная ОДНИМ новым
 ключом `None -> Module-node-id`: CallFact.enclosing_def уже использует None как маркер
 "вызов на уровне модуля", так что `node_ids.get(call.enclosing_def)` прозрачно
@@ -267,11 +268,14 @@ def _extract_join_and_stage(
     Returns {"nodes": int, "edges": int, "imports_external": int, "join_stats":
     JoinStats, "http_url_unresolved": int, "http_verb_unresolved": int,
     "http_route_unresolved": int, "consumer_base_class_no_generic": int,
-    "producer_unresolved_channel": int} (the http_* trio: M6 T2 review Important-1;
-    the next one: M6 T3; the last one: M6 T4 (GAPS §6/pilot gap 5), same precedent --
-    kafka_ext's own base_class/producer honest-miss counters summed across
-    `relpaths`, always present, 0 when kafka is inactive or nothing failed to
-    resolve) -- everything the caller's own report dict still needs to assemble
+    "producer_unresolved_channel": int, "signal_name_unresolved": int} (the http_*
+    trio: M6 T2 review Important-1; the next one: M6 T3; the next: M6 T4 (GAPS §6/
+    pilot gap 5), same precedent -- kafka_ext's own base_class/producer honest-miss
+    counters summed across `relpaths`, always present, 0 when kafka is inactive or
+    nothing failed to resolve; the last one: M7 T4 (OPEN R3) -- temporal_ext's own
+    signal-sender honest-miss counter, same precedent, 0 when temporal is inactive
+    or every `.signal(...)` call resolved/was silently skipped as non-signal-shaped
+    noise) -- everything the caller's own report dict still needs to assemble
     (service/files/defs/refs/malformed_ranges/degraded/reason/from_cache/mode/
     stale_files are all OUTSIDE this function's concern -- it only ever runs S5/S6
     and reports what THAT did).
@@ -341,6 +345,12 @@ def _extract_join_and_stage(
     # was ever picked up from kr.stats, so a would-be PRODUCES claim that died this
     # way vanished from the report exactly as silently as the consumer-side gap did.
     kafka_stats = {"consumer_base_class_no_generic": 0, "producer_unresolved_channel": 0}
+    # M7 T4 (OPEN R3): temporal_ext's own signal-sender honest-miss counter, same
+    # aggregation precedent as http_stats/kafka_stats just above -- before this,
+    # tr.stats was discarded entirely (only tr.roles/node_props/channels/edges/claims
+    # were consumed), so a `.signal(...)` call site that looked like a genuine (if
+    # unresolvable) signal reference vanished from the report without a trace.
+    temporal_stats = {"signal_name_unresolved": 0}
     domain_roles: dict[str, set[str]] = {}
     domain_node_props: dict[str, dict] = {}
     domain_channels: list[NodeRec] = []
@@ -371,9 +381,13 @@ def _extract_join_and_stage(
             # T6 review fix: ONE ConstTable per file, shared by both consts-consuming
             # extractors (kafka + http_client) -- was built inside kafka's own branch
             # (and internally by extract_http_client), i.e. twice when both active.
+            # M7 T4: temporal joins the same disjunction -- its own signal-sender arg0
+            # resolution needs consts too (brief: "Consumes: consts (arg0-литерал
+            # имени)"), same one-ConstTable-per-file sharing, now across three
+            # extractors instead of two.
             consts = (
                 ConstTable.build(facts_by_file[rp], files[rp])
-                if kafka_active or http_client_active else None
+                if kafka_active or http_client_active or temporal_active else None
             )
 
             if fastapi_active:
@@ -404,15 +418,25 @@ def _extract_join_and_stage(
                     kafka_stats[key] += kr.stats[key]
 
             if temporal_active:
-                tr = extract_temporal(ctx, node_ids)
+                # Same narrowing as the kafka_active/http_client_active branches above,
+                # same reasoning: temporal_active being True is one of the three
+                # disjuncts (M7 T4) that guarantee consts was built just above.
+                assert consts is not None
+                tr = extract_temporal(ctx, node_ids, consts)
                 for nid, rs in tr.roles.items():
                     domain_roles.setdefault(nid, set()).update(rs)
                 for nid, props in tr.node_props.items():
                     domain_node_props.setdefault(nid, {}).update(props)
+                # M7 T4: signal/update handlers and their `.signal(...)` senders now
+                # emit Channel(temporal_signal) nodes too -- temporal was the one
+                # domain extractor with no `channels` output before this task.
+                domain_channels.extend(tr.channels)
                 domain_edges.extend(tr.edges)
                 # temporal_start_mark: per-file claim, consumed later by S7 (T7) via
                 # staging.claims_for + update_edge_props on the matching CALLS edge.
                 staging.add_claims(svc.name, rp, "temporal_start_mark", tr.claims)
+                for key in temporal_stats:
+                    temporal_stats[key] += tr.stats[key]
 
             if http_client_active:
                 # Same narrowing as the kafka_active branch above, same reasoning: this
@@ -474,6 +498,7 @@ def _extract_join_and_stage(
         "join_stats": join_stats,
         **http_stats,
         **kafka_stats,
+        **temporal_stats,
     }
 
 
@@ -551,6 +576,7 @@ def _analyze_full(
         "http_route_unresolved": ej["http_route_unresolved"],
         "consumer_base_class_no_generic": ej["consumer_base_class_no_generic"],
         "producer_unresolved_channel": ej["producer_unresolved_channel"],
+        "signal_name_unresolved": ej["signal_name_unresolved"],
         "degraded": degraded,
         "reason": reason,
         "from_cache": from_cache,
@@ -576,7 +602,7 @@ def _skip_report(svc: ServiceConfig, staging: Staging) -> dict:
         "calls_joined": 0,
         "calls_unresolved": 0,
         "calls_external": 0,
-        # M6 counters: hardcoded zeros like the pre-M6 stats above, keeping all
+        # M6/M7 counters: hardcoded zeros like the pre-M6 stats above, keeping all
         # three report shapes (full/incremental/skipped) key-uniform -- a skipped
         # service ran no extractors, so every miss-counter is definitionally 0
         # (M6 final review, Minor-1: report.py's .get() tolerated the omission,
@@ -586,6 +612,8 @@ def _skip_report(svc: ServiceConfig, staging: Staging) -> dict:
         "http_route_unresolved": 0,
         "consumer_base_class_no_generic": 0,
         "producer_unresolved_channel": 0,
+        # M7 T4 (OPEN R3): same precedent, temporal's own signal-sender counter.
+        "signal_name_unresolved": 0,
         "degraded": False,
         "reason": None,
         "from_cache": False,
@@ -710,6 +738,7 @@ def _analyze_incremental(
         "http_route_unresolved": ej["http_route_unresolved"],
         "consumer_base_class_no_generic": ej["consumer_base_class_no_generic"],
         "producer_unresolved_channel": ej["producer_unresolved_channel"],
+        "signal_name_unresolved": ej["signal_name_unresolved"],
         "degraded": False,
         "reason": None,
         "from_cache": from_cache,

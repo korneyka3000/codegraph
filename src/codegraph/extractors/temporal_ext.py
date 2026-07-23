@@ -81,18 +81,191 @@ claims)`: node_props is required (nowhere else to deliver workflow_name -- this 
 only ever sees `node_ids: dict[int, str]`, never NodeRec objects, so a props-patch dict
 is the only channel analyze.py's `_apply_role_props_patch` can consume), and `stats` is
 added for parity with kafka_ext/fastapi_ext (not read downstream yet, same as
-fastapi_ext.stats today). `channels` is NOT added: temporal never creates Channel nodes.
-This mirrors T4's own documented precedent (progress.md: "FastapiResult без claims, с
-node_props -- прозой плана суперсидится top-line сигнатура") of the plan's prose
-description winning over its own abbreviated signature line.
+fastapi_ext.stats today). This mirrors T4's own documented precedent (progress.md:
+"FastapiResult без claims, с node_props -- прозой плана суперсидится top-line
+сигнатура") of the plan's prose description winning over its own abbreviated signature
+line. (M7 T4, below, adds a `channels` field -- the "temporal never creates Channel
+nodes" claim this paragraph originally made no longer holds; see that section.)
+
+M7 T4 (OPEN R3, docs/superpowers/reports/2026-07-23-pilot-rerun-open-gaps.md): Temporal
+signals as first-class channels -- 34 real `@workflow.signal|query|update` handlers +
+45 `.signal(` sender call-sites + 3 `get_external_workflow_handle` uses, all invisible
+before this task (grep against the extractor turned up zero matches). Binding design
+(M7 plan): REUSE PRODUCES/CONSUMES over a new Channel kind "temporal_signal" -- no new
+edge types at all (EDGE_TYPES/core/schema.py is untouched); trace_process/
+linking.segments.derive group PRODUCES/CONSUMES purely by edge type + channel id,
+never by Channel.props["channel_kind"] (verified by reading that module), so the
+signal hop is picked up by the EXISTING grouping for free, no linking-layer change
+needed. `TemporalResult` gains a `channels: list[NodeRec]` field (placed right after
+`node_props`, mirroring FastapiResult's own `roles, node_props, channels, edges, ...`
+order) -- both handlers and senders create `Channel(kind="temporal_signal")` nodes,
+unlike every OTHER edge this module emits.
+
+  - Handlers: `@workflow.signal`/`@workflow.update`-decorated methods share ONE role,
+    TemporalSignalHandler (mirrors the activity-role precedent) -- `_extract_signal_
+    kind_roles` is one shared helper parameterized by (decorator pattern, signal_kind
+    string), called once per decorator kind so the two stay byte-identical in shape.
+    `@workflow.query` is role-only (`_extract_query_roles`, its own smaller function --
+    NO channel/edge at all, since a query is a synchronous read, not an async
+    boundary a sender ever "produces" into). All three write `node_props["signal_kind"]`
+    (mirrors `workflow_name`'s own node_props-patch convention) -- this is the ONLY
+    place `signal_kind` lives when the decorator is `query` (no edge exists to also
+    carry it), so it is deliberately a node prop first and foremost; signal/update
+    additionally mirror it onto their own CONSUMES edge's props for query-ability
+    without a node join.
+
+    Channel identity: the decorator's own `name=` kwarg (a STRING LITERAL only --
+    decorators are never visited as CallFacts by build_file_facts, since a decorated
+    def's decorator expression lives outside `body` and is never walked as a `call`
+    node, M1a's own carried-forward "outside body" limitation; `_mini_decorator_call`
+    re-parses one decorator's raw text standalone to recover a real CallFact, the
+    EXACT mirror of fastapi_ext.py's own `_mini_call` -- see that module's docstring
+    for the full "why" this is needed at all) falling back to the method's OWN name
+    when name= is absent (bare `@workflow.signal`), a call-form decorator with no
+    name= kwarg at all (`@workflow.signal()`), or name= present but non-string/empty.
+    Deliberately NOT const-resolved against the file's ConstTable (unlike the sender
+    side below) -- mirrors fastapi_ext._route_prefix's own `APIRouter(prefix=...)`
+    kwarg convention (string-literal only), and every real fixture this task's own
+    pilot evidence quotes (`@workflow.signal(name="complete-survey")`, `"survey-ready"`,
+    ...) is already a literal. A `name=SOME_CONST` kwarg is a documented, deliberate
+    scope boundary, not a silent gap: falling back to the method name (same as no
+    name= at all) is a strictly SAFER default than emitting a wrong/absent channel,
+    and no real fixture exercises this shape.
+
+  - Senders: `<handle>.signal("<name>", ...)` and `get_external_workflow_handle(...).
+    signal(...)` share ONE matcher, `_extract_signal_senders` -- callee_name == "signal"
+    EXACTLY, receiver checked NOT AT ALL (mirrors `_extract_start_workflow_claims`'s
+    own no-receiver-check precedent for "ANY receiver", one level more permissive than
+    `execute_activity`'s fixed `receiver_text == "workflow"` check above). Chained-call
+    receivers (`get_external_workflow_handle(wf_id).signal(...)`) need NO special
+    casing at all: CallFact.receiver_text is the raw source TEXT of the call's own
+    `object` field regardless of that field's node type (parsing/facts.py's own
+    contract comment: "receiver_text = весь текст object-поля, включая вложенные
+    точки" -- text, not a structural walk), so for a chained call it comes back as
+    the literal string "get_external_workflow_handle(wf_id)", simply never inspected
+    by a matcher that ignores receiver entirely -- pinned by
+    test_signal_sender_via_external_workflow_handle_chained_call_produces in this
+    module's own test file, which asserts the exact receiver_text value AND that
+    extraction succeeds through the identical code path as a plain
+    `handle.signal(...)` call.
+
+    arg0 resolution (`_resolve_signal_arg0`) is a three-way split, chosen over a
+    plain binary resolved/unresolved because a receiver-agnostic, callee-name-only
+    match (the weakest-evidence pattern in this entire codebase -- even weaker than
+    idiom_match's own IMPORT_NAME tier, which at least requires an import statement
+    corroborating the callee) needs to separate "doesn't even look like a signal
+    call" from "looks like one but we honestly can't resolve it", rather than
+    bumping a miss counter for every non-Temporal `.signal(...)` call in a codebase
+    (an honest, but noisy, per-call-site classification cost this task's brief
+    explicitly asked to avoid via "noise guard"):
+      1. arg0 is a STRING literal (`value_kind == "string"`), or a bare NAME
+         resolving through `consts.resolve_arg` to a real value (a module-level
+         `NAME = "literal"` constant, per this task's brief: "Consumes: consts
+         (arg0-литерал имени)"; an ATTR-shaped arg0 goes through the same
+         resolve_arg call for uniformity but can never come back kind="value"
+         today -- consts.py's attr paths only ever yield config_ref/unresolved --
+         so every attr lands in bucket 2 in practice) -> MATCH: PRODUCES into
+         Channel(temporal_signal,
+         name). An empty string ("" literal, or a const resolving to "") is treated
+         as an honest miss (bucket 2), not a match -- same "M2 final review" empty-
+         name crash guard every make_channel_node call site elsewhere in this
+         codebase already carries (kafka_ext.py), just applied a half-step earlier
+         here (before ever calling make_channel_node) since the empty-vs-populated
+         distinction also decides which stat bucket this call falls into.
+      2. arg0 IS name/attr-shaped (`value_kind in ("name", "attr")`) but does NOT
+         resolve to a usable value (a runtime variable, an attribute chain neither a
+         module const nor recognized by consts.py's os.environ/getenv/settings.X
+         textual fallback) -> counts as an honest miss, `signal_name_unresolved`
+         (this task's brief-mandated counter, wired into the per-service report --
+         see pipeline/analyze.py and pipeline/report.py). This is deliberately the
+         SAME bucket a `settings.X`-shaped attr expression falls into (resolves to
+         `Resolved(kind="config_ref")`, not "value") -- still name-like, still
+         honestly unresolvable to a concrete identity, still worth counting.
+      3. Anything else (a numeric/bool/None/dict/list literal, an f-string, no arg0
+         at all) -> SILENTLY skipped, no counter at all: "not a signal-looking call"
+         (brief's own framing) -- these shapes don't read as a signal-NAME reference
+         in the first place, so treating every one of them as a miss would just
+         manufacture noise for the overwhelming majority of unrelated `.signal(...)`
+         methods (Qt-style signal objects, etc.) any receiver-agnostic matcher will
+         inevitably sweep in. An f-string arg0 (`.signal(f"signal-{x}", ...)`) is a
+         genuinely plausible real Temporal call this bucket still discards -- a
+         documented, deliberate scope boundary (consts.resolve_arg WOULD resolve it
+         to a "template" Resolved, but this function never asks past the value_kind
+         gate above), not an oversight; see this module's own test file for the pin.
+
+    Documented, ACCEPTED false-positive risk (brief: "document the FP-risk
+    honestly"): because there is no receiver-type check at all, Python's OWN stdlib
+    `signal.signal(sig, handler)` (`import signal; signal.signal(signal.SIGTERM,
+    handler)`) structurally collides -- callee_name is "signal", arg0
+    (`signal.SIGTERM`) is attr-shaped and unresolvable, so it lands in bucket 2 above
+    and bumps `signal_name_unresolved` exactly as if it were a real, if unresolvable,
+    Temporal signal reference. This is accepted noise, not a bug: excluding it would
+    need a receiver-type check this task's own design explicitly rejects (ANY
+    receiver, no filtering -- real Temporal handles are obtained too dynamically,
+    e.g. `handle = await client.get_workflow_handle(...)`, to check by name the way
+    `execute_activity`'s fixed "workflow" receiver can). `props={"mechanism":
+    "temporal_signal"}` on every emitted PRODUCES edge marks this provenance
+    explicitly, so a graph consumer can identify (and, if ever needed, filter or
+    deprioritize) edges from this specific, weaker-evidence matcher. Pinned by
+    test_stdlib_signal_signal_collision_is_a_documented_accepted_fp_risk in this
+    module's own test file, so a future change cannot silently make this WORSE
+    (e.g. start emitting a bogus PRODUCES edge for it) without that test catching it.
+
+    Resolution/confidence: the handler-side CONSUMES edge uses this module's
+    existing `_RESOLUTION`/`_CONFIDENCE` ("static", 1.0) constants, same as
+    INVOKES_ACTIVITY above -- a decorator match IS the full, unambiguous ground
+    truth here (mirrors fastapi_ext.py's own HANDLES edge, also "static"/1.0 from a
+    decorator match alone). The sender-side PRODUCES edge instead uses a fixed
+    ("heuristic", 0.6) -- NOT derived from any idiom_match MatchTier (there is no
+    tiered matching here at all, just a bare callee-name check), chosen because 0.6
+    is this codebase's own established floor for "a weak, textually-matched
+    reference with no receiver/import corroboration" (idiom_match.MatchTier.
+    IMPORT_NAME) -- and this matcher has LESS corroboration than even that tier (no
+    import-statement check either), so reusing the existing floor value keeps the
+    number inside this codebase's own established resolution/confidence vocabulary
+    rather than inventing a new, one-off magic constant.
+
+    No cross-request dedup at PRODUCES-edge-emission time (unlike kafka_ext.py's own
+    enum-fanout path, `_emit_enum_fanout_produces`): two `.signal("x")` call sites
+    sharing one enclosing method both independently append a fresh Channel(...) +
+    EdgeRec to this extractor's own output lists; staging's (src, dst, type,
+    via_channel, origin_service) PRIMARY KEY then collapses them to one row, last
+    write's evidence winning. This is the SAME "architecturally shared, pre-existing,
+    accepted" property kafka_ext.py's OWN single-channel emit paths
+    (`_emit_kafka_topic_produces`/`_emit_event_type_produces`/the call/dispatch_dict
+    consumer paths) already have -- see that module's own `_emit_enum_fanout_produces`
+    docstring for the full "only fan-out (N edges per call site, not 1) needs its own
+    dedup" argument, which does not apply here (one edge per matched call site).
+
+    Cross-service edge invariant (staging.upsert_edges, verified by reading its own
+    logic directly, brief: "no invariant change needed; verify"): PRODUCES/CONSUMES
+    into a `chan:temporal_signal:...` id already passes today, unconditionally --
+    `chan_or_proc_endpoint` short-circuits the same-service check whenever EITHER
+    endpoint starts with "chan:"/"proc:", and every edge this section emits has a
+    chan:-prefixed dst. No schema/staging change was needed for signal channels to
+    legitimately bridge two different services' own sym: ids (e.g. a consumer in
+    service A signaling a workflow that also lives in service A is the common case,
+    but `get_external_workflow_handle` legitimately crosses services too) -- exactly
+    the same "channels are the legal bridge" property kafka/http_route channels
+    already rely on.
+
+    Neither side here uses `ctx.ref_symbol_lookup` at all (unlike INVOKES_ACTIVITY/
+    start_workflow above, both scip-ref-resolved) -- handler-side identity comes from
+    decorator TEXT (a literal or the method's own name), sender-side identity comes
+    from `consts.resolve_arg` (module-level literals only) -- so signal/update/query
+    extraction resolves IDENTICALLY under real SCIP and under the degraded heuristic
+    fallback, needing no stubbed-lookup unit/integration split the way DEPENDS_ON or
+    INVOKES_ACTIVITY do.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from codegraph.core.schema import EdgeRec
+from codegraph.core.schema import EdgeRec, NodeRec, make_channel_node
 from codegraph.extractors.idiom_match import match_decorators
+from codegraph.parsing.consts import ConstTable, resolve_arg
+from codegraph.parsing.facts import ArgFact, CallFact, build_file_facts
 from codegraph.resolvers.scip.symbols import symbol_to_node_id
 
 from .base import FileContext
@@ -100,6 +273,15 @@ from .base import FileContext
 _EXTRACTOR = "temporal"
 _RESOLUTION = "static"
 _CONFIDENCE = 1.0
+
+# M7 T4 (OPEN R3): decorator patterns for the shared signal/update channel-emitting
+# path -- (idiom_match.match_decorators pattern, node_props["signal_kind"] value).
+# workflow.query is handled separately (_extract_query_roles): role only, no channel.
+_SIGNAL_KIND_DECORATORS = (
+    ("workflow.signal", "signal"),
+    ("workflow.update", "update"),
+)
+_QUERY_DECORATOR_PATTERN = "workflow.query"
 
 # M6 T1 (pilot GAPS §3): every Temporal SDK spelling of "invoke an activity from a
 # workflow" -- receiver is still required to be exactly "workflow" (unchanged).
@@ -125,6 +307,10 @@ _START_WORKFLOW_CALLEES = frozenset({
 class TemporalResult:
     roles: dict[str, set[str]]
     node_props: dict[str, dict]
+    # M7 T4 (OPEN R3): signal/update/query handlers and their `.signal(...)` senders
+    # both create Channel(kind="temporal_signal") nodes -- placed right after
+    # node_props, mirroring FastapiResult's own field order.
+    channels: list[NodeRec]
     edges: list[EdgeRec]
     claims: list[dict]
     stats: dict[str, int]
@@ -139,6 +325,14 @@ def _stats() -> dict[str, int]:
         "start_workflow_resolved": 0,
         "start_workflow_unresolved": 0,
         "start_workflow_missing_node_id": 0,
+        # M7 T4 (OPEN R3): signal/update/query handler roles (+ CONSUMES channel for
+        # signal/update) -- see module docstring for the full design.
+        "signal_handler_missing_node_id": 0,
+        # M7 T4: `.signal(...)` sender call-sites -- PRODUCES into the SAME
+        # temporal_signal channel a handler CONSUMES from.
+        "signal_sender_missing_node_id": 0,
+        "signal_sender_resolved": 0,
+        "signal_name_unresolved": 0,
     }
 
 
@@ -149,6 +343,13 @@ def _resolve_ref(ctx: FileContext, start_byte: int | None) -> str | None:
     if sym is None:
         return None
     return symbol_to_node_id(ctx.service, ctx.relpath, sym)
+
+
+def _arg0(call: CallFact) -> ArgFact | None:
+    """First POSITIONAL argument of `call`, or None -- shared by all three
+    arg0-consuming matchers below (invokes_activity/start_workflow/signal senders;
+    M7 T4 review: the identical one-liner had accreted three copies)."""
+    return next((a for a in call.args if a.index == 0), None)
 
 
 def _extract_defn_roles(
@@ -181,7 +382,7 @@ def _extract_invokes_activity(
         if enclosing_id is None:
             stats["invokes_activity_missing_node_id"] += 1
             continue
-        arg0 = next((a for a in call.args if a.index == 0), None)
+        arg0 = _arg0(call)
         activity_id = _resolve_ref(ctx, arg0.name_start_byte) if arg0 is not None else None
         if activity_id is None:
             stats["invokes_activity_unresolved"] += 1
@@ -205,7 +406,7 @@ def _extract_start_workflow_claims(
         if enclosing_id is None:
             stats["start_workflow_missing_node_id"] += 1
             continue
-        arg0 = next((a for a in call.args if a.index == 0), None)
+        arg0 = _arg0(call)
         dst_id = _resolve_ref(ctx, arg0.name_start_byte) if arg0 is not None else None
         if dst_id is None:
             stats["start_workflow_unresolved"] += 1
@@ -218,9 +419,148 @@ def _extract_start_workflow_claims(
         stats["start_workflow_resolved"] += 1
 
 
-def extract_temporal(ctx: FileContext, node_ids: dict[int, str]) -> TemporalResult:
+def _mini_decorator_call(dec_text: str) -> CallFact | None:
+    """Re-parses one decorator's raw text as a standalone snippet to get a real
+    CallFact -- exact mirror of fastapi_ext.py's own `_mini_call` (see this module's
+    own docstring, M7 T4 section, for why decorators aren't already CallFacts). A
+    bare/non-call decorator (e.g. "workflow.signal") mini-parses to zero calls ->
+    None, same as a call-form decorator with no usable arguments at all never would
+    -- both are handled identically by the caller (fall back to the method name).
+
+    Deliberately its OWN 2-line copy, not a cross-module import of fastapi_ext's
+    `_mini_call`: unlike kafka_ext.py's reuse of idiom_match._imports_module (two
+    independent implementations of one matching RULE that must stay check-for-check
+    in sync -- a real drift risk, see that module's own docstring), there is no
+    algorithm here to drift out of sync -- both are a bare call-through to
+    build_file_facts plus "first call or None". Keeping temporal_ext.py
+    self-contained for a wrapper this trivial outweighs coupling two otherwise-
+    unrelated peer domain extractors over it (M7 T4 review weighed the hoist and
+    kept the copy; the return annotation below matches fastapi_ext's exactly)."""
+    mini = build_file_facts("<decorator>", dec_text.encode("utf-8") + b"\n")
+    return mini.calls[0] if mini.calls else None
+
+
+def _signal_channel_name(dec_text: str, method_name: str) -> str:
+    """`name=`-kwarg string literal wins; a bare decorator, a call-form decorator
+    with no name= kwarg at all, or name= present but non-string/empty all fall back
+    to the METHOD's own name -- brief: "(или имя метода при отсутствии)". See module
+    docstring (M7 T4) for why this is deliberately NOT const-resolved against the
+    file's ConstTable, unlike the sender-side arg0 below."""
+    call = _mini_decorator_call(dec_text)
+    if call is not None:
+        name_arg = next((a for a in call.args if a.keyword == "name"), None)
+        if name_arg is not None and name_arg.value_kind == "string" and name_arg.string_value:
+            return name_arg.string_value
+    return method_name
+
+
+def _extract_signal_kind_roles(
+    ctx: FileContext, node_ids: dict[int, str], pattern: str, signal_kind: str,
+    roles: dict[str, set[str]], node_props: dict[str, dict], channels: list[NodeRec],
+    edges: list[EdgeRec], stats: dict[str, int],
+) -> None:
+    """Shared by BOTH `workflow.signal` and `workflow.update` (see
+    _SIGNAL_KIND_DECORATORS) -- role TemporalSignalHandler + node_props signal_kind +
+    CONSUMES into Channel(temporal_signal, name). `workflow.query` is intentionally
+    NOT handled here -- see `_extract_query_roles` (role only, no channel/edge)."""
+    for d, dec_text in match_decorators(pattern, ctx.facts.defs):
+        node_id = node_ids.get(d.index)
+        if node_id is None:
+            stats["signal_handler_missing_node_id"] += 1
+            continue
+        roles.setdefault(node_id, set()).add("TemporalSignalHandler")
+        node_props.setdefault(node_id, {})["signal_kind"] = signal_kind
+
+        name = _signal_channel_name(dec_text, d.name)
+        chan = make_channel_node("temporal_signal", name=name)
+        channels.append(chan)
+        edges.append(EdgeRec(
+            src=node_id, dst=chan.id, type="CONSUMES",
+            resolution=_RESOLUTION, confidence=_CONFIDENCE, extractor=_EXTRACTOR,
+            evidence_file=ctx.relpath, evidence_line=d.start_line,
+            props={"signal_kind": signal_kind},
+        ))
+
+
+def _extract_query_roles(
+    ctx: FileContext, node_ids: dict[int, str],
+    roles: dict[str, set[str]], node_props: dict[str, dict], stats: dict[str, int],
+) -> None:
+    """`workflow.query` -- role ONLY (props signal_kind="query"), NO channel/edge:
+    a query is a synchronous read of workflow state, not an async boundary any
+    sender ever "produces" into (module docstring, M7 T4)."""
+    for d, _dec_text in match_decorators(_QUERY_DECORATOR_PATTERN, ctx.facts.defs):
+        node_id = node_ids.get(d.index)
+        if node_id is None:
+            stats["signal_handler_missing_node_id"] += 1
+            continue
+        roles.setdefault(node_id, set()).add("TemporalSignalHandler")
+        node_props.setdefault(node_id, {})["signal_kind"] = "query"
+
+
+def _resolve_signal_arg0(arg0: ArgFact | None, consts: ConstTable) -> tuple[str | None, bool]:
+    """Three-way classification of a `.signal(...)` call's arg0 -- see module
+    docstring (M7 T4) for the full rationale. Returns (channel_name,
+    counts_as_unresolved_miss):
+      - (name, False): a concrete, non-empty channel name -- MATCH.
+      - (None, True): arg0 LOOKS like a signal-name reference (a string that
+        resolved empty, or a name/attr that didn't resolve to a usable value) --
+        an honest miss, caller bumps signal_name_unresolved.
+      - (None, False): arg0 doesn't look like a signal-name reference at all (no
+        arg0, or a non-string/non-name/non-attr shape -- numeric/bool/dict/fstring/
+        ...) -- silent skip, noise guard, no counter.
+    """
+    if arg0 is None:
+        return None, False
+    if arg0.value_kind == "string":
+        name = arg0.string_value
+        return (name, False) if name else (None, True)
+    if arg0.value_kind in ("name", "attr"):
+        resolved = resolve_arg(arg0, consts)
+        if resolved.kind == "value" and resolved.value:
+            return resolved.value, False
+        return None, True
+    return None, False
+
+
+def _extract_signal_senders(
+    ctx: FileContext, node_ids: dict[int, str], consts: ConstTable,
+    channels: list[NodeRec], edges: list[EdgeRec], stats: dict[str, int],
+) -> None:
+    """`<handle>.signal("<name>", ...)` / `get_external_workflow_handle(...).
+    signal(...)` -- ANY receiver (never checked at all, mirrors
+    `_extract_start_workflow_claims`'s own precedent), callee_name == "signal"
+    exactly -> PRODUCES into the SAME temporal_signal channel a handler CONSUMES
+    from. See module docstring (M7 T4) for the FP-risk this deliberately accepts."""
+    for call in ctx.facts.calls:
+        if call.callee_name != "signal":
+            continue
+        enclosing_id = node_ids.get(call.enclosing_def)
+        if enclosing_id is None:
+            stats["signal_sender_missing_node_id"] += 1
+            continue
+        name, counts_as_miss = _resolve_signal_arg0(_arg0(call), consts)
+        if name is None:
+            if counts_as_miss:
+                stats["signal_name_unresolved"] += 1
+            continue
+        chan = make_channel_node("temporal_signal", name=name)
+        channels.append(chan)
+        edges.append(EdgeRec(
+            src=enclosing_id, dst=chan.id, type="PRODUCES",
+            resolution="heuristic", confidence=0.6, extractor=_EXTRACTOR,
+            evidence_file=ctx.relpath, evidence_line=call.start_line,
+            props={"mechanism": "temporal_signal"},
+        ))
+        stats["signal_sender_resolved"] += 1
+
+
+def extract_temporal(
+    ctx: FileContext, node_ids: dict[int, str], consts: ConstTable,
+) -> TemporalResult:
     roles: dict[str, set[str]] = {}
     node_props: dict[str, dict] = {}
+    channels: list[NodeRec] = []
     edges: list[EdgeRec] = []
     claims: list[dict] = []
     stats = _stats()
@@ -228,7 +568,14 @@ def extract_temporal(ctx: FileContext, node_ids: dict[int, str]) -> TemporalResu
     _extract_defn_roles(ctx, node_ids, roles, node_props, stats)
     _extract_invokes_activity(ctx, node_ids, edges, stats)
     _extract_start_workflow_claims(ctx, node_ids, claims, stats)
+    for pattern, signal_kind in _SIGNAL_KIND_DECORATORS:
+        _extract_signal_kind_roles(
+            ctx, node_ids, pattern, signal_kind, roles, node_props, channels, edges, stats,
+        )
+    _extract_query_roles(ctx, node_ids, roles, node_props, stats)
+    _extract_signal_senders(ctx, node_ids, consts, channels, edges, stats)
 
     return TemporalResult(
-        roles=roles, node_props=node_props, edges=edges, claims=claims, stats=stats,
+        roles=roles, node_props=node_props, channels=channels, edges=edges,
+        claims=claims, stats=stats,
     )

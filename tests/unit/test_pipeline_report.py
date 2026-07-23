@@ -454,6 +454,49 @@ def test_print_report_kafka_producer_unresolved_channel_defaults_when_key_absent
     assert "kafka idiom misses" not in console.export_text()
 
 
+# -- M7 T4 (OPEN R3): print_report temporal signal_name_unresolved honest-miss
+# counter -- its own "idiom misses" line, same defensive .get(key, 0)/any-nonzero-
+# shows precedent as the http/kafka blocks above (one line per extractor family).
+
+
+def test_print_report_shows_temporal_signal_name_unresolved_when_nonzero():
+    svc_with_misses = {**SERVICE_OK, "signal_name_unresolved": 4}
+    report = build_report([svc_with_misses, SERVICE_DEGRADED], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "temporal idiom misses" in text
+    assert "signal_name_unresolved = 4" in text
+
+
+def test_print_report_temporal_signal_name_unresolved_sums_across_services():
+    svc_a = {**SERVICE_OK, "signal_name_unresolved": 1}
+    svc_b = {**SERVICE_DEGRADED, "signal_name_unresolved": 2}
+    report = build_report([svc_a, svc_b], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+    assert "signal_name_unresolved = 3" in text
+
+
+def test_print_report_no_temporal_line_when_signal_name_unresolved_is_zero():
+    svc = {**SERVICE_OK, "signal_name_unresolved": 0}
+    report = build_report([svc], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    assert "temporal idiom misses" not in console.export_text()
+
+
+def test_print_report_temporal_signal_name_unresolved_defaults_when_key_absent():
+    """SERVICE_OK/SERVICE_DEGRADED (pre-M7-T4 shapes, no signal_name_unresolved key
+    at all) must not KeyError -- .get(0) makes them contribute nothing and the line
+    stays absent."""
+    report = build_report([SERVICE_OK, SERVICE_DEGRADED], LOAD_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise
+    assert "temporal idiom misses" not in console.export_text()
+
+
 # -- M2 T7: print_report linking summary (additive) --
 
 

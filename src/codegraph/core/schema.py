@@ -185,6 +185,10 @@ NODE_KINDS = frozenset({
 ROLE_KINDS = frozenset({
     "RouteHandler", "MessageConsumer", "MessageProducer",
     "TemporalWorkflow", "TemporalActivity",
+    # M7 T4 (OPEN R3): one role shared by @workflow.signal/@workflow.update/
+    # @workflow.query-decorated methods (props "signal_kind" discriminates which of
+    # the three) -- see extractors/temporal_ext.py's module docstring.
+    "TemporalSignalHandler",
 })
 EDGE_TYPES = frozenset({
     "CONTAINS", "IMPORTS", "CALLS",
@@ -248,7 +252,7 @@ def make_service_node(service: str) -> NodeRec:
 
 
 def make_channel_node(
-    kind: Literal["kafka_topic", "event_type", "http_route"],
+    kind: Literal["kafka_topic", "event_type", "http_route", "temporal_signal"],
     name: str | None = None,
     *,
     owner_service: str | None = None,
@@ -262,8 +266,11 @@ def make_channel_node(
     cross-service проверке).
 
     Обязательные параметры зависят от kind:
-      - kafka_topic / event_type: `name` обязателен (topic / event-type имя);
-        id = ids.chan_kafka(name) / ids.chan_event(name).
+      - kafka_topic / event_type / temporal_signal: `name` обязателен (topic /
+        event-type / signal-name имя); id = ids.chan_kafka(name) /
+        ids.chan_event(name) / ids.chan_temporal_signal(name) (M7 T4, OPEN R3 --
+        see extractors/temporal_ext.py's module docstring for the handler/sender
+        pair this backs).
       - http_route: `method` И `template` обязательны, `name` не используется;
         id = ids.chan_http(owner_service, method, template) (owner_service=None
         сериализуется в id как "?" -- см. ids.chan_http).
@@ -276,9 +283,9 @@ def make_channel_node(
     `extra_props` -- произвольные дополнительные свойства узла (напр.
     partition_key), копируются в NodeRec.props без изменений.
 
-    NodeRec.name -- отображаемое имя: `name` для kafka_topic/event_type,
-    "<METHOD> <template>" для http_route. qualified_name == id (каналы не имеют
-    вложенной структуры, id уже уникально их идентифицирует).
+    NodeRec.name -- отображаемое имя: `name` для kafka_topic/event_type/
+    temporal_signal, "<METHOD> <template>" для http_route. qualified_name == id
+    (каналы не имеют вложенной структуры, id уже уникально их идентифицирует).
     """
     if kind == "kafka_topic":
         if not name:
@@ -289,6 +296,11 @@ def make_channel_node(
         if not name:
             raise ValueError("make_channel_node(kind='event_type') requires name")
         node_id = ids.chan_event(name)
+        display_name = name
+    elif kind == "temporal_signal":
+        if not name:
+            raise ValueError("make_channel_node(kind='temporal_signal') requires name")
+        node_id = ids.chan_temporal_signal(name)
         display_name = name
     elif kind == "http_route":
         if not method or not template:

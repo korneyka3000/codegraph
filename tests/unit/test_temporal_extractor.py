@@ -32,8 +32,23 @@ dict is the only channel analyze.py's `_apply_role_props_patch` can consume -- t
 mirrors T4's own documented judgement call ("FastapiResult без claims, с node_props --
 прозой плана суперсидится top-line сигнатура", per progress.md). `stats` is likewise
 added for parity with every other M2 domain extractor (fastapi_ext, kafka_ext); it is
-not read anywhere downstream yet, same as fastapi_ext.stats today. `channels` is
-deliberately NOT added -- temporal never creates Channel nodes.
+not read anywhere downstream yet, same as fastapi_ext.stats today.
+
+M7 T4 (OPEN R3, docs/superpowers/reports/2026-07-23-pilot-rerun-open-gaps.md): unlike
+M2/M6, `channels` is NOW part of TemporalResult -- `@workflow.signal`/`@workflow.update`
+handlers and their `.signal(...)` senders both create `Channel(kind="temporal_signal")`
+nodes (the M2-era claim "channels is deliberately NOT added -- temporal never creates
+Channel nodes", extractors/temporal_ext.py's own old docstring, no longer holds and has
+been updated there). `_load` below now also returns a `ConstTable` (built the same way
+kafka_ext/http_client_ext's own tests build one) -- the sender-side arg0 resolution
+needs it (brief: "Consumes: consts (arg0-литерал имени)"), and `extract_temporal` grew
+a third required positional parameter for it, mirroring `extract_kafka`'s own
+`(ctx, node_ids, idioms, consts)` shape. See the new tests below the M6 T1 section for
+the full signal/update/query scenario matrix, and extractors/temporal_ext.py's own
+module docstring for the complete design rationale (name resolution, the three-way
+sender arg0 classification, the accepted FP-risk of a receiver-agnostic `.signal(...)`
+match, and why no ref_symbol_lookup is needed on either side here unlike
+INVOKES_ACTIVITY/start_workflow).
 """
 
 from __future__ import annotations
@@ -45,6 +60,7 @@ import pytest
 from codegraph.extractors.base import FileContext
 from codegraph.extractors.python_core import extract as extract_python_core
 from codegraph.extractors.temporal_ext import TemporalResult, extract_temporal
+from codegraph.parsing.consts import ConstTable
 from codegraph.parsing.facts import build_file_facts
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "services"
@@ -71,7 +87,9 @@ def _load(relpath: str, service: str, source: bytes, *, ref_symbol_lookup=None):
         def_symbol_lookup=lambda rp, sb: None, module_exists=lambda d: False,
         ref_symbol_lookup=ref_symbol_lookup,
     )
-    return ctx, node_ids
+    # M7 T4: ConstTable.build ignores `facts` (see its own docstring) and only reads
+    # `source` -- same construction every consts-consuming extractor's own tests use.
+    return ctx, node_ids, ConstTable.build(facts, source)
 
 
 def _workflow_ctx(**kw):
@@ -97,19 +115,22 @@ def _def(ctx: FileContext, name: str):
 
 
 def test_temporal_result_field_shape():
-    r = TemporalResult(roles={}, node_props={}, edges=[], claims=[], stats={})
+    r = TemporalResult(
+        roles={}, node_props={}, channels=[], edges=[], claims=[], stats={},
+    )
     assert r.roles == {}
     assert r.node_props == {}
+    assert r.channels == []
     assert r.edges == []
     assert r.claims == []
     assert r.stats == {}
 
 
 def test_no_decorators_or_temporal_calls_is_a_noop():
-    ctx, node_ids = _load("m.py", "svc", b"def plain():\n    pass\n")
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _load("m.py", "svc", b"def plain():\n    pass\n")
+    result = extract_temporal(ctx, node_ids, consts)
     assert result == TemporalResult(
-        roles={}, node_props={}, edges=[], claims=[], stats=result.stats,
+        roles={}, node_props={}, channels=[], edges=[], claims=[], stats=result.stats,
     )
 
 
@@ -117,8 +138,8 @@ def test_no_decorators_or_temporal_calls_is_a_noop():
 
 
 def test_workflow_defn_role_and_workflow_name_prop():
-    ctx, node_ids = _workflow_ctx()
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _workflow_ctx()
+    result = extract_temporal(ctx, node_ids, consts)
     class_id = node_ids[_def(ctx, "KycWorkflow").index]
 
     assert result.roles[class_id] == {"TemporalWorkflow"}
@@ -128,8 +149,8 @@ def test_workflow_defn_role_and_workflow_name_prop():
 def test_activity_defn_role_on_separate_file():
     """verify_documents lives in a DIFFERENT file than KycWorkflow -- proves the
     decorator scan is purely per-file/per-def, no cross-file assumption."""
-    ctx, node_ids = _activity_ctx()
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _activity_ctx()
+    result = extract_temporal(ctx, node_ids, consts)
     act_id = node_ids[_def(ctx, "verify_documents").index]
 
     assert result.roles[act_id] == {"TemporalActivity"}
@@ -137,14 +158,14 @@ def test_activity_defn_role_on_separate_file():
 
 
 def test_activity_file_has_no_workflow_role():
-    ctx, node_ids = _activity_ctx()
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _activity_ctx()
+    result = extract_temporal(ctx, node_ids, consts)
     assert all("TemporalWorkflow" not in roles for roles in result.roles.values())
 
 
 def test_defn_missing_node_id_skips_gracefully():
-    ctx, _real_node_ids = _workflow_ctx()
-    result = extract_temporal(ctx, {})
+    ctx, _real_node_ids, consts = _workflow_ctx()
+    result = extract_temporal(ctx, {}, consts)
     assert result.roles == {}
     assert result.node_props == {}
     assert result.stats["defn_missing_node_id"] == 1
@@ -154,7 +175,7 @@ def test_defn_missing_node_id_skips_gracefully():
 
 
 def test_invokes_activity_run_to_verify_documents_resolved():
-    ctx0, _ = _workflow_ctx()
+    ctx0, _, _ = _workflow_ctx()
     exec_call = next(c for c in ctx0.facts.calls if c.callee_name == "execute_activity")
     arg0 = next(a for a in exec_call.args if a.index == 0)
     span = arg0.name_start_byte
@@ -165,8 +186,8 @@ def test_invokes_activity_run_to_verify_documents_resolved():
     def ref_lookup(rp, sb):
         return target_sym if (rp, sb) == (relpath, span) else None
 
-    ctx, node_ids = _workflow_ctx(ref_symbol_lookup=ref_lookup)
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _workflow_ctx(ref_symbol_lookup=ref_lookup)
+    result = extract_temporal(ctx, node_ids, consts)
     run_id = node_ids[_def(ctx, "run").index]
 
     invokes = [e for e in result.edges if e.type == "INVOKES_ACTIVITY"]
@@ -182,22 +203,22 @@ def test_invokes_activity_run_to_verify_documents_resolved():
 
 
 def test_invokes_activity_unresolved_ref_lookup_no_edge_and_stat():
-    ctx, node_ids = _workflow_ctx(ref_symbol_lookup=lambda rp, sb: None)
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _workflow_ctx(ref_symbol_lookup=lambda rp, sb: None)
+    result = extract_temporal(ctx, node_ids, consts)
     assert not any(e.type == "INVOKES_ACTIVITY" for e in result.edges)
     assert result.stats["invokes_activity_unresolved"] == 1
 
 
 def test_invokes_activity_missing_ref_symbol_lookup_degrades_no_crash():
-    ctx, node_ids = _workflow_ctx()  # ref_symbol_lookup defaults to None
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _workflow_ctx()  # ref_symbol_lookup defaults to None
+    result = extract_temporal(ctx, node_ids, consts)
     assert not any(e.type == "INVOKES_ACTIVITY" for e in result.edges)
     assert result.stats["invokes_activity_unresolved"] == 1
 
 
 def test_invokes_activity_missing_node_id_skips_gracefully():
-    ctx, _real_node_ids = _workflow_ctx(ref_symbol_lookup=lambda rp, sb: "x")
-    result = extract_temporal(ctx, {})
+    ctx, _real_node_ids, consts = _workflow_ctx(ref_symbol_lookup=lambda rp, sb: "x")
+    result = extract_temporal(ctx, {}, consts)
     assert result.edges == []
     assert result.stats["invokes_activity_missing_node_id"] == 1
 
@@ -222,11 +243,11 @@ def test_execute_activity_wrong_receiver_ignored():
     sabotage (verified). Without a wired lookup the test is vacuous: _resolve_ref
     returns None and no edge appears for a reason unrelated to the receiver check.
     """
-    ctx, node_ids = _load(
+    ctx, node_ids, consts = _load(
         "m.py", "svc", NON_WORKFLOW_RECEIVER_SRC,
         ref_symbol_lookup=lambda rp, sb: "scip-python python svc 0.0 `m`/some_fn().",
     )
-    result = extract_temporal(ctx, node_ids)
+    result = extract_temporal(ctx, node_ids, consts)
     assert not any(e.type == "INVOKES_ACTIVITY" for e in result.edges)
 
 
@@ -254,7 +275,7 @@ def test_execute_activity_method_resolves_arg0_to_invokes_activity():
     """Primary pilot gap (GAPS §3, temporal_ext.py:143): `execute_activity_method`
     must match and resolve arg0 (`Act.m`, an attribute ref) exactly like
     `execute_activity` resolves a bare name ref."""
-    ctx0, _ = _load("m.py", "svc", EXECUTE_ACTIVITY_METHOD_SRC)
+    ctx0, _, _ = _load("m.py", "svc", EXECUTE_ACTIVITY_METHOD_SRC)
     call = next(c for c in ctx0.facts.calls if c.callee_name == "execute_activity_method")
     arg0 = next(a for a in call.args if a.index == 0)
     span = arg0.name_start_byte
@@ -264,8 +285,10 @@ def test_execute_activity_method_resolves_arg0_to_invokes_activity():
     def ref_lookup(rp, sb):
         return target_sym if (rp, sb) == ("m.py", span) else None
 
-    ctx, node_ids = _load("m.py", "svc", EXECUTE_ACTIVITY_METHOD_SRC, ref_symbol_lookup=ref_lookup)
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _load(
+        "m.py", "svc", EXECUTE_ACTIVITY_METHOD_SRC, ref_symbol_lookup=ref_lookup,
+    )
+    result = extract_temporal(ctx, node_ids, consts)
     run_id = node_ids[_def(ctx, "run").index]
 
     invokes = [e for e in result.edges if e.type == "INVOKES_ACTIVITY"]
@@ -299,7 +322,7 @@ def test_activity_invoke_variants_resolve_same_as_execute_activity(callee):
         b"async def run(x):\n"
         b"    await workflow." + callee.encode() + b"(Act.m, x)\n"
     )
-    ctx0, _ = _load("m.py", "svc", src)
+    ctx0, _, _ = _load("m.py", "svc", src)
     call = next(c for c in ctx0.facts.calls if c.callee_name == callee)
     arg0 = next(a for a in call.args if a.index == 0)
     span = arg0.name_start_byte
@@ -309,8 +332,8 @@ def test_activity_invoke_variants_resolve_same_as_execute_activity(callee):
     def ref_lookup(rp, sb):
         return target_sym if (rp, sb) == ("m.py", span) else None
 
-    ctx, node_ids = _load("m.py", "svc", src, ref_symbol_lookup=ref_lookup)
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _load("m.py", "svc", src, ref_symbol_lookup=ref_lookup)
+    result = extract_temporal(ctx, node_ids, consts)
 
     invokes = [e for e in result.edges if e.type == "INVOKES_ACTIVITY"]
     assert len(invokes) == 1
@@ -334,11 +357,11 @@ def test_execute_activity_method_wrong_receiver_ignored():
 def run():
     other.execute_activity_method(some_fn)
 '''
-    ctx, node_ids = _load(
+    ctx, node_ids, consts = _load(
         "m.py", "svc", src,
         ref_symbol_lookup=lambda rp, sb: "scip-python python svc 0.0 `m`/some_fn().",
     )
-    result = extract_temporal(ctx, node_ids)
+    result = extract_temporal(ctx, node_ids, consts)
     assert not any(e.type == "INVOKES_ACTIVITY" for e in result.edges)
 
 
@@ -362,7 +385,7 @@ def test_old_execute_activity_form_unchanged_alongside_new_variant():
     must not alter the pre-existing `execute_activity` form's matching/resolution in
     any way -- both it and the new `execute_activity_method` form resolve
     independently and correctly from the very same enclosing function."""
-    ctx0, _ = _load("m.py", "svc", MIXED_OLD_AND_NEW_ACTIVITY_SRC)
+    ctx0, _, _ = _load("m.py", "svc", MIXED_OLD_AND_NEW_ACTIVITY_SRC)
     old_call = next(c for c in ctx0.facts.calls if c.callee_name == "execute_activity")
     new_call = next(c for c in ctx0.facts.calls if c.callee_name == "execute_activity_method")
     old_span = next(a for a in old_call.args if a.index == 0).name_start_byte
@@ -380,10 +403,10 @@ def test_old_execute_activity_form_unchanged_alongside_new_variant():
             return new_sym
         return None
 
-    ctx, node_ids = _load(
+    ctx, node_ids, consts = _load(
         "m.py", "svc", MIXED_OLD_AND_NEW_ACTIVITY_SRC, ref_symbol_lookup=ref_lookup,
     )
-    result = extract_temporal(ctx, node_ids)
+    result = extract_temporal(ctx, node_ids, consts)
     run_id = node_ids[_def(ctx, "run").index]
 
     invokes = {e.dst: e for e in result.edges if e.type == "INVOKES_ACTIVITY"}
@@ -399,7 +422,7 @@ def test_old_execute_activity_form_unchanged_alongside_new_variant():
 
 
 def _start_workflow_span():
-    ctx0, _ = _consumer_orders_ctx()
+    ctx0, _, _ = _consumer_orders_ctx()
     sw = next(c for c in ctx0.facts.calls if c.callee_name == "start_workflow")
     arg0 = next(a for a in sw.args if a.index == 0)
     return sw, arg0.name_start_byte
@@ -414,8 +437,8 @@ def test_start_workflow_claim_resolved_dst_id():
     def ref_lookup(rp, sb):
         return target_sym if (rp, sb) == (relpath, span) else None
 
-    ctx, node_ids = _consumer_orders_ctx(ref_symbol_lookup=ref_lookup)
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _consumer_orders_ctx(ref_symbol_lookup=ref_lookup)
+    result = extract_temporal(ctx, node_ids, consts)
     handler_id = node_ids[_def(ctx, "handle_order_created").index]
 
     assert len(result.claims) == 1
@@ -429,15 +452,15 @@ def test_start_workflow_claim_resolved_dst_id():
 
 
 def test_start_workflow_claim_skipped_when_ref_unresolved():
-    ctx, node_ids = _consumer_orders_ctx(ref_symbol_lookup=lambda rp, sb: None)
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _consumer_orders_ctx(ref_symbol_lookup=lambda rp, sb: None)
+    result = extract_temporal(ctx, node_ids, consts)
     assert result.claims == []
     assert result.stats["start_workflow_unresolved"] == 1
 
 
 def test_start_workflow_missing_ref_symbol_lookup_degrades_no_crash():
-    ctx, node_ids = _consumer_orders_ctx()  # defaults to None
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _consumer_orders_ctx()  # defaults to None
+    result = extract_temporal(ctx, node_ids, consts)
     assert result.claims == []
     assert result.stats["start_workflow_unresolved"] == 1
 
@@ -450,8 +473,8 @@ def test_start_workflow_missing_node_id_skips_gracefully():
         return "scip-python python kyc-worker 0.0 `app.workflows.kyc`/KycWorkflow#run()." \
             if (rp, sb) == (relpath, span) else None
 
-    ctx, _real_node_ids = _consumer_orders_ctx(ref_symbol_lookup=ref_lookup)
-    result = extract_temporal(ctx, {})
+    ctx, _real_node_ids, consts = _consumer_orders_ctx(ref_symbol_lookup=ref_lookup)
+    result = extract_temporal(ctx, {}, consts)
     assert result.claims == []
     assert result.stats["start_workflow_missing_node_id"] == 1
 
@@ -473,10 +496,10 @@ def test_start_workflow_matches_any_receiver_not_just_client():
     def ref_lookup(rp, sb):
         return target_sym
 
-    ctx, node_ids = _load(
+    ctx, node_ids, consts = _load(
         "m.py", "svc", ANY_RECEIVER_START_WORKFLOW_SRC, ref_symbol_lookup=ref_lookup,
     )
-    result = extract_temporal(ctx, node_ids)
+    result = extract_temporal(ctx, node_ids, consts)
     assert len(result.claims) == 1
     assert result.claims[0]["src_id"] == node_ids[_def(ctx, "run_it").index]
 
@@ -507,8 +530,8 @@ def test_child_workflow_variants_produce_start_mark_claim(callee):
     def ref_lookup(rp, sb):
         return target_sym
 
-    ctx, node_ids = _load("m.py", "svc", src, ref_symbol_lookup=ref_lookup)
-    result = extract_temporal(ctx, node_ids)
+    ctx, node_ids, consts = _load("m.py", "svc", src, ref_symbol_lookup=ref_lookup)
+    result = extract_temporal(ctx, node_ids, consts)
 
     assert len(result.claims) == 1
     claim = result.claims[0]
@@ -517,3 +540,378 @@ def test_child_workflow_variants_produce_start_mark_claim(callee):
     assert result.stats["start_workflow_resolved"] == 1
     # child-workflow start is a claim only, same as start_workflow -- never a direct edge.
     assert not any(e.type == "INVOKES_ACTIVITY" for e in result.edges)
+
+
+# =========================================================================================
+# M7 T4 (OPEN R3): temporal signals as first-class channels.
+#
+# Handlers: @workflow.signal/@workflow.update/@workflow.query-decorated methods -> role
+# TemporalSignalHandler (shared by all three) + node_props signal_kind. signal/update
+# ALSO get a CONSUMES edge into Channel(temporal_signal, name) -- name from the
+# decorator's own name= kwarg (string literal only, mirrors fastapi_ext._route_prefix's
+# APIRouter(prefix=...) convention -- NOT const-resolved, unlike the sender side below),
+# falling back to the method's own name when name= is absent/non-string/empty. query is
+# role-only, no channel/edge at all (read-only, not an async boundary).
+#
+# Senders: ANY receiver (mirrors _extract_start_workflow_claims' own no-receiver-check
+# precedent), callee_name == "signal" exactly -> PRODUCES into the SAME channel-id
+# scheme. arg0 resolution is a three-way split (see extractors/temporal_ext.py's
+# _resolve_signal_arg0 docstring for the full contract): a string literal (or a bare
+# name resolving through the file's ConstTable to a string) MATCHES; a bare
+# name/attribute that does NOT resolve (a runtime variable, an unresolvable attribute
+# chain) counts as an honest miss (signal_name_unresolved); anything else (a numeric
+# literal, an f-string, a dict, no args at all -- doesn't look like a signal-name
+# reference in the first place) is silently skipped, no counter -- a noise guard,
+# not a miss. No ref_symbol_lookup is used on EITHER side here, unlike
+# INVOKES_ACTIVITY/start_workflow above.
+# =========================================================================================
+
+
+SIGNAL_WITH_NAME_SRC = b'''class SurveyWorkflow:
+    @workflow.signal(name="complete-survey")
+    async def complete_survey(self, payload):
+        pass
+'''
+
+
+def test_workflow_signal_with_name_role_and_consumes_channel():
+    ctx, node_ids, consts = _load("m.py", "svc", SIGNAL_WITH_NAME_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    handler_id = node_ids[_def(ctx, "complete_survey").index]
+
+    assert result.roles[handler_id] == {"TemporalSignalHandler"}
+    assert result.node_props[handler_id] == {"signal_kind": "signal"}
+
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    e = consumes[0]
+    assert e.src == handler_id
+    assert e.dst == "chan:temporal_signal:complete-survey"
+    assert e.resolution == "static" and e.confidence == 1.0
+    assert e.extractor == "temporal"
+    assert e.evidence_file == "m.py"
+    assert e.props == {"signal_kind": "signal"}
+    assert [c.id for c in result.channels] == ["chan:temporal_signal:complete-survey"]
+    # M7 T4 review: cross-contamination guard -- a handler decorator alone must
+    # never ALSO emit the sender-side edge type.
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+
+
+SIGNAL_BARE_SRC = b'''class SurveyWorkflow:
+    @workflow.signal
+    async def survey_ready(self, payload):
+        pass
+'''
+
+
+def test_workflow_signal_bare_decorator_uses_method_name():
+    """No name= at all (bare, non-call decorator) -- brief: "(или имя метода при
+    отсутствии)" -- channel identity falls back to the method's OWN name."""
+    ctx, node_ids, consts = _load("m.py", "svc", SIGNAL_BARE_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    handler_id = node_ids[_def(ctx, "survey_ready").index]
+
+    assert result.roles[handler_id] == {"TemporalSignalHandler"}
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].dst == "chan:temporal_signal:survey_ready"
+
+
+SIGNAL_CALL_NO_NAME_KWARG_SRC = b'''class SurveyWorkflow:
+    @workflow.signal()
+    async def survey_ready(self, payload):
+        pass
+'''
+
+
+def test_workflow_signal_call_form_without_name_kwarg_uses_method_name():
+    """Call-form decorator (`@workflow.signal()`) but no name= kwarg at all -- a
+    DIFFERENT code path than the bare (non-call) case above (matched via
+    match_decorators' call_prefix branch, then a mini re-parse finds a real
+    zero-arg CallFact) -- same method-name fallback."""
+    ctx, node_ids, consts = _load("m.py", "svc", SIGNAL_CALL_NO_NAME_KWARG_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].dst == "chan:temporal_signal:survey_ready"
+
+
+def test_signal_handler_missing_node_id_skips_gracefully():
+    ctx, _real_node_ids, consts = _load("m.py", "svc", SIGNAL_WITH_NAME_SRC)
+    result = extract_temporal(ctx, {}, consts)
+    assert result.roles == {}
+    assert result.channels == []
+    assert not any(e.type == "CONSUMES" for e in result.edges)
+    assert result.stats["signal_handler_missing_node_id"] == 1
+
+
+# -- @workflow.update: same channel treatment as signal, signal_kind="update" --
+
+UPDATE_WITH_NAME_SRC = b'''class SurveyWorkflow:
+    @workflow.update(name="resolution-step-updated")
+    async def update_resolution_step(self, payload):
+        pass
+'''
+
+
+def test_workflow_update_role_and_consumes_channel_with_update_kind():
+    ctx, node_ids, consts = _load("m.py", "svc", UPDATE_WITH_NAME_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    handler_id = node_ids[_def(ctx, "update_resolution_step").index]
+
+    assert result.roles[handler_id] == {"TemporalSignalHandler"}
+    assert result.node_props[handler_id] == {"signal_kind": "update"}
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    e = consumes[0]
+    assert e.dst == "chan:temporal_signal:resolution-step-updated"
+    assert e.props == {"signal_kind": "update"}
+    # M7 T4 review: same cross-contamination guard as the signal-handler test.
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+
+
+# -- @workflow.query: role ONLY, no channel/edge (read-only, not an async boundary) --
+
+QUERY_SRC = b'''class SurveyWorkflow:
+    @workflow.query(name="get-status")
+    def get_status(self):
+        pass
+'''
+
+
+def test_workflow_query_role_only_no_channel_or_edge():
+    ctx, node_ids, consts = _load("m.py", "svc", QUERY_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    handler_id = node_ids[_def(ctx, "get_status").index]
+
+    assert result.roles[handler_id] == {"TemporalSignalHandler"}
+    assert result.node_props[handler_id] == {"signal_kind": "query"}
+    assert result.channels == []
+    assert not any(e.type == "CONSUMES" for e in result.edges)
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+
+
+def test_query_handler_missing_node_id_skips_gracefully():
+    """M7 T4 review: _extract_query_roles carries its OWN copy of the
+    missing-node-id bump (it shares the counter NAME with the signal/update path
+    but not the code line) -- exercised independently here so a typo'd key or a
+    dropped increment in the query path's copy can't regress silently."""
+    ctx, _real_node_ids, consts = _load("m.py", "svc", QUERY_SRC)
+    result = extract_temporal(ctx, {}, consts)
+    assert result.roles == {}
+    assert result.node_props == {}
+    assert result.stats["signal_handler_missing_node_id"] == 1
+
+
+# -- signal senders: `.signal("<name>", ...)` -> PRODUCES --
+
+SIGNAL_SENDER_STRING_SRC = b'''async def notify(handle, payload):
+    await handle.signal("complete-survey", payload)
+'''
+
+
+def test_signal_sender_string_arg0_produces_matching_channel():
+    ctx, node_ids, consts = _load("m.py", "svc", SIGNAL_SENDER_STRING_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    sender_id = node_ids[_def(ctx, "notify").index]
+
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    e = produces[0]
+    assert e.src == sender_id
+    assert e.dst == "chan:temporal_signal:complete-survey"
+    assert e.resolution == "heuristic" and e.confidence == 0.6
+    assert e.extractor == "temporal"
+    assert e.evidence_file == "m.py"
+    assert e.props == {"mechanism": "temporal_signal"}
+    assert result.stats["signal_sender_resolved"] == 1
+    # M7 T4 review: cross-contamination guard -- a sender call alone must never
+    # ALSO emit the handler-side edge type.
+    assert not any(e.type == "CONSUMES" for e in result.edges)
+
+
+def test_signal_sender_missing_node_id_skips_gracefully():
+    ctx, _real_node_ids, consts = _load("m.py", "svc", SIGNAL_SENDER_STRING_SRC)
+    result = extract_temporal(ctx, {}, consts)
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.channels == []  # M7 T4 review: parity with the handler-side sibling
+    assert result.stats["signal_sender_missing_node_id"] == 1
+
+
+EXTERNAL_HANDLE_SIGNAL_SRC = b'''async def notify(wf_id):
+    await get_external_workflow_handle(wf_id).signal("x")
+'''
+
+
+def test_signal_sender_via_external_workflow_handle_chained_call_produces():
+    """Pins CallFact.receiver_text semantics for a CHAINED-call receiver: `fn` is an
+    attribute node whose `object` field is itself a `call` node
+    (get_external_workflow_handle(wf_id)) -- receiver_text is the raw source TEXT of
+    that whole object field regardless of its node type (facts.py's own contract:
+    "= весь текст object-поля"), so it comes back as the literal string
+    "get_external_workflow_handle(wf_id)", non-None. Since the sender matcher never
+    inspects receiver_text at all (ANY receiver, mirrors _extract_start_workflow_
+    claims' own no-receiver-check precedent), this chained form is handled by the
+    exact same code path as a plain `handle.signal(...)` -- no special-casing."""
+    ctx, node_ids, consts = _load("m.py", "svc", EXTERNAL_HANDLE_SIGNAL_SRC)
+    call = next(c for c in ctx.facts.calls if c.callee_name == "signal")
+    assert call.receiver_text == "get_external_workflow_handle(wf_id)"
+
+    result = extract_temporal(ctx, node_ids, consts)
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    assert produces[0].dst == "chan:temporal_signal:x"
+    assert produces[0].src == node_ids[_def(ctx, "notify").index]
+    assert not any(e.type == "CONSUMES" for e in result.edges)
+
+
+HANDLER_AND_SENDER_SRC = b'''class SurveyWorkflow:
+    @workflow.signal(name="complete-survey")
+    async def complete_survey(self, payload):
+        pass
+
+
+async def notify(handle, payload):
+    await handle.signal("complete-survey", payload)
+'''
+
+
+def test_handler_and_sender_in_same_service_share_channel_id():
+    """Deterministic chan id (make_channel_node("temporal_signal", name=...)) unifies
+    both sides for free -- no explicit dedup/join logic needed (M6-gate-style
+    channel unification, per the brief). The channels list itself is pinned too (M7
+    T4 review): it deliberately holds TWO fully-equal NodeRec entries here, one
+    appended per side -- extractor-level output is NOT deduped; staging's id-keyed
+    upsert collapses them later -- and BOTH must carry the exact id every edge's
+    dst names, or the unification claim would be vacuous."""
+    ctx, node_ids, consts = _load("m.py", "svc", HANDLER_AND_SENDER_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(consumes) == 1 and len(produces) == 1
+    assert consumes[0].dst == produces[0].dst == "chan:temporal_signal:complete-survey"
+    assert [c.id for c in result.channels] == [
+        "chan:temporal_signal:complete-survey", "chan:temporal_signal:complete-survey",
+    ]
+    assert result.channels[0] == result.channels[1]  # equal NodeRecs, one staged row
+
+
+# -- sender arg0 resolution: the three-way split --
+
+SIGNAL_SENDER_VARIABLE_SRC = b'''async def notify(handle, signal_name, payload):
+    await handle.signal(signal_name, payload)
+'''
+
+
+def test_signal_sender_unresolvable_variable_bumps_counter_no_edge():
+    ctx, node_ids, consts = _load("m.py", "svc", SIGNAL_SENDER_VARIABLE_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.stats["signal_name_unresolved"] == 1
+
+
+SIGNAL_SENDER_CONST_SRC = b'''SIGNAL_NAME = "complete-survey"
+
+
+async def notify(handle, payload):
+    await handle.signal(SIGNAL_NAME, payload)
+'''
+
+
+def test_signal_sender_name_resolves_via_module_const_produces():
+    """arg0-литерал имени (brief's "Consumes: consts") -- a bare identifier IS
+    resolvable when it names a module-level `NAME = "literal"` constant, unlike the
+    unresolvable-variable case above."""
+    ctx, node_ids, consts = _load("m.py", "svc", SIGNAL_SENDER_CONST_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    assert produces[0].dst == "chan:temporal_signal:complete-survey"
+    assert result.stats["signal_name_unresolved"] == 0
+
+
+NON_TEMPORAL_SIGNAL_CALL_SRC = b'''def run(foo):
+    foo.signal(123)
+'''
+
+
+def test_signal_sender_non_string_non_name_arg0_silently_skipped_no_counter():
+    """Not a signal-looking call at all (brief's noise-guard bucket): a
+    non-string-literal arg0 that's ALSO not name/attr-shaped (a bare int literal)
+    is neither matched NOR counted as an honest miss -- distinguishes this from the
+    unresolvable-VARIABLE case above, which DOES look like a genuine (if
+    unresolvable) signal reference."""
+    ctx, node_ids, consts = _load("m.py", "svc", NON_TEMPORAL_SIGNAL_CALL_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.stats["signal_name_unresolved"] == 0
+
+
+SIGNAL_SENDER_FSTRING_SRC = b'''async def notify(handle, suffix, payload):
+    await handle.signal(f"signal-{suffix}", payload)
+'''
+
+
+def test_signal_sender_fstring_arg0_silently_skipped_no_counter():
+    """An f-string arg0 resolves through consts.resolve_arg to its OWN "template"
+    kind (not "value") -- deliberately treated as noise here (too uncertain to guess
+    a stable channel identity from a template), NOT as an unresolvable-name-like
+    miss, even though it plausibly IS a real (if dynamic) signal call in practice.
+    Documented scope limitation, mirrors the non-string-non-name-like (123) bucket."""
+    ctx, node_ids, consts = _load("m.py", "svc", SIGNAL_SENDER_FSTRING_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.stats["signal_name_unresolved"] == 0
+
+
+SIGNAL_SENDER_EMPTY_STRING_SRC = b'''async def notify(handle, payload):
+    await handle.signal("", payload)
+'''
+
+
+def test_signal_sender_empty_string_arg0_no_crash_and_counts_as_unresolved():
+    """Same "M2 final review fix" empty-name guard every other make_channel_node
+    call site in this codebase already carries (see kafka_ext.py) -- an empty
+    string is a STRING (looks like a genuine, if malformed, signal call), so it
+    counts as an honest miss, not a silent skip."""
+    ctx, node_ids, consts = _load("m.py", "svc", SIGNAL_SENDER_EMPTY_STRING_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.stats["signal_name_unresolved"] == 1
+
+
+SIGNAL_SENDER_NO_ARGS_SRC = b'''def run(sig):
+    sig.signal()
+'''
+
+
+def test_signal_sender_no_args_silently_skipped_no_counter():
+    ctx, node_ids, consts = _load("m.py", "svc", SIGNAL_SENDER_NO_ARGS_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.stats["signal_name_unresolved"] == 0
+
+
+STDLIB_SIGNAL_COLLISION_SRC = b'''import signal
+
+
+def install_handler(handler):
+    signal.signal(signal.SIGTERM, handler)
+'''
+
+
+def test_stdlib_signal_signal_collision_is_a_documented_accepted_fp_risk():
+    """Honest FP-risk pin (brief: "document the FP-risk honestly"): the receiver-
+    agnostic `.signal(...)` matcher has NO way to distinguish a real Temporal
+    `handle.signal(name, ...)` call from Python's own unrelated stdlib
+    `signal.signal(sig, handler)` -- here arg0 (`signal.SIGTERM`) is attr-shaped
+    (name-like) and unresolvable, so it bumps signal_name_unresolved exactly like a
+    genuine unresolvable Temporal signal reference would. This is accepted,
+    documented noise (see temporal_ext.py's own module docstring), not a bug this
+    task claims to fix -- pinned here so a future change can't silently make it
+    WORSE (e.g. start emitting a bogus PRODUCES edge) without this test catching it."""
+    ctx, node_ids, consts = _load("m.py", "svc", STDLIB_SIGNAL_COLLISION_SRC)
+    result = extract_temporal(ctx, node_ids, consts)
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.stats["signal_name_unresolved"] == 1
