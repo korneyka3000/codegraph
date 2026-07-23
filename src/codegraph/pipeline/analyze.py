@@ -72,8 +72,10 @@ re-joined even though `service_delta` (which only ever compares file content has
 would never flag it on its own.
 
 Incremental step order (load-bearing, not cosmetic):
-  1. Snapshot `old_files = dict(staging.files_for_service(svc.name))` and
-     `old_refs = staging.refs_hash_by_file(svc.name)` -- BEFORE anything wipes them.
+  1. Snapshot `old_files = dict(staging.files_for_service(svc.name))`,
+     `old_refs = staging.refs_hash_by_file(svc.name)` and (M7 T1 review Important-1)
+     `old_class_attrs_digest = _class_attrs_digest(...)` -- BEFORE anything wipes
+     them.
   2. `staging.clear_scip_layer(svc.name)` (files/scip_defs/scip_refs only -- nodes/
      edges/claims of non-stale files must survive this call untouched).
   3. Fresh `scan_service` -> `add_files` -> `service_delta(old_files, scanned)`.
@@ -91,8 +93,17 @@ Incremental step order (load-bearing, not cosmetic):
      dead)` -- BEFORE S5: S5's own per-file `add_claims` calls (temporal_start_mark/
      http_call) must not collide with a stale claim row from the file's PREVIOUS
      analysis.
-  8. S5+S6 (`_extract_join_and_stage`, the exact function the full path also calls)
-     over `stale` only -- `def_symbol_lookup`/`ref_symbol_lookup`/
+  8. (8a, M7 T1 review Important-1 -- the settings-staleness escalation) Harvest the
+     stale files' class_attrs claims, then compare the SERVICE-WIDE class_attrs
+     digest against the step-1 snapshot: refs_hash is blind to attribute VALUES, so
+     a Settings-default/enum-member edit makes ONLY the Settings file itself stale
+     while every consumer file's T2/T3-derived edges (which bake those values in)
+     would silently stay stale forever. A changed digest (with non-stale files left
+     to protect) escalates THIS run: stale widens to ALL scanned files, step 7's
+     deletion re-runs over the widened set, and the report says
+     stale_escalation="class_attrs_changed". Then S5+S6
+     (`_extract_join_and_stage`, the exact function the full path also calls)
+     over `stale` -- `def_symbol_lookup`/`ref_symbol_lookup`/
      `local_defs_for_file` all query the FRESH, service-wide (not stale-scoped)
      staging tables step 4 just wrote, so a stale file referencing a def in a
      NON-stale file still resolves correctly. The Service node is always
@@ -123,6 +134,8 @@ index, and this wiring.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import replace
 from functools import cache, partial
 from pathlib import Path
@@ -153,6 +166,20 @@ def _venv_for(svc: ServiceConfig) -> Path | None:
         return svc.path / svc.python
     default_venv = svc.path / ".venv"
     return default_venv if default_venv.exists() else None
+
+
+def _class_attrs_digest(staging: Staging, service: str) -> str:
+    """sha256 over the service's CURRENT staged class_attrs claims (M7 T1 review
+    Important-1) -- the incremental path's "did any class-body literal change"
+    fingerprint. Byte-deterministic because `claims_for` orders rows by (relpath,
+    payload_json) (staging.py, M7 T1 review Minor-2 -- an order flip here would read
+    as a phantom change and escalate for no reason) and each payload dict round-trips
+    through sort_keys=True JSON on both write (`add_claims`) and re-dump (here).
+    Includes claims_for's injected "_service"/"_relpath" keys -- constant-per-row
+    metadata that only ever changes when the row itself does, so it never distorts
+    the comparison."""
+    rows = staging.claims_for("class_attrs", service)
+    return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
 
 
 def _apply_role_props_patch(
@@ -577,9 +604,13 @@ def _analyze_incremental(
     """The real incremental algorithm -- see this module's own docstring for the
     full step-by-step correctness argument and ordering rationale. Reached only when
     the skip precondition (prior_delta.empty and fingerprint_ok) did NOT hold."""
-    # 1. snapshot BEFORE clear_scip_layer wipes files/scip_refs.
+    # 1. snapshot BEFORE clear_scip_layer wipes files/scip_refs. The class_attrs
+    # digest (M7 T1 review Important-1) must also be snapshotted HERE -- before
+    # step 7's delete_file_layer wipes the stale files' claim rows, or the "before"
+    # side of the escalation comparison (step 8a) would already be missing them.
     old_files = dict(staging.files_for_service(svc.name))
     old_refs = staging.refs_hash_by_file(svc.name)
+    old_class_attrs_digest = _class_attrs_digest(staging, svc.name)
 
     # 2-3. make room, then re-scan+add_files fresh (same source of truth the full
     # path always re-scans from) and diff against the just-snapshotted OLD state.
@@ -620,6 +651,43 @@ def _analyze_incremental(
     files = {rp: (svc.path / rp).read_bytes() for rp in stale_sorted}
     facts_by_file = _build_facts_by_file(stale_sorted, files)
 
+    # 8a. M7 T1 review Important-1 (settings-staleness hole, empirically proven):
+    # refs_hash is blind to attribute VALUES -- editing a Settings default/env or an
+    # enum member changes NOTHING about any consumer file's own content or refs, so
+    # only the Settings file itself lands in `stale`, while every OTHER file's
+    # T2/T3-derived edges (which bake class_attrs VALUES in) would silently stay
+    # stale forever. Detection: harvest the stale files' class_attrs claims NOW
+    # (step 7 already wiped their old rows, so this write is the clean post-state)
+    # and compare the SERVICE-WIDE digest (stale fresh + unchanged persisted; a dead
+    # file's wiped rows correctly read as a change too) against the step-1 snapshot.
+    # Changed AND there are non-stale files left to protect -> escalate THIS run to
+    # a full re-extract: widen stale to ALL scanned files, wipe + rebuild
+    # files/facts for the widened set, and report it (stale_escalation). The
+    # widened `_extract_join_and_stage` call re-harvests every file's claims itself
+    # (its own pre-loop pass; the delete below wipes the rows this check just
+    # wrote), so claims end up complete either way -- the double harvest of the
+    # original stale files is a couple of cheap pure-Python loops, not a re-parse.
+    # No widening needed when stale already covers every scanned file (e.g. a
+    # first-run incremental, where the digest ALWAYS moves from empty-to-populated):
+    # the marker means "this run re-extracted more than the file delta demanded",
+    # not "the digest moved".
+    stale_escalation: str | None = None
+    for rp in stale_sorted:
+        staging.add_claims(
+            svc.name, rp, "class_attrs", harvest_class_attrs(rp, facts_by_file[rp]),
+        )
+    if _class_attrs_digest(staging, svc.name) != old_class_attrs_digest:
+        all_scanned = {rp for rp, _, _ in rows}
+        if all_scanned - stale:
+            stale_escalation = "class_attrs_changed"
+            stale = all_scanned
+            stale_sorted = sorted(stale)
+            staging.delete_file_layer(
+                svc.name, stale | dead, drop_calls_evidence=stale | dead,
+            )
+            files = {rp: (svc.path / rp).read_bytes() for rp in stale_sorted}
+            facts_by_file = _build_facts_by_file(stale_sorted, files)
+
     ej = _extract_join_and_stage(
         svc, staging, stale_sorted, files, facts_by_file, active_idioms, idioms,
         degraded=False,
@@ -655,7 +723,16 @@ def _analyze_incremental(
         # note: "NOT deleted"). Absent from BOTH the full and skipped report shapes
         # (there is no "stale set" concept in either -- see
         # test_analyze_full_and_skipped_reports_have_no_stale_relpaths_key).
+        #
+        # M7 T1 review Important-1: under a class_attrs escalation (step 8a) this IS
+        # the WIDENED set (all scanned files) -- load-bearing for S8 coherence, not
+        # just reporting: delete_file_layer wiped the widened set's chunk rows too,
+        # so chunk_embed must re-chunk exactly this set.
         "stale_relpaths": tuple(stale_sorted),
+        # M7 T1 review Important-1: non-None ("class_attrs_changed") iff step 8a
+        # actually WIDENED the stale set beyond what the file delta demanded --
+        # incremental-shape-only key, same family as stale_files/stale_relpaths.
+        "stale_escalation": stale_escalation,
     }
 
 

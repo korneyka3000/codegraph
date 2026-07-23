@@ -709,17 +709,26 @@ class Staging:
     def claims_for(self, kind: str, service: str | None = None) -> list[dict]:
         """payload dict + инжектированные "_service"/"_relpath" (побеждают при
         коллизии имён с ключами самого payload -- staging-метаданные авторитетнее
-        произвольного содержимого claim'а)."""
+        произвольного содержимого claim'а).
+
+        M7 T1 review Minor-2: `payload_json` -- вторичный ключ сортировки (после
+        relpath) в ОБЕИХ ветках. До этого несколько claims одного (service, relpath,
+        kind) возвращались в неспецифицированном (rowid-случайном, т.е. порядка
+        вставки) порядке -- теперь порядок байт-детерминирован независимо от порядка
+        add_claims-вызовов. Load-bearing для pipeline/analyze.py::_class_attrs_digest
+        (sha256 поверх этого списка: случайная перестановка строк читалась бы как
+        фантомное "class_attrs changed" и зря эскалировала бы инкрементальный
+        прогон до полного re-extract)."""
         if service is None:
             cur = self._db.execute(
                 "SELECT service, relpath, payload_json FROM claims WHERE kind=? "
-                "ORDER BY service, relpath",
+                "ORDER BY service, relpath, payload_json",
                 (kind,),
             )
         else:
             cur = self._db.execute(
                 "SELECT service, relpath, payload_json FROM claims "
-                "WHERE kind=? AND service=? ORDER BY relpath",
+                "WHERE kind=? AND service=? ORDER BY relpath, payload_json",
                 (kind, service),
             )
         out = []

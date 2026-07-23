@@ -897,6 +897,7 @@ def test_analyze_full_and_skipped_reports_have_no_stale_relpaths_key(tmp_path):
     st = Staging(tmp_path / "s.db")
     full_report = analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
     assert "stale_relpaths" not in full_report
+    assert "stale_escalation" not in full_report  # M7 T1: same incremental-only family
 
     empty_delta = ServiceDelta(added=(), changed=(), deleted=(), unchanged=("app/main.py",))
     skip_report = analyze_service(
@@ -905,6 +906,7 @@ def test_analyze_full_and_skipped_reports_have_no_stale_relpaths_key(tmp_path):
     )
     assert skip_report["mode"] == "skipped"
     assert "stale_relpaths" not in skip_report
+    assert "stale_escalation" not in skip_report
 
 
 # -- M7 T1: class_attrs harvesting -- claims written in S5 (kind="class_attrs"),
@@ -1046,3 +1048,117 @@ def test_analyze_incremental_class_attr_index_sees_unchanged_file_via_persisted_
     assert sf is not None
     assert sf.default == "http://localhost:8000"
     assert sf.env_name == "SERVICE_VERIFICATION_REQUESTS_URL"
+
+
+# -- M7 T1 review Important-1 (settings-staleness hole, empirically proven by the
+# reviewer on real scip): a Settings-default edit under --incremental made only the
+# Settings FILE itself stale -- refs_hash is blind to attribute VALUES, so consumer
+# files (whose T2/T3-derived edges will bake in the OLD default/env) were never
+# re-extracted, and their derived edges would have stayed stale forever. Fix: the
+# incremental path snapshots the service's class_attrs claims digest BEFORE any wipe,
+# re-harvests the stale files' claims, and -- if the service-wide digest changed --
+# escalates THIS run's stale set to ALL scanned files (reported as
+# stale_escalation="class_attrs_changed"). Self-contained in analyze.py; no
+# config_fingerprint plumbing.
+
+
+def test_analyze_incremental_settings_change_escalates_stale_to_all_files(tmp_path):
+    svc_root = _class_attrs_service_tree(tmp_path)
+    svc = ServiceConfig(name="svc", path=svc_root)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    # ONLY the Settings file changes -- and only a class-attr VALUE at that.
+    (svc_root / "app" / "config.py").write_text(
+        _SETTINGS_SRC.replace("http://localhost:8000", "http://localhost:9000"),
+    )
+
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["stale_escalation"] == "class_attrs_changed"
+    # ALL scanned files re-extracted, not just the settings file itself.
+    assert report["stale_files"] == report["files"] == 3
+    assert report["stale_relpaths"] == (
+        "app/__init__.py", "app/config.py", "app/other.py",
+    )
+    # and the escalated run's claims carry the NEW default.
+    by_class = {c["class_fqn"]: c for c in st.claims_for("class_attrs", "svc")}
+    assert by_class["app.config.ServiceSettings"]["fields"][
+        "verification_requests_url"
+    ]["default"] == "http://localhost:9000"
+
+
+def test_analyze_incremental_non_class_attr_change_does_not_escalate(tmp_path):
+    """The negative: an edit that does NOT move any class-body literal (app/other.py
+    has none at all) keeps the narrow stale set and reports stale_escalation=None --
+    escalation keys off the class_attrs claims DIGEST, not off 'some file changed'."""
+    svc_root = _class_attrs_service_tree(tmp_path)
+    svc = ServiceConfig(name="svc", path=svc_root)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    (svc_root / "app" / "other.py").write_text(
+        "class Other:\n    def f(self):\n        return 3\n",
+    )
+
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["stale_escalation"] is None
+    assert report["stale_relpaths"] == ("app/other.py",)
+
+
+def test_analyze_incremental_first_run_all_stale_reports_no_escalation(tmp_path):
+    """First-run incremental (no prior state): every file is added->stale already, so
+    even though the class_attrs digest necessarily changes (empty -> populated),
+    there is nothing to WIDEN -- stale_escalation stays None (the marker means 'this
+    run re-extracted more than the file delta demanded', not 'the digest moved')."""
+    svc = ServiceConfig(name="svc", path=_class_attrs_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=False),
+        incremental=True,
+    )
+    assert report["mode"] == "incremental"
+    assert report["stale_files"] == report["files"]
+    assert report["stale_escalation"] is None
+
+
+# -- M7 T1 review Important-2 (delete-before-harvest ordering pin, through the REAL
+# analyze_service path): the claims PK is (service, relpath, kind, payload_json) --
+# a v1->v2 Settings edit produces a DIFFERENT payload_json, so if the incremental
+# path ever harvested BEFORE delete_file_layer wiped the stale file's old rows,
+# BOTH versions' rows would coexist and the assembled index would see phantom v1
+# data. Reviewer's probe scenario, committed as a regression test.
+
+
+def test_analyze_incremental_stale_settings_file_claims_replaced_not_duplicated(tmp_path):
+    svc_root = _class_attrs_service_tree(tmp_path)
+    svc = ServiceConfig(name="svc", path=svc_root)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    (svc_root / "app" / "config.py").write_text(
+        _SETTINGS_SRC.replace("http://localhost:8000", "http://localhost:9000"),
+    )
+
+    analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True,
+    )
+
+    config_claims = [
+        c for c in st.claims_for("class_attrs", "svc")
+        if c["_relpath"] == "app/config.py"
+    ]
+    assert len(config_claims) == 1  # exactly ONE row -- v1's row is GONE, not beside v2
+    assert config_claims[0]["fields"]["verification_requests_url"]["default"] == (
+        "http://localhost:9000"
+    )

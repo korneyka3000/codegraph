@@ -204,7 +204,12 @@ def test_class_with_no_class_body_literals_is_absent_from_index():
 
 
 # -- field_by_name: unique across the service index, honest collision -> None (T3
-# auto-join safety net) --
+# auto-join safety net). M7 T1 review Important-4: the by-name join is ENV-GATED --
+# only fields actually carrying an env_name (env_prefix'd Settings classes, or an
+# explicit alias) participate at all; a plain DTO/model class (no model_config, no
+# alias) never pollutes the join surface. Both collision fixtures below therefore
+# carry env_prefix ON PURPOSE: without it they'd be excluded outright and the
+# collision assertion would pass vacuously ("not found" instead of "ambiguous").
 
 
 def test_field_by_name_unique_resolves():
@@ -215,22 +220,138 @@ def test_field_by_name_unique_resolves():
     assert sf.env_name == "SERVICE_VERIFICATION_REQUESTS_URL"
 
 
-COLLIDING_SRC_A = b'''class SettingsA:
+COLLIDING_SRC_A = b'''from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class SettingsA(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="a_")
+
     host: str = "a-host"
 '''
-COLLIDING_SRC_B = b'''class SettingsB:
+COLLIDING_SRC_B = b'''from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class SettingsB(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="b_")
+
     host: str = "b-host"
 '''
 
 
-def test_field_by_name_collision_across_two_classes_is_none():
+def test_field_by_name_collision_across_two_env_carrying_classes_is_none():
     claims = _claims("app/a.py", COLLIDING_SRC_A) + _claims("app/b.py", COLLIDING_SRC_B)
     idx = build_class_attr_index(claims)
+    # sanity: BOTH fields really are env-carrying (i.e. both genuinely participate
+    # in the by-name join -- the ambiguity below is a real collision between two
+    # joinable fields, not a vacuous "neither was ever joinable").
+    assert idx.settings_field("SettingsA", "host").env_name == "A_HOST"
+    assert idx.settings_field("SettingsB", "host").env_name == "B_HOST"
     assert idx.field_by_name("host") is None
     # the honest ambiguity is scoped to field_by_name -- per-class lookup (the caller
     # already knows which class it means) is unaffected.
     assert idx.settings_field("SettingsA", "host").default == "a-host"
     assert idx.settings_field("SettingsB", "host").default == "b-host"
+
+
+DTO_SRC = b'''class OrderDTO:
+    status: str = "pending"
+'''
+
+
+def test_field_by_name_excludes_fields_without_env_name():
+    """M7 T1 review Important-4 pin: a DTO-shaped class (class-body string default,
+    but NO model_config/env_prefix and NO alias -> env_name=None) is still harvested
+    and per-class-queryable, but does NOT participate in the by-name join at all --
+    T3's auto-anchor joins THROUGH env (self.host -> field -> env_name -> service),
+    so a field carrying no env name could never anchor anything anyway; keeping it
+    out kills the DTO collision-pollution surface the reviewer measured (2/6
+    field-name collisions even on the tiny fixture set)."""
+    idx = _index("app/dto.py", DTO_SRC)
+    assert idx.settings_field("OrderDTO", "status").default == "pending"
+    assert idx.settings_field("OrderDTO", "status").env_name is None
+    assert idx.field_by_name("status") is None
+
+
+def test_field_by_name_env_carrying_field_not_shadowed_by_dto_same_name():
+    """The flip side of the exclusion: a DTO field sharing a Settings field's NAME
+    is not a collision any more (pre-Important-4 it was -- the by-name join went
+    ambiguous-None and T3's auto-anchor would have refused) -- the env-carrying
+    field stays uniquely joinable."""
+    settings_src = (
+        b"from pydantic_settings import BaseSettings, SettingsConfigDict\n"
+        b"\n"
+        b"\n"
+        b"class HostSettings(BaseSettings):\n"
+        b'    model_config = SettingsConfigDict(env_prefix="svc_")\n'
+        b"\n"
+        b'    status: str = "enabled"\n'
+    )
+    claims = _claims("app/config.py", settings_src) + _claims("app/dto.py", DTO_SRC)
+    idx = build_class_attr_index(claims)
+    sf = idx.field_by_name("status")
+    assert sf is not None
+    assert sf.class_fqn == "app.config.HostSettings"
+    assert sf.env_name == "SVC_STATUS"
+
+
+# -- M7 T1 review Important-3: INHERITED model_config/env_prefix (real pydantic
+# semantics: a subclass of a Settings base inherits its model_config) is NOT visible
+# to this per-class, per-file harvest -- tracked limitation, documented in
+# class_attrs.py's module docstring (workarounds there: repeat model_config in the
+# subclass, or put an explicit alias on the field). This test PINS the current
+# honest-None behavior so a future inheritance-aware fix has to consciously flip it.
+
+
+INHERITED_PREFIX_SRC = b'''from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class BaseServiceSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="service_")
+
+
+class ChildSettings(BaseServiceSettings):
+    child_url: str = "http://child:8000"
+'''
+
+
+def test_inherited_env_prefix_not_seen_env_name_none_documented_limitation():
+    idx = _index("app/config/inherited.py", INHERITED_PREFIX_SRC)
+    sf = idx.settings_field("ChildSettings", "child_url")
+    assert sf is not None
+    assert sf.default == "http://child:8000"
+    # real pydantic would derive SERVICE_CHILD_URL here via the INHERITED
+    # env_prefix -- the harvest honestly reports None instead of guessing.
+    assert sf.env_name is None
+    # and, per Important-4's env-gating, an env-less field is not by-name joinable.
+    assert idx.field_by_name("child_url") is None
+
+
+# -- M7 T1 review Minor-1: positional Field("value", alias=...) default --
+
+
+POSITIONAL_FIELD_SRC = b'''from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class PosSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="pos_")
+
+    topic: str = Field("orders.events", alias="ORDERS_TOPIC")
+    plain: str = Field("v")
+'''
+
+
+def test_settings_field_positional_field_default_is_read():
+    """pydantic's Field accepts the default as its FIRST POSITIONAL argument
+    (`Field("orders.events", alias=...)`) just as legitimately as `default=` --
+    before this fix the positional spelling silently lost the default (None)."""
+    idx = _index("app/config/pos.py", POSITIONAL_FIELD_SRC)
+    sf = idx.settings_field("PosSettings", "topic")
+    assert sf.default == "orders.events"
+    assert sf.env_name == "ORDERS_TOPIC"  # alias still wins over pos_ prefix
+    plain = idx.settings_field("PosSettings", "plain")
+    assert plain.default == "v"
+    assert plain.env_name == "POS_PLAIN"  # no alias -> prefix-derived
 
 
 # -- suffix-matching ambiguity (same "last segments" convention as M6's base_class

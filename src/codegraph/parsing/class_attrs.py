@@ -20,12 +20,15 @@ here (contrast the enum path below, which DOES gate on `Enum`/`StrEnum` in
 class-body assignments the brief calls out (string-literal defaults, bare
 annotations, or a `Field(...)`/`SettingsConfigDict(...)` call RHS) produce anything
 at all; a class with no such attributes is never even entered into the index (see
-`harvest_class_attrs`). (2) `field_by_name`'s own collision policy (below) is the
-documented safety net for exactly this over-approximation: two UNRELATED classes
-that happen to share a field name simply make that name ambiguous (`None`), which is
-the honest, fail-closed answer T3's auto-anchor wants ("false match worse than no
-match", the M7 plan's own Global Constraint) -- not a reason to invent an extra,
-undocumented "is this really pydantic Settings" gate.
+`harvest_class_attrs`). (2) the by-name join surface is separately protected: since
+the M7 T1 review (Important-4), `field_by_name` considers ONLY env-carrying fields
+(env_name non-None -- i.e. classes with an env_prefix'd model_config, or fields with
+an explicit alias), so a DTO/model class harvested by this no-gate policy can never
+pollute T3's auto-anchor join at all; among the fields that DO participate, a shared
+name is still an honest collision -> `None` ("false match worse than no match", the
+M7 plan's own Global Constraint). Per-class lookups (`settings_field`) stay ungated
+-- a caller that already names the class (T2's `settings:` source) legitimately
+reads an env-less field's default too.
 
 `model_config = SettingsConfigDict(env_prefix="...")` is detected by attribute NAME
 alone (`model_config`, pydantic v2's own reserved class attribute), not by requiring
@@ -41,10 +44,28 @@ outright (used VERBATIM, no case transform -- it already IS the literal env-var 
 the author chose); otherwise, if `model_config`'s `env_prefix` was found,
 `env_name = (prefix + field).upper()` (pydantic-settings' own default derivation);
 otherwise `env_name = None` ("prefix not found"). A field's `default` is the RHS
-string literal if there is one, else a `Field(...)` call's `default=` keyword IF that
-value is itself a string literal, else `None` -- covering "no default at all" and "a
-default that isn't a plain string" identically (both honestly `None`, per the
-brief's `default: str | None`).
+string literal if there is one, else a `Field(...)` call's `default=` keyword (or,
+M7 T1 review Minor-1, its FIRST POSITIONAL argument -- pydantic's own `Field`
+signature puts `default` in the first positional slot, so `Field("v", alias=...)`
+is as legitimate as `Field(default="v", ...)`) IF that value is itself a string
+literal, else `None` -- covering "no default at all" and "a default that isn't a
+plain string" identically (both honestly `None`, per the brief's
+`default: str | None`).
+
+TRACKED LIMITATION (M7 T1 review Important-3) -- inherited model_config: real
+pydantic INHERITS `model_config` (and therefore `env_prefix`) down a Settings class
+hierarchy (`class ChildSettings(BaseServiceSettings)` where only the base carries
+`SettingsConfigDict(env_prefix=...)` still derives prefixed env names at runtime).
+This per-class, per-file harvest cannot see that: resolving it would need the
+service-wide class hierarchy (base_exprs give only base-name TEXT, possibly defined
+in another file entirely) plus MRO-ordered config merging -- deliberately out of
+scope for the foundation task. A subclass whose own body has no `model_config` (and
+whose fields have no explicit alias) therefore gets `env_name=None`, honestly --
+never a guessed prefix -- and, per the env-gating above, its fields simply don't
+participate in `field_by_name`. Pinned by
+`test_inherited_env_prefix_not_seen_env_name_none_documented_limitation`.
+Workarounds for real codebases: repeat `model_config` in the subclass, or put an
+explicit `alias`/`validation_alias` on the field.
 
 -- Enum semantics --
 
@@ -165,6 +186,11 @@ class ClassAttrIndex:
         return matches[0] if len(matches) == 1 else None
 
     def field_by_name(self, field: str) -> SettingsField | None:
+        """T3's auto-anchor join key. ENV-GATED (M7 T1 review Important-4): only
+        fields that actually CARRY an env_name participate -- see
+        `build_class_attr_index`'s own inline comment for the full rationale. Among
+        those, unique name -> the field; collision -> None (honest ambiguity); a
+        name known only from env-less (DTO-shaped) fields -> None (never joinable)."""
         return self.field_index.get(field)
 
 
@@ -207,15 +233,23 @@ def _env_prefix(attrs: list[ClassAttrFact]) -> str | None:
 
 
 def _field_default_and_alias(attr: ClassAttrFact) -> tuple[str | None, str | None]:
-    """(literal default if a plain string RHS or a `Field(default=...)` string
-    keyword; literal alias/validation_alias if `Field(...)` carries one) for ONE
-    class-body attribute. A call-shaped RHS (`call_args is not None`) is checked for
-    `Field(...)`-style kwargs; a plain string RHS falls back to `string_value`
+    """(literal default if a plain string RHS or a `Field(...)` string default;
+    literal alias/validation_alias if `Field(...)` carries one) for ONE class-body
+    attribute. A call-shaped RHS (`call_args is not None`) is checked for
+    `Field(...)`-style arguments; a plain string RHS falls back to `string_value`
     directly -- the two are mutually exclusive per ClassAttrFact's own construction
-    (a call RHS never also sets `string_value`)."""
+    (a call RHS never also sets `string_value`).
+
+    M7 T1 review Minor-1: the call-shaped default is read from `default=` OR,
+    failing that, the FIRST POSITIONAL argument -- pydantic's own `Field` signature
+    is `Field(default=..., ...)` with `default` as the first positional slot, so
+    `Field("orders.events", alias=...)` is exactly as legitimate a spelling as
+    `Field(default="orders.events", ...)` (was silently lost before this fix)."""
     if attr.call_args is not None:
         by_kw = _kwargs_by_name(attr)
         default_arg = by_kw.get(_DEFAULT_KW)
+        if default_arg is None:
+            default_arg = next((a for a in attr.call_args if a.index == 0), None)
         default = (
             default_arg.string_value
             if default_arg is not None and default_arg.value_kind == "string"
@@ -331,6 +365,19 @@ def build_class_attr_index(claims: list[dict]) -> ClassAttrIndex:
     by_name_value: dict[str, SettingsField] = {}
     for class_fqn, fields in settings_by_class.items():
         for name, sf in fields.items():
+            # M7 T1 review Important-4: the by-name join is ENV-GATED -- a field
+            # carrying no env_name (DTO/model classes: no model_config, no alias)
+            # never participates. T3's auto-anchor joins THROUGH env (self.host ->
+            # field -> env_name -> env->service map), so an env-less field could
+            # never anchor anything anyway -- excluding it here removes the whole
+            # DTO collision-pollution surface (reviewer measured 2/6 field-name
+            # collisions even on the tiny fixture set) without weakening the honest
+            # collision->None policy among fields that ARE joinable. Per-class
+            # lookups (`settings_field`) are deliberately NOT gated -- a caller that
+            # already knows the class (T2's `settings:` source) legitimately wants
+            # an env-less field's default too.
+            if sf.env_name is None:
+                continue
             by_name_classes.setdefault(name, set()).add(class_fqn)
             by_name_value[name] = sf
     field_index = {

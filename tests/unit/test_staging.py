@@ -763,6 +763,21 @@ def test_add_claims_multiple_payloads_one_call(tmp_path):
     assert {c["topic"] for c in claims} == {"t1", "t2"}
 
 
+def test_claims_for_same_relpath_rows_ordered_by_payload_json(tmp_path):
+    """M7 T1 review Minor-2: two claims sharing (service, relpath, kind) used to come
+    back in unspecified (insertion/rowid-accidental) order -- the ORDER BY only went
+    down to relpath. Now payload_json is the documented secondary sort key, making
+    claims_for byte-deterministic regardless of add_claims call order -- load-bearing
+    for pipeline/analyze.py's `_class_attrs_digest` (a sha256 over the claims list:
+    an order flip would read as a phantom "class_attrs changed" escalation). Inserted
+    deliberately in REVERSE payload_json order so pre-fix rowid order would fail."""
+    st = Staging(tmp_path / "s.db")
+    st.add_claims("a", "x.py", "k", [{"z": 1}])  # payload_json '{"z": 1}' -- larger
+    st.add_claims("a", "x.py", "k", [{"b": 1}])  # payload_json '{"b": 1}' -- smaller
+    for claims in (st.claims_for("k"), st.claims_for("k", service="a")):
+        assert [set(c) - {"_service", "_relpath"} for c in claims] == [{"b"}, {"z"}]
+
+
 def test_begin_service_clears_own_claims(tmp_path):
     st = Staging(tmp_path / "s.db")
     st.add_claims("a", "app/x.py", "kafka_producer", [{"topic": "orders"}])
