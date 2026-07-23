@@ -508,6 +508,16 @@ def _skip_report(svc: ServiceConfig, staging: Staging) -> dict:
         "calls_joined": 0,
         "calls_unresolved": 0,
         "calls_external": 0,
+        # M6 counters: hardcoded zeros like the pre-M6 stats above, keeping all
+        # three report shapes (full/incremental/skipped) key-uniform -- a skipped
+        # service ran no extractors, so every miss-counter is definitionally 0
+        # (M6 final review, Minor-1: report.py's .get() tolerated the omission,
+        # but a future direct-index consumer would KeyError only on this shape).
+        "http_url_unresolved": 0,
+        "http_verb_unresolved": 0,
+        "http_route_unresolved": 0,
+        "consumer_base_class_no_generic": 0,
+        "producer_unresolved_channel": 0,
         "degraded": False,
         "reason": None,
         "from_cache": False,
