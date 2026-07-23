@@ -12,20 +12,36 @@ empty ServiceIdioms; activation is purely "temporal" ∈ active_idioms (see anal
     grants TemporalWorkflow/TemporalActivity roles; workflow.defn additionally patches
     `workflow_name` onto the class's own node_props (the class's DISPLAY name, not a
     qualified/resolved value -- matches the brief's "имя класса" wording exactly).
-  - `workflow.execute_activity(fn_ref, ...)`: matched structurally (callee_name ==
-    "execute_activity" AND receiver_text == "workflow" -- confirmed against the real
-    kyc_worker/app/workflows/kyc.py fixture, see this module's test file; NOT a glob on
-    receiver, unlike start_workflow below). arg0's own name/attr byte span (already
-    exactly ArgFact.name_start_byte/end_byte -- no span math, ArgFact already carries
-    "attr" as the LAST segment per T2's contract) resolves via ctx.ref_symbol_lookup to
-    the activity's node id. src is the enclosing DEF id as-is (the method, e.g.
-    `KycWorkflow.run` -- the brief's own initial "raise to the workflow class" idea is
-    explicitly overridden by checking the golden fixture: golden src IS the method).
+  - `workflow.execute_activity(fn_ref, ...)`: matched structurally (callee_name IN
+    _ACTIVITY_INVOKE_CALLEES AND receiver_text == "workflow" -- confirmed against the
+    real kyc_worker/app/workflows/kyc.py fixture, see this module's test file; NOT a
+    glob on receiver, unlike start_workflow below). arg0's own name/attr byte span
+    (already exactly ArgFact.name_start_byte/end_byte -- no span math, ArgFact already
+    carries "attr" as the LAST segment per T2's contract) resolves via
+    ctx.ref_symbol_lookup to the activity's node id. src is the enclosing DEF id as-is
+    (the method, e.g. `KycWorkflow.run` -- the brief's own initial "raise to the
+    workflow class" idea is explicitly overridden by checking the golden fixture:
+    golden src IS the method).
   - `*.start_workflow(fn_ref, ...)`: glob on receiver (ANY receiver -- Temporal client
     handles are typically obtained dynamically, e.g. `client = await Client.connect(...)`,
     so there's no fixed name to check the way execute_activity has "workflow"; see
-    test_start_workflow_matches_any_receiver_not_just_client). Produces a
-    "temporal_start_mark" CLAIM, not a direct edge -- see design-decision note below.
+    test_start_workflow_matches_any_receiver_not_just_client). callee_name IN
+    _START_WORKFLOW_CALLEES (M6 T1, below). Produces a "temporal_start_mark" CLAIM,
+    not a direct edge -- see design-decision note below.
+
+M6 T1 (pilot report docs/superpowers/reports/2026-07-23-pilot-real-services-gaps.md
+§3/§4): a real-stack pilot on camunda-gateway found BOTH matchers above were strict
+`==` comparisons against a single literal name, so `INVOKES_ACTIVITY` came out at
+**zero** edges despite 43 activities and 80 real call sites -- the code there calls
+`workflow.execute_activity_method(SomeActivity.some_method, ...)` (a bound-method
+ref), never bare `execute_activity`; and `start_workflow`'s claim only resolved 4/7
+real child-workflow starts, missing `start_child_workflow`/`execute_child_workflow`.
+Fix is deliberately minimal (GAPS §3: "резолвится одинаково" -- arg0 resolution is
+byte-identical regardless of which name matched): each `==` became an `in` against a
+frozenset of Temporal's own SDK vocabulary for that operation --
+`_ACTIVITY_INVOKE_CALLEES` (receiver check unchanged, still exactly "workflow") and
+`_START_WORKFLOW_CALLEES` (receiver check unchanged too -- still no check at all, any
+receiver). No other line in either matcher function changed.
 
 Design decision on the temporal_start_mark claim (brief's explicit "реши и
 задокументируй"): `dst_id` is resolved NOW, at extraction time, via
@@ -85,6 +101,25 @@ _EXTRACTOR = "temporal"
 _RESOLUTION = "static"
 _CONFIDENCE = 1.0
 
+# M6 T1 (pilot GAPS §3): every Temporal SDK spelling of "invoke an activity from a
+# workflow" -- receiver is still required to be exactly "workflow" (unchanged).
+_ACTIVITY_INVOKE_CALLEES = frozenset({
+    "execute_activity",
+    "execute_activity_method",
+    "execute_local_activity",
+    "execute_local_activity_method",
+    "start_activity",
+    "start_local_activity",
+})
+
+# M6 T1 (pilot GAPS §4): every Temporal SDK spelling of "start a (child) workflow" --
+# receiver stays unchecked (ANY receiver, unchanged -- see module docstring).
+_START_WORKFLOW_CALLEES = frozenset({
+    "start_workflow",
+    "start_child_workflow",
+    "execute_child_workflow",
+})
+
 
 @dataclass(frozen=True)
 class TemporalResult:
@@ -140,7 +175,7 @@ def _extract_invokes_activity(
     ctx: FileContext, node_ids: dict[int, str], edges: list[EdgeRec], stats: dict[str, int],
 ) -> None:
     for call in ctx.facts.calls:
-        if call.callee_name != "execute_activity" or call.receiver_text != "workflow":
+        if call.callee_name not in _ACTIVITY_INVOKE_CALLEES or call.receiver_text != "workflow":
             continue
         enclosing_id = node_ids.get(call.enclosing_def)
         if enclosing_id is None:
@@ -164,7 +199,7 @@ def _extract_start_workflow_claims(
     ctx: FileContext, node_ids: dict[int, str], claims: list[dict], stats: dict[str, int],
 ) -> None:
     for call in ctx.facts.calls:
-        if call.callee_name != "start_workflow":
+        if call.callee_name not in _START_WORKFLOW_CALLEES:
             continue
         enclosing_id = node_ids.get(call.enclosing_def)
         if enclosing_id is None:
