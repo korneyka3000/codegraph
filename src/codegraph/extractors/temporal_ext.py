@@ -194,22 +194,32 @@ unlike every OTHER edge this module emits.
          gate above), not an oversight; see this module's own test file for the pin.
 
     Documented, ACCEPTED false-positive risk (brief: "document the FP-risk
-    honestly"): because there is no receiver-type check at all, Python's OWN stdlib
-    `signal.signal(sig, handler)` (`import signal; signal.signal(signal.SIGTERM,
-    handler)`) structurally collides -- callee_name is "signal", arg0
-    (`signal.SIGTERM`) is attr-shaped and unresolvable, so it lands in bucket 2 above
-    and bumps `signal_name_unresolved` exactly as if it were a real, if unresolvable,
-    Temporal signal reference. This is accepted noise, not a bug: excluding it would
-    need a receiver-type check this task's own design explicitly rejects (ANY
-    receiver, no filtering -- real Temporal handles are obtained too dynamically,
-    e.g. `handle = await client.get_workflow_handle(...)`, to check by name the way
-    `execute_activity`'s fixed "workflow" receiver can). `props={"mechanism":
-    "temporal_signal"}` on every emitted PRODUCES edge marks this provenance
-    explicitly, so a graph consumer can identify (and, if ever needed, filter or
-    deprioritize) edges from this specific, weaker-evidence matcher. Pinned by
-    test_stdlib_signal_signal_collision_is_a_documented_accepted_fp_risk in this
-    module's own test file, so a future change cannot silently make this WORSE
-    (e.g. start emitting a bogus PRODUCES edge for it) without that test catching it.
+    honestly"): because there is no receiver-TYPE check, any unrelated `.signal(...)`
+    method (Qt-style signal objects, etc.) structurally collides -- a string arg0
+    would even produce a (mechanism-tagged) edge. This is accepted noise, not a bug:
+    a real receiver-type check is impossible here (real Temporal handles are obtained
+    too dynamically, e.g. `handle = await client.get_workflow_handle(...)`, to check
+    by name the way `execute_activity`'s fixed "workflow" receiver can).
+    `props={"mechanism": "temporal_signal"}` on every emitted PRODUCES edge marks
+    this provenance explicitly, so a graph consumer can identify (and, if ever
+    needed, filter or deprioritize) edges from this specific, weaker-evidence
+    matcher.
+
+    ONE exact-name carve-out (M7 T4 review follow-up) narrows the loudest instance:
+    a receiver literally spelled `signal` -- Python's OWN stdlib
+    `signal.signal(signal.SIGTERM, handler)`, whose arg0 is attr-shaped/unresolvable
+    and previously landed in bucket 2, bumping `signal_name_unresolved` on virtually
+    every service (SIGTERM/SIGINT installation is that common) -- is dropped before
+    arg0 classification entirely: neither edge nor counter. This is an EXCLUSION of
+    one specific non-Temporal spelling (no real Temporal handle variable is named
+    `signal`), not a positive receiver filter -- the design above stands. Known
+    limit: an aliased `import signal as sig; sig.signal(...)` is NOT filtered and
+    still lands in the honest-miss bucket like any other name-like unresolvable
+    arg0. Pinned by
+    test_stdlib_signal_signal_receiver_filtered_no_edge_no_counter in this module's
+    own test file (which also documents the alias limit), so a future change cannot
+    silently regress either direction -- start counting the stdlib idiom again, or
+    start emitting a bogus PRODUCES edge for it.
 
     Resolution/confidence: the handler-side CONSUMES edge uses this module's
     existing `_RESOLUTION`/`_CONFIDENCE` ("static", 1.0) constants, same as
@@ -528,12 +538,27 @@ def _extract_signal_senders(
     channels: list[NodeRec], edges: list[EdgeRec], stats: dict[str, int],
 ) -> None:
     """`<handle>.signal("<name>", ...)` / `get_external_workflow_handle(...).
-    signal(...)` -- ANY receiver (never checked at all, mirrors
-    `_extract_start_workflow_claims`'s own precedent), callee_name == "signal"
-    exactly -> PRODUCES into the SAME temporal_signal channel a handler CONSUMES
-    from. See module docstring (M7 T4) for the FP-risk this deliberately accepts."""
+    signal(...)` -- ANY receiver except the ONE exact-name exclusion below (mirrors
+    `_extract_start_workflow_claims`'s own no-positive-receiver-check precedent),
+    callee_name == "signal" exactly -> PRODUCES into the SAME temporal_signal
+    channel a handler CONSUMES from. See module docstring (M7 T4) for the residual
+    FP-risk this deliberately accepts."""
     for call in ctx.facts.calls:
         if call.callee_name != "signal":
+            continue
+        if call.receiver_text == "signal":
+            # M7 T4 review follow-up: Python's own stdlib `signal.signal(SIGTERM,
+            # handler)` -- the one receiver spelling that is reliably NEVER a
+            # Temporal handle (no real handle variable is named `signal`; the
+            # attribute-call form `signal.signal(...)` on that name is the stdlib
+            # module in practice), and SIGTERM/SIGINT installation is common
+            # enough that counting it would add signal_name_unresolved noise on
+            # virtually every service. An exact-name EXCLUSION dropped BEFORE
+            # arg0 classification (neither edge nor counter), not a positive
+            # receiver filter -- every other receiver stays matched blindly; an
+            # aliased `import signal as sig` is a documented filter limit (still
+            # lands in the honest-miss bucket). See the module docstring's
+            # FP-risk section.
             continue
         enclosing_id = node_ids.get(call.enclosing_def)
         if enclosing_id is None:

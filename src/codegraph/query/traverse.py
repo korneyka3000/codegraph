@@ -227,9 +227,11 @@ def _compact_steps(
 
     A step is "boring" (collapsible) unless its node:
       - carries one of core.schema.ROLE_KINDS (RouteHandler/MessageConsumer/
-        MessageProducer/TemporalWorkflow/TemporalActivity) -- collapsing a
-        role-bearing hop would hide exactly the service/channel-boundary-shaped
-        step a reader most needs to see;
+        MessageProducer/TemporalWorkflow/TemporalActivity/TemporalSignalHandler --
+        the check itself reads ROLE_KINDS generically, so M7 T4's new role was
+        covered the moment schema.py grew it; only this prose list needed updating)
+        -- collapsing a role-bearing hop would hide exactly the service/
+        channel-boundary-shaped step a reader most needs to see;
       - has more than one OUTGOING step within this SAME segment (`step_parents`,
         parallel to `steps` -- see _walk_segment) -- a node that itself calls >1
         further step here is a fan-out/branch point, never safe to fold into an

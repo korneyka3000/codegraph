@@ -901,17 +901,21 @@ def install_handler(handler):
 '''
 
 
-def test_stdlib_signal_signal_collision_is_a_documented_accepted_fp_risk():
-    """Honest FP-risk pin (brief: "document the FP-risk honestly"): the receiver-
-    agnostic `.signal(...)` matcher has NO way to distinguish a real Temporal
-    `handle.signal(name, ...)` call from Python's own unrelated stdlib
-    `signal.signal(sig, handler)` -- here arg0 (`signal.SIGTERM`) is attr-shaped
-    (name-like) and unresolvable, so it bumps signal_name_unresolved exactly like a
-    genuine unresolvable Temporal signal reference would. This is accepted,
-    documented noise (see temporal_ext.py's own module docstring), not a bug this
-    task claims to fix -- pinned here so a future change can't silently make it
-    WORSE (e.g. start emitting a bogus PRODUCES edge) without this test catching it."""
+def test_stdlib_signal_signal_receiver_filtered_no_edge_no_counter():
+    """M7 T4 review follow-up: a receiver literally named `signal` is Python's own
+    stdlib module in practice, never a Temporal handle (no real handle variable is
+    named `signal`), and SIGTERM/SIGINT installation is a common enough idiom that
+    letting it bump signal_name_unresolved would add noise on virtually every
+    service. The sender matcher's ONE receiver check (`receiver_text == "signal"`
+    -- an exact-name EXCLUSION, not a positive filter; every other receiver is
+    still matched blindly) drops it before arg0 classification ever runs: no edge,
+    no counter. The FP-risk for OTHER non-Temporal `.signal(...)` receivers stays
+    accepted+documented as before (temporal_ext.py's module docstring), and an
+    ALIASED stdlib import (`import signal as sig; sig.signal(...)`) is a known
+    filter limit -- it still lands in the honest-miss bucket like any other
+    name-like unresolvable arg0."""
     ctx, node_ids, consts = _load("m.py", "svc", STDLIB_SIGNAL_COLLISION_SRC)
     result = extract_temporal(ctx, node_ids, consts)
     assert not any(e.type == "PRODUCES" for e in result.edges)
-    assert result.stats["signal_name_unresolved"] == 1
+    assert result.stats["signal_name_unresolved"] == 0
+    assert result.stats["signal_sender_resolved"] == 0
