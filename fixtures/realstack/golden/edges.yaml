@@ -1,0 +1,60 @@
+# Эталонные рёбра для fixtures/realstack — все ПЯТЬ пилотных gap'ов (M6 T5, см.
+# docs/superpowers/reports/2026-07-23-pilot-real-services-gaps.md). Формат — как
+# fixtures/golden/edges.yaml (dst: symbol XOR channel), но скоуп ЗДЕСЬ — ТОЛЬКО
+# типы, которые проверяет M6-гейт (tests/eval/test_m6_gate.py): INVOKES_ACTIVITY,
+# temporal_start-маркированный CALLS, CALLS_HTTP, CONSUMES, PRODUCES + CONTAINS
+# topic→event. Полный CALLS-граф (module-level/ctor/self-method вызовы и т.п.)
+# здесь сознательно НЕ размечается — вне скоупа M6-гейта (см. task-5-brief.md's
+# Interfaces-раздел: гейт явно перечисляет только эти пять типов).
+#
+# Каждая запись выведена ВРУЧНУЮ из fixtures/realstack/services/*/app/*.py +
+# workspace.yaml — см. комментарий у каждой группы для конкретного файла:строки.
+version: 1
+edges:
+  # --- gap 3: workflow.start_workflow (route -> workflow) и
+  # workflow.start_child_workflow (workflow -> child workflow) --
+  # app/routes/submit.py's submit_document + app/workflows/submission.py's
+  # DocSubmissionWorkflow.run. Оба резолвятся при извлечении (temporal_ext.py) —
+  # S7 (_apply_temporal_start_marks) создаёт CALLS с mechanism=temporal_start.
+  - src: {service: gateway, symbol: app.routes.submit.submit_document}
+    type: CALLS
+    dst: {service: gateway, symbol: app.workflows.submission.DocSubmissionWorkflow.run}
+    mechanism: temporal_start
+  - src: {service: gateway, symbol: app.workflows.submission.DocSubmissionWorkflow.run}
+    type: CALLS
+    dst: {service: gateway, symbol: app.workflows.notify.NotifyWorkflow.run}
+    mechanism: temporal_start
+  # --- gap 2: workflow.execute_activity_method (bound-method ref) --
+  # DocSubmissionWorkflow.run calls both DocActivities methods this way.
+  - src: {service: gateway, symbol: app.workflows.submission.DocSubmissionWorkflow.run}
+    type: INVOKES_ACTIVITY
+    dst: {service: gateway, symbol: app.activities.docs.DocActivities.fetch_document_content}
+  - src: {service: gateway, symbol: app.workflows.submission.DocSubmissionWorkflow.run}
+    type: INVOKES_ACTIVITY
+    dst: {service: gateway, symbol: app.activities.docs.DocActivities.publish_submitted_event}
+  # --- gap 1: decorator-SDK HTTP client (route_from/call/verb_from idiom) --
+  # DocClient.fetch_document: @path_template("/documents/{doc_uid}") + Request(Method.GET,
+  # ...) + self.driver.fetch_content(request) -> resolves to worker's GET /documents/{doc_uid}.
+  - src: {service: gateway, symbol: app.clients.doc_client.DocClient.fetch_document}
+    type: CALLS_HTTP
+    dst: {channel: "chan:http:worker:GET /documents/{doc_uid}"}
+  # --- gap 5: producer wrapper (KYCEventPublisher.publish over send_and_wait) --
+  # DocActivities.publish_submitted_event calls self._publisher.publish(...); the
+  # producer idiom pins event_type=DocSubmittedEvent (const), NOT the dynamic topic_name.
+  - src: {service: gateway, symbol: app.activities.docs.DocActivities.publish_submitted_event}
+    type: PRODUCES
+    dst: {channel: "chan:event_type:DocSubmittedEvent"}
+  # --- gap 4: base_class consumer (BaseConsumer[DocSubmittedEvent].process_event) --
+  # worker/app/consumers/doc_submitted.py's DocSubmittedConsumer(BaseConsumer[DocSubmittedEvent]);
+  # kyc_base_consumer has no installed venv here, so this resolves via the IMPORT_NAME
+  # textual tier (resolution=heuristic, confidence=0.6 -- pinned directly by the gate,
+  # NOT by this file's format, which carries no confidence field at all).
+  - src: {service: worker, symbol: app.consumers.doc_submitted.DocSubmittedConsumer.process_event}
+    type: CONSUMES
+    dst: {channel: "chan:event_type:DocSubmittedEvent"}
+# channels: block is documentation only (mirrors fixtures/golden/edges.yaml's own
+# convention) -- nothing in evalx reads it; the gate hardcodes both channel ids via
+# core.ids.chan_kafka/chan_event and checks the CONTAINS pair directly against staging.
+channels:
+  - id: "chan:kafka_topic:${self.config.topic}"
+    contains: ["chan:event_type:DocSubmittedEvent"]

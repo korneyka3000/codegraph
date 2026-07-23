@@ -1,0 +1,59 @@
+# realstack: synthetic fixture proving all FIVE pilot idiom gaps end-to-end (M6
+# T5; see docs/superpowers/reports/2026-07-23-pilot-real-services-gaps.md). Two
+# independent-domain mini-services (gateway, worker) linked ONLY via Channel
+# boundaries -- cross-service linkage goes through event_type identity, never a
+# shared literal Kafka topic (GAPS §6's conclusion: producer and consumer match
+# on the event's TYPE, not on a topic string, because the real topic is a
+# dynamic runtime value on both ends of this stack).
+version: 1
+graph_name: realstack
+services:
+  - name: gateway
+    path: ./services/gateway
+    http: { base_url_env: GATEWAY_URL }
+    idioms:
+      producers:
+        # Gap 5: business-level wrapper over aiokafka's send_and_wait -- topic_name
+        # is a dynamic argument (no literal to resolve statically), so this idiom
+        # pins event_type instead (the documented manual fallback, T4); NO topic:
+        # field here at all -- there genuinely is no static topic identity on the
+        # producer side of this stack.
+        - name: kyc-event-publisher
+          call: "app.services.publisher.KYCEventPublisher.publish"
+          channel:
+            kind: event_type
+            event_type_from: { const: "DocSubmittedEvent" }
+      http_clients:
+        # Gap 1: decorator-route HTTP client SDK -- path lives in @path_template,
+        # verb in Request(Method.X, ...), the call itself behind driver indirection.
+        - name: doc-client-decorator-sdk
+          file_glob: "**/clients/doc_client.py"
+          class_glob: "*Client"
+          base_url: { env: WORKER_URL }
+          route_from: { decorator: "path_template", arg: 0 }
+          call: "driver.fetch_content"
+          verb_from: { request_ctor: "Request", enum: "Method" }
+  - name: worker
+    path: ./services/worker
+    http: { base_url_env: WORKER_URL }
+    idioms:
+      consumers:
+        # Gap 4: shared-lib BaseConsumer[Event] subclass -- process_event (NOT
+        # ctor/setup) is the business handler; event_type comes from the generic
+        # argument (a stable static identity), not the dynamic per-env topic.
+        # topic.attr is OPTIONAL (config/models.py) -- included here to ALSO pin
+        # the honest-unresolved-topic + CONTAINS(topic -> event) path: kyc_base_consumer
+        # is a path-dependency with no installed venv (see fixtures/realstack/libs/
+        # kyc_base_consumer), so scip cannot resolve the base class reference --
+        # IMPORT_NAME textual tier fires instead (resolution=heuristic,
+        # confidence=0.6), exactly like the real pilot's own shared-lib gap.
+        - name: doc-submitted-base-class
+          kind: base_class
+          base_class: "kyc_base_consumer.base.BaseConsumer"
+          handler_method: "process_event"
+          event_type_from: { generic_arg: 0 }
+          topic: { attr: "self.config.topic" }
+builtin_idioms: [fastapi, aiokafka, faststream, confluent, temporal, aiohttp_client]
+processes:
+  - name: "Document submission"
+    entrypoint: "gateway:POST /submit"

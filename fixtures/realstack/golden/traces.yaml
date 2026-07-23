@@ -1,0 +1,27 @@
+# Эталонный трейс для fixtures/realstack (M6 T5). Формат — как
+# fixtures/golden/traces.yaml (посегментное сравнение, см. tests/eval/
+# test_m6_gate.py's `_trace_diff`, портированный из test_m2_gate.py).
+#
+# Все четыре async-хопа (route -> workflow -> activity -> publish -> event-канал
+# -> process_event; и decorator-SDK-вызов -> CALLS_HTTP -> worker-роут) сворачиваются
+# ровно в ТРИ сегмента -- то же "folding" поведение, что и M2's golden trace (см. его
+# комментарий): route/workflow/activity/publish/SDK-вызов все читаются через
+# CALLS/INVOKES_ACTIVITY (intra-edge типы) из ОДНОГО entry (submit_document), поэтому
+# они остаются ШАГАМИ внутри сегмента 1, а не отдельными сегментами -- граница
+# сегмента возникает ТОЛЬКО на PRODUCES/CALLS_HTTP (exit-рёбра). Сегмент 1 несёт ДВА
+# exit'а (CALLS_HTTP в worker's route; PRODUCES в event-канал) -> ДВЕ следующих записи
+# в очереди -> сегменты 2 и 3 (порядок в этом файле — не позиционный контракт, гейт
+# сравнивает МНОЖЕСТВОМ (service, entry_symbol, via_channel) троек, см. _trace_diff).
+version: 1
+traces:
+  - entrypoint: "gateway:POST /submit"
+    segments:
+      - service: gateway
+        entry: {symbol: app.routes.submit.submit_document}
+        via_channel: null
+      - service: worker
+        entry: {symbol: app.routes.documents.get_document}
+        via_channel: "chan:http:worker:GET /documents/{doc_uid}"
+      - service: worker
+        entry: {symbol: app.consumers.doc_submitted.DocSubmittedConsumer.process_event}
+        via_channel: "chan:event_type:DocSubmittedEvent"

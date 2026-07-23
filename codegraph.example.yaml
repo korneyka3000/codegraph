@@ -56,11 +56,44 @@ services:
           registrar_call: "app.consumers.base.register_handlers"
           topic: { const: "orders.events" }
           event_type_from: dict_key
+        - name: shared-lib-consumer                       # подкласс базового класса из shared-lib
+                                                            # (`class Consumer(BaseConsumer[FooEvent])`,
+                                                            # см. docs/superpowers/reports/
+                                                            # 2026-07-23-pilot-real-services-gaps.md §4) —
+                                                            # бизнес-обработчик — ОВЕРРАЙД handler_method
+                                                            # (не ctor/setup), event_type — из
+                                                            # generic-параметра базового класса (стабильная
+                                                            # статическая идентичность), а не из топика
+                                                            # (часто динамический). topic.attr — опционально:
+                                                            # даёт честный unresolved-канал + CONTAINS
+                                                            # topic→event, если топик — конфиг-атрибут, а не
+                                                            # литерал (поддерживает ТОЛЬКО {attr: ...} — нет
+                                                            # call-сайта, чтобы резолвить const/arg/kwarg/env).
+          kind: base_class
+          base_class: "shared_consumer_base.BaseConsumer"
+          handler_method: "process_event"
+          event_type_from: { generic_arg: 0 }              # BaseConsumer[FooEvent] → "FooEvent"
+          topic: { attr: "self.config.topic" }
       http_clients:
         - name: default-sdk                              # уточнение builtin-конвенции *Client
           file_glob: "**/clients/*_client.py"
           class_glob: "*Client"
           base_url: { attr: "self._base_url", env: DOCUMENT_MANAGEMENT_URL }
+        - name: decorator-route-sdk                       # альтернативная SDK-конвенция: маршрут — в
+                                                            # декораторе (не arg0 самого HTTP-вызова), verb —
+                                                            # из Request(Method.X, ...), сам вызов — за
+                                                            # driver-индирекцией (см. §2 отчёта выше). Поля
+                                                            # route_from/call/verb_from — все-или-ничего
+                                                            # (config/models.py); при заданном route_from
+                                                            # экстрактор переключается в этот режим целиком,
+                                                            # verb-режим (get/post/…-callee + arg0=URL) выше
+                                                            # не участвует.
+          file_glob: "**/clients/*_client.py"
+          class_glob: "*Client"
+          base_url: { env: DOCUMENT_MANAGEMENT_URL }
+          route_from: { decorator: "path_template", arg: 0 }  # @path_template("/v1/x/{id}")
+          call: "driver.fetch_content"                        # "a.b|c.d" — "|"-альтернативы допустимы
+          verb_from: { request_ctor: "Request", enum: "Method" }  # Request(Method.GET, ...)
   - name: document-management
     path: ../document-management
     http: { base_url_env: DOCUMENT_MANAGEMENT_URL }      # builtin-идиом достаточно
