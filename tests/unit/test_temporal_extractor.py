@@ -213,8 +213,19 @@ def run():
 
 def test_execute_activity_wrong_receiver_ignored():
     """callee name matches but receiver isn't literally "workflow" -- per brief's
-    explicit fixture-checked contract, NOT glob/any-receiver like start_workflow."""
-    ctx, node_ids = _load("m.py", "svc", NON_WORKFLOW_RECEIVER_SRC)
+    explicit fixture-checked contract, NOT glob/any-receiver like start_workflow.
+
+    The ref lookup resolves UNCONDITIONALLY (same pattern as
+    test_start_workflow_matches_any_receiver_not_just_client): if the receiver guard
+    were deleted, the matcher would reach arg0 resolution, succeed, and emit a real
+    INVOKES_ACTIVITY edge -- making this no-edge assertion genuinely fail under that
+    sabotage (verified). Without a wired lookup the test is vacuous: _resolve_ref
+    returns None and no edge appears for a reason unrelated to the receiver check.
+    """
+    ctx, node_ids = _load(
+        "m.py", "svc", NON_WORKFLOW_RECEIVER_SRC,
+        ref_symbol_lookup=lambda rp, sb: "scip-python python svc 0.0 `m`/some_fn().",
+    )
     result = extract_temporal(ctx, node_ids)
     assert not any(e.type == "INVOKES_ACTIVITY" for e in result.edges)
 
@@ -309,7 +320,13 @@ def test_activity_invoke_variants_resolve_same_as_execute_activity(callee):
 
 def test_execute_activity_method_wrong_receiver_ignored():
     """Widened callee-name set must still enforce receiver == "workflow" -- mirrors
-    test_execute_activity_wrong_receiver_ignored, now for the new name."""
+    test_execute_activity_wrong_receiver_ignored, now for the new name.
+
+    Ref lookup resolves unconditionally for the same reason as there: only the
+    receiver guard stands between this call and a real edge, so deleting/breaking
+    the guard turns this test RED (sabotage-verified) instead of it passing
+    vacuously off _resolve_ref's None.
+    """
     src = b'''def execute_activity_method(fn, **kw):
     pass
 
@@ -317,7 +334,10 @@ def test_execute_activity_method_wrong_receiver_ignored():
 def run():
     other.execute_activity_method(some_fn)
 '''
-    ctx, node_ids = _load("m.py", "svc", src)
+    ctx, node_ids = _load(
+        "m.py", "svc", src,
+        ref_symbol_lookup=lambda rp, sb: "scip-python python svc 0.0 `m`/some_fn().",
+    )
     result = extract_temporal(ctx, node_ids)
     assert not any(e.type == "INVOKES_ACTIVITY" for e in result.edges)
 
