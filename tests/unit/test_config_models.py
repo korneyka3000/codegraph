@@ -253,6 +253,15 @@ def test_generic_arg_spec_defaults_to_zero():
     assert GenericArgSpec().generic_arg == 0
 
 
+def test_generic_arg_spec_rejects_negative_index():
+    """M6 T3 review Minor-4: a negative generic_arg could only ever mean a config
+    typo (there is no negative-indexing semantics for generic params) -- rejected at
+    load time via Field(ge=0) instead of silently producing zero claims forever
+    (the extractor's own defensive range guard would treat it as a permanent miss)."""
+    with pytest.raises(ValidationError):
+        GenericArgSpec(generic_arg=-1)
+
+
 def test_base_class_topic_is_optional():
     idiom = ConsumerIdiom.model_validate({
         "name": "x", "kind": "base_class",

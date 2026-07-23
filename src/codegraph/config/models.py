@@ -56,10 +56,13 @@ class GenericArgSpec(_Strict):
     EventTypeFrom shape kind="base_class" accepts (enforced by
     ConsumerIdiom._kind_requirements): ValueSpec's arg/kwarg/const/env/attr and
     dispatch_dict's "dict_key" all presuppose a CallFact call-site, which a class
-    definition never has.
+    definition never has. ge=0 (M6 T3 review Minor-4): a negative index has no
+    generic-param semantics and could only be a config typo -- rejected at load
+    time instead of silently producing zero claims forever (the extractor's own
+    defensive range guard would treat it as a permanent honest miss).
     """
 
-    generic_arg: int = 0
+    generic_arg: int = Field(default=0, ge=0)
 
 
 EventTypeFrom = ValueSpec | Literal["dict_key"] | GenericArgSpec

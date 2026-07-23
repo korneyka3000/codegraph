@@ -673,7 +673,15 @@ BASE_CLASS_IDIOM = ConsumerIdiom(
     event_type_from=GenericArgSpec(generic_arg=0),
 )
 
-BASE_CLASS_SRC = b'''class OCRDataConsumer(BaseConsumer[OCRDataEvent]):
+# The from-import line is load-bearing for every non-STATIC test below (M6 T3 review
+# Important-1): the textual IMPORT_NAME fallback requires import-statement evidence
+# (mirrors idiom_match._match_import_name_ctor_form) -- bare name equality alone no
+# longer matches. Real consumer files always import their base, so this also makes
+# the synthetic more faithful to the pilot convention (GAPS §5).
+BASE_CLASS_SRC = b'''from kyc_base_consumer.base import BaseConsumer
+
+
+class OCRDataConsumer(BaseConsumer[OCRDataEvent]):
     async def process_event(self, event) -> bool:
         return True
 
@@ -726,9 +734,10 @@ def test_base_class_static_tier_scip_resolved_consumes_event_channel():
 
 def test_base_class_textual_fallback_tier_without_scip_stub():
     """No ref_symbol_lookup wired at all (SCIP unavailable) -- the base name's bare
-    text ("BaseConsumer") still equals the configured base_class's last FQN segment,
-    so the IMPORT_NAME-tier textual fallback fires (0.6/heuristic) instead of
-    silently producing nothing; pins the scip-resolved vs textual-fallback
+    text ("BaseConsumer") equals the configured base_class's last FQN segment AND the
+    file from-imports that name (`from kyc_base_consumer.base import BaseConsumer` in
+    BASE_CLASS_SRC), so the IMPORT_NAME-tier textual fallback fires (0.6/heuristic)
+    instead of silently producing nothing; pins the scip-resolved vs textual-fallback
     confidence difference against the STATIC-tier test above."""
     relpath = "app/consumers/ocr.py"
     ctx, node_ids, consts = _load(relpath, "kyc-worker", BASE_CLASS_SRC)
@@ -737,6 +746,125 @@ def test_base_class_textual_fallback_tier_without_scip_stub():
     assert len(consumes) == 1
     assert consumes[0].resolution == "heuristic" and consumes[0].confidence == 0.6
     assert consumes[0].dst == "chan:event_type:OCRDataEvent"
+
+
+# -- M6 T3 review Important-1: the textual tier requires import corroboration
+# (mirrors idiom_match._match_import_name_ctor_form's exact checks) -- bare name
+# equality alone used to match `class C(evil.BaseConsumer[FooEvent])` at 0.6 with
+# facts.imports == [] (reviewer-executed false positive).
+
+
+NO_IMPORT_EVIL_PREFIX_SRC = b'''class C(evil.BaseConsumer[FooEvent]):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_module_prefixed_base_without_module_import_is_a_noop():
+    """The reviewer's exact false-positive case: `evil.BaseConsumer[...]` with ZERO
+    imports in the file -- the prefixed form requires the configured FQN's first
+    module segment to actually be imported (ctor-form's _imports_module check), so
+    nothing matches and nothing is emitted (not even the no-generic counter: the
+    base itself never matched)."""
+    relpath = "app/consumers/evil.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", NO_IMPORT_EVIL_PREFIX_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    assert result.edges == []
+    assert result.channels == []
+    assert result.roles == {}
+    assert result.stats["consumer_base_class_no_generic"] == 0
+
+
+NO_IMPORT_BARE_SRC = b'''class OCRDataConsumer(BaseConsumer[OCRDataEvent]):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_bare_name_without_import_evidence_is_a_noop():
+    """Bare `BaseConsumer[...]` in a file that imports NOTHING: name equality with
+    the FQN's last segment is no longer sufficient on its own -- a from-import of
+    that name is required for the bare form (ctor-form's `class_seg in imp.names`
+    check)."""
+    relpath = "app/consumers/noimp.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", NO_IMPORT_BARE_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    assert result.edges == []
+    assert result.roles == {}
+
+
+MODULE_PREFIX_SRC = b'''import kyc_base_consumer.base
+
+
+class OCRDataConsumer(kyc_base_consumer.base.BaseConsumer[OCRDataEvent]):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_module_prefixed_base_with_module_import_matches():
+    """`import kyc_base_consumer.base` + fully-prefixed base -- the prefixed form's
+    module-import corroboration fires (IMPORT_NAME tier, 0.6). Also one of the four
+    reviewer-verified-but-unpinned shapes (module-prefixed base)."""
+    relpath = "app/consumers/prefixed.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", MODULE_PREFIX_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].resolution == "heuristic" and consumes[0].confidence == 0.6
+    assert consumes[0].dst == "chan:event_type:OCRDataEvent"
+
+
+ALIASED_MODULE_PREFIX_SRC = b'''import kyc_base_consumer.base as shared
+
+
+class OCRDataConsumer(shared.BaseConsumer[OCRDataEvent]):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_aliased_module_import_matches_prefix_text_not_verified():
+    """Chosen semantics, pinned honestly: for a PREFIXED base, the prefix text is NOT
+    required to textually match the imported module -- only (a) prefixed form and
+    (b) the configured FQN's first module segment imported somewhere in the file
+    (ImportFact.target_module records the REAL module name for `import m as alias`,
+    see facts.py's aliased_import handling). This is a literal mirror of
+    idiom_match._match_import_name_ctor_form's receiver comment ("receiver не обязан
+    текстуально совпадать с именем модуля") and is exactly what makes the alias form
+    `import kyc_base_consumer.base as shared` + `shared.BaseConsumer[...]` match
+    (correctly -- it genuinely IS the configured base) at this weakest tier without
+    any alias-resolution machinery."""
+    relpath = "app/consumers/aliased.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", ALIASED_MODULE_PREFIX_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].resolution == "heuristic" and consumes[0].confidence == 0.6
+
+
+WRONG_MODULE_FROM_IMPORT_SRC = b'''from evil import BaseConsumer
+
+
+class OCRDataConsumer(BaseConsumer[OCRDataEvent]):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_from_import_of_same_name_from_other_module_matches_documented_laxity():
+    """Documented laxity, pinned honestly: the bare-name form's from-import check is
+    `last_segment in imp.names` for ANY import (the module part is NOT verified
+    against the configured FQN's prefix) -- an exact mirror of ctor-form's own
+    `any(class_seg in imp.names ...)`, which is precisely this lax for calls too.
+    `from evil import BaseConsumer` therefore still matches at the weakest tier;
+    tightening beyond the precedent is out of this fix's scope."""
+    relpath = "app/consumers/wrongmod.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", WRONG_MODULE_FROM_IMPORT_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].resolution == "heuristic" and consumes[0].confidence == 0.6
 
 
 DIFFERENT_BASE_SRC = b'''class NotAConsumer(SomeOtherBase[Whatever]):
@@ -755,7 +883,10 @@ def test_base_class_subclass_of_different_base_is_a_noop():
     assert result.stats["consumer_base_class_no_generic"] == 0
 
 
-NO_GENERIC_SRC = b'''class OCRDataConsumer(BaseConsumer):
+NO_GENERIC_SRC = b'''from kyc_base_consumer.base import BaseConsumer
+
+
+class OCRDataConsumer(BaseConsumer):
     async def process_event(self, event) -> bool:
         return True
 '''
@@ -802,7 +933,10 @@ def test_base_class_topic_attr_emits_unresolved_channel_and_containment():
     assert topic_chan.props["channel_kind"] == "kafka_topic"
 
 
-MULTI_INHERIT_SRC = b'''class C(Mixin, BaseConsumer[FooEvent]):
+MULTI_INHERIT_SRC = b'''from pkg import BaseConsumer, Mixin
+
+
+class C(Mixin, BaseConsumer[FooEvent]):
     async def process_event(self, event) -> bool:
         return True
 '''
@@ -823,7 +957,10 @@ def test_base_class_multi_inherit_finds_generic_base_not_just_first():
     assert consumes[0].dst == "chan:event_type:FooEvent"
 
 
-ATTR_GENERIC_SRC = b'''class AttrBase(BaseConsumer[evtmod.OCRDataEvent]):
+ATTR_GENERIC_SRC = b'''from pkg import BaseConsumer
+
+
+class AttrBase(BaseConsumer[evtmod.OCRDataEvent]):
     async def process_event(self, event) -> bool:
         return True
 '''
@@ -842,7 +979,10 @@ def test_base_class_generic_arg_attribute_chain_reduces_to_last_identifier():
     assert consumes[0].dst == "chan:event_type:OCRDataEvent"
 
 
-MULTI_GENERIC_SRC = b'''class C(Base[A, B]):
+MULTI_GENERIC_SRC = b'''from pkg import Base
+
+
+class C(Base[A, B]):
     async def process_event(self, event) -> bool:
         return True
 '''
@@ -866,7 +1006,10 @@ def test_base_class_missing_handler_method_no_crash_stat_incremented():
     param) but lacks the configured handler_method entirely (e.g. renamed) -- must
     degrade gracefully (no claim), not crash on a None def lookup."""
     relpath = "app/consumers/nohandler.py"
-    src = b'''class OCRDataConsumer(BaseConsumer[OCRDataEvent]):
+    src = b'''from kyc_base_consumer.base import BaseConsumer
+
+
+class OCRDataConsumer(BaseConsumer[OCRDataEvent]):
     async def some_other_method(self, event) -> bool:
         return True
 '''
@@ -902,3 +1045,103 @@ def test_base_class_kind_ignored_by_call_and_dispatch_dict_extraction_paths():
     consumes = [e for e in result.edges if e.type == "CONSUMES"]
     assert len(consumes) == 1
     assert consumes[0].props == {"dispatch": "event_type"}
+
+
+# -- M6 T3 review Minor-1: reviewer-verified-but-unpinned shapes (the fourth --
+# module-prefixed base -- is pinned above alongside the Important-1 semantics).
+
+
+NESTED_CLASS_SRC = b'''from kyc_base_consumer.base import BaseConsumer
+
+
+class Outer:
+    class InnerConsumer(BaseConsumer[OCRDataEvent]):
+        async def process_event(self, event) -> bool:
+            return True
+'''
+
+
+def test_base_class_nested_class_inside_class_matches():
+    """A consumer class NESTED inside another class: _scan_class_bases' recursive
+    walk finds it (keyed by ITS OWN name token, not the outer's), and the handler
+    lookup is parent-index-scoped (d.parent == class_def.index), so the inner
+    class's own process_event -- not anything on Outer -- gets the role/edge."""
+    relpath = "app/consumers/nested.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", NESTED_CLASS_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    handler_id = node_ids[_def(ctx, "process_event").index]
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].src == handler_id
+    assert consumes[0].dst == "chan:event_type:OCRDataEvent"
+    assert result.roles[handler_id] == {"MessageConsumer"}
+
+
+THREE_BASES_SRC = b'''from kyc_base_consumer.base import BaseConsumer
+from pkg import After, Before
+
+
+class C(Before, BaseConsumer[OCRDataEvent], After):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_three_bases_middle_position_matches():
+    relpath = "app/consumers/middle.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", THREE_BASES_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].dst == "chan:event_type:OCRDataEvent"
+
+
+KEYWORD_PLUS_GENERIC_SRC = b'''from abc import ABCMeta
+
+from kyc_base_consumer.base import BaseConsumer
+
+
+class C(BaseConsumer[OCRDataEvent], metaclass=ABCMeta):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_keyword_argument_alongside_generic_base_matches():
+    """`metaclass=ABCMeta` in the same superclasses list is a keyword_argument node
+    -- skipped by _scan_class_bases (and by facts' base_exprs), never confused for
+    a base; the generic base beside it still matches."""
+    relpath = "app/consumers/meta.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", KEYWORD_PLUS_GENERIC_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].dst == "chan:event_type:OCRDataEvent"
+
+
+# -- M6 T3 review Minor-2: nested-subscript generic arg -- raw-text channel name --
+
+
+NESTED_SUBSCRIPT_SRC = b'''from kyc_base_consumer.base import BaseConsumer
+
+
+class C(BaseConsumer[dict[str, OCRDataEvent]]):
+    async def process_event(self, event) -> bool:
+        return True
+'''
+
+
+def test_base_class_nested_subscript_generic_arg_uses_raw_text_channel_name():
+    """Known limitation, pinned (see _generic_arg_text's docstring): a NESTED
+    subscript generic (`BaseConsumer[dict[str, Event]]`) is neither an identifier
+    nor an attribute, so the whole raw expression text -- whitespace included,
+    exactly as written in source -- becomes the channel name. No real consumer in
+    the pilot convention parameterizes its base with anything but a bare event
+    class; if one ever does, the honest raw-text identity at least keys producer/
+    consumer consistently for byte-identical spellings."""
+    relpath = "app/consumers/nestedsub.py"
+    ctx, node_ids, consts = _load(relpath, "kyc-worker", NESTED_SUBSCRIPT_SRC)
+    result = extract_kafka(ctx, node_ids, _idioms(consumers=[BASE_CLASS_IDIOM]), consts)
+    consumes = [e for e in result.edges if e.type == "CONSUMES"]
+    assert len(consumes) == 1
+    assert consumes[0].dst == "chan:event_type:dict[str, OCRDataEvent]"

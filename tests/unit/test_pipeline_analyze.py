@@ -579,10 +579,15 @@ BASE_CLASS_NO_GENERIC_IDIOM = ConsumerIdiom(
     event_type_from=GenericArgSpec(generic_arg=0),
 )
 
-# Bare (non-generic) subclass -- base_class idiom's target base matches textually,
-# but there is no subscript at all, so extract_kafka bumps consumer_base_class_no_generic
-# instead of producing a claim (see test_kafka_extractor.py's own unit-level proof).
+# Bare (non-generic) subclass -- base_class idiom's target base matches textually
+# (the from-import line is the required corroboration, M6 T3 review Important-1:
+# bare name equality with zero import evidence no longer matches at all), but there
+# is no subscript, so extract_kafka bumps consumer_base_class_no_generic instead of
+# producing a claim (see test_kafka_extractor.py's own unit-level proof).
 _NO_GENERIC_CONSUMER_SRC = (
+    "from kyc_base_consumer.base import BaseConsumer\n"
+    "\n"
+    "\n"
     "class OCRDataConsumer(BaseConsumer):\n"
     "    async def process_event(self, event) -> bool:\n"
     "        return True\n"

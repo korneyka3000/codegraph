@@ -76,8 +76,10 @@ node prop).
 M6 T3 (GAPS §4/pilot gap 4 -- CONSUMES=0 on shared-lib `BaseConsumer[Event]`
 subclasses): a FOURTH, independent ConsumerIdiom shape, kind="base_class" -- a class
 whose bases contain a subscript `Base[...]` resolving (scip ref-lookup on the base
-name token, falling back to a textual FQN-suffix match at idiom_match's IMPORT_NAME
-tier confidence when scip has no opinion) to `idiom.base_class` marks its OWN
+name token, falling back to an IMPORT-CORROBORATED textual match at idiom_match's
+IMPORT_NAME tier confidence when scip has no opinion: last-FQN-segment name equality
+PLUS import-statement evidence, mirroring _match_import_name_ctor_form's exact
+checks -- see _match_base_tier) to `idiom.base_class` marks its OWN
 `handler_method` (not the class, not ctor/setup) MessageConsumer; CONSUMES goes
 handler_method -> Channel(event_type from the subscript's generic_arg-th argument,
 `idiom.event_type_from` a GenericArgSpec). Unlike the other three shapes, there is no
@@ -115,7 +117,17 @@ from codegraph.config.models import (
 )
 from codegraph.core.ids import display_qualified
 from codegraph.core.schema import EdgeRec, NodeRec, make_channel_node
-from codegraph.extractors.idiom_match import CallMatch, MatchTier, match_calls
+
+# _imports_module: underscore-named in idiom_match but reused here deliberately (M6
+# T3 review Important-1, reviewer-sanctioned) -- the base_class textual tier's
+# module-import corroboration must stay check-for-check identical to
+# _match_import_name_ctor_form's, and one shared helper is how the two stay in sync.
+from codegraph.extractors.idiom_match import (
+    CallMatch,
+    MatchTier,
+    _imports_module,
+    match_calls,
+)
 from codegraph.parsing.consts import ConstTable, Resolved, resolve_value_spec
 from codegraph.parsing.facts import ArgFact, CallFact, DefFact
 from codegraph.resolvers.scip.symbols import parse_symbol, symbol_to_node_id
@@ -502,6 +514,11 @@ class _ClassBaseToken:
     name_end_byte: int
     name_text: str
     generic_arg_texts: tuple[str, ...] = ()
+    # M6 T3 review Important-1: whether the base's name part was an attribute chain
+    # ("mod.Base[...]"/"mod.Base") rather than a bare identifier -- the textual
+    # fallback tier's module-import corroboration branch only applies to prefixed
+    # forms (mirrors _match_import_name_ctor_form's receiver_text-is-not-None check).
+    is_prefixed: bool = False
 
 
 def _base_token_name(node):
@@ -516,6 +533,16 @@ def _base_token_name(node):
 
 
 def _generic_arg_text(node) -> str:
+    """Generic-argument text for the event channel name: an attribute chain reduces
+    to its LAST identifier (`Base[evtmod.Event]` -> "Event", per the brief); every
+    other shape -- identifier, but also a NESTED subscript like
+    `Base[dict[str, Event]]` -- keeps its RAW source text as-is (M6 T3 review
+    Minor-2, known limitation): the channel name is then whitespace-sensitive
+    ("dict[str, Event]" != "dict[str,Event]" as channel identities). No pilot
+    consumer parameterizes its base with anything but a bare event class; if one
+    ever does, byte-identical spellings still key producer/consumer consistently,
+    and normalizing beyond that is deliberately out of scope (pinned by
+    test_base_class_nested_subscript_generic_arg_uses_raw_text_channel_name)."""
     if node.type == "attribute":
         last = node.child_by_field_name("attribute")
         if last is not None:
@@ -562,6 +589,7 @@ def _scan_class_bases(source: bytes) -> dict[tuple[int, int], list[_ClassBaseTok
                             name_start_byte=name_tok.start_byte, name_end_byte=name_tok.end_byte,
                             name_text=name_tok.text.decode("utf-8", errors="replace"),
                             generic_arg_texts=arg_texts,
+                            is_prefixed=value.type == "attribute",
                         ))
                     else:
                         name_tok = _base_token_name(base)
@@ -571,6 +599,7 @@ def _scan_class_bases(source: bytes) -> dict[tuple[int, int], list[_ClassBaseTok
                             is_subscript=False,
                             name_start_byte=name_tok.start_byte, name_end_byte=name_tok.end_byte,
                             name_text=name_tok.text.decode("utf-8", errors="replace"),
+                            is_prefixed=base.type == "attribute",
                         ))
                 result[(name_node.start_byte, name_node.end_byte)] = tokens
         for child in node.children:
@@ -585,11 +614,28 @@ def _match_base_tier(
 ) -> MatchTier | None:
     """STATIC (scip ref-lookup at the base name token's own span -> display_qualified,
     fnmatchcase against base_class_fqn -- same glob forms idiom_match._match_static
-    uses) tried first; IMPORT_NAME fallback (bare name-text equality against the
-    configured FQN's last segment) when scip has no opinion (lookup unwired, symbol
-    not found, or a local/unparseable symbol) -- mirrors match_calls' own
+    uses) tried first; IMPORT_NAME fallback when scip has no opinion (lookup unwired,
+    symbol not found, or a local/unparseable symbol) -- mirrors match_calls' own
     "first tier that fires wins" priority (idiom_match.py). RECEIVER has no meaning
-    here at all (no call-site/receiver, only a class's own base expression)."""
+    here at all (no call-site/receiver, only a class's own base expression).
+
+    The IMPORT_NAME fallback (M6 T3 review Important-1) requires IMPORT-STATEMENT
+    corroboration on top of last-segment name equality -- an exact mirror of
+    idiom_match._match_import_name_ctor_form's two checks (bare name equality alone
+    used to match `class C(evil.BaseConsumer[...])` in a file importing NOTHING,
+    reviewer-executed false positive):
+      (a) from-import form: the FQN's last segment appears in some import's names
+          (`from kyc_base_consumer.base import BaseConsumer`). Same documented
+          laxity as ctor-form: the import's MODULE part is not verified against
+          the FQN prefix (`from evil import BaseConsumer` still matches -- the
+          tier is the weakest by design, pinned by test).
+      (b) prefixed form (`shared.BaseConsumer[...]`): the FQN's own FIRST module
+          segment is imported somewhere in this file (idiom_match._imports_module,
+          reused directly). The prefix TEXT is not required to match the module --
+          ctor-form's own receiver comment verbatim -- which is exactly what lets
+          `import kyc_base_consumer.base as shared` + `shared.BaseConsumer[...]`
+          match without any alias-resolution machinery (ImportFact.target_module
+          records the REAL module name for aliased imports, see facts.py)."""
     if ctx.ref_symbol_lookup is not None:
         sym = ctx.ref_symbol_lookup(ctx.relpath, tok.name_start_byte)
         if sym is not None:
@@ -601,7 +647,11 @@ def _match_base_tier(
                 ):
                     return MatchTier.STATIC
     last_segment = base_class_fqn.rsplit(".", 1)[-1]
-    if tok.name_text == last_segment:
+    if tok.name_text != last_segment:
+        return None
+    if any(last_segment in imp.names for imp in ctx.facts.imports):
+        return MatchTier.IMPORT_NAME
+    if tok.is_prefixed and _imports_module(ctx.facts.imports, base_class_fqn.split(".", 1)[0]):
         return MatchTier.IMPORT_NAME
     return None
 
@@ -628,6 +678,17 @@ def _emit_base_class_topic_containment(
     # always-downgrades-to-heuristic/<=0.6 convention, `_resolution_for`) directly.
     resolved = Resolved(kind="config_ref", config_ref=idiom.topic.attr)
     resolution, confidence = _resolution_for(tier, resolved)
+    # Deliberate convention divergence (M6 T3 review Minor-3): unresolved/config_ref
+    # land as NODE props here, whereas this module's other channels carry config_ref
+    # as an EDGE prop only (`_props_for`) and no unresolved marker at all. The
+    # precedent actually followed is linking/http_routes.py's
+    # `_unresolved_channel_and_edge` (Channel(unresolved=True, ...) node props for a
+    # channel whose identity is known-incomplete) -- and it fits: this channel's
+    # NAME itself is a config placeholder ("${self.config.topic}"), so the
+    # unresolvedness is a property of the channel node's identity, not of any one
+    # edge's evidence. The kafka edge-prop convention is kept for the existing
+    # call-site-resolved shapes, where the channel name IS concrete and only the
+    # resolution path varies per edge.
     topic_chan = make_channel_node(
         "kafka_topic", name=_channel_name(resolved),
         unresolved=True, config_ref=idiom.topic.attr,
