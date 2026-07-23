@@ -1348,6 +1348,49 @@ def test_producer_wrapper_const_event_type_produces_event_channel():
     assert not any(e.type == "CONTAINS" for e in result.edges)
 
 
+WRAPPER_EVENT_TYPE_KWARG_SRC = b'''from app.services.producer import KYCEventPublisher
+
+
+async def use(publisher: KYCEventPublisher):
+    await publisher.publish("body-bytes", event_type="OrderCreated")
+'''
+
+
+def test_producer_wrapper_kwarg_event_type_produces_event_channel():
+    """M6-T4 review minor (M7 backlog): event_type_from={kwarg: ...}'s resolution
+    mechanism is already proven generically at the consts level
+    (test_parsing_consts.py's test_resolve_value_spec_kwarg) and at kafka_ext level
+    for name_from (test_producer_user_idiom_kwarg_topic_source_produces_channel
+    above) -- but was never pinned, at the kafka_ext EXTRACTOR level, for
+    event_type_from specifically. Same wrapper-call idiom shape as the const-event-
+    type test just above, except the call site passes event_type=... as a KWARG
+    instead of fixing it at config time -- proves resolve_value_spec's shared kwarg
+    branch (spec.kwarg -> find ArgFact by keyword -> resolve_arg) is actually reached
+    via event_type_from too, not just name_from/topic. `_emit_event_type_produces`
+    needed no production changes for this -- it already resolves `channel.
+    event_type_from` generically via `_resolve_event_type_from`/`resolve_value_spec`,
+    exactly like `_emit_kafka_topic_produces` does for `name_from`."""
+    relpath = "app/kyc_engine/activities/kafka_events.py"
+    ctx, node_ids, consts = _load(relpath, "camunda-gateway", WRAPPER_EVENT_TYPE_KWARG_SRC)
+    idiom = ProducerIdiom(
+        name="kyc-event-publisher-wrapper-kwarg-type",
+        call="app.services.producer.KYCEventPublisher.publish",
+        channel=ChannelSpec(kind="event_type", event_type_from=ValueSpec(kwarg="event_type")),
+    )
+    result = extract_kafka(ctx, node_ids, _idioms(producers=[idiom]), consts)
+    use_id = node_ids[_def(ctx, "use").index]
+
+    produces = [e for e in result.edges if e.type == "PRODUCES"]
+    assert len(produces) == 1
+    p = produces[0]
+    assert p.src == use_id
+    assert p.dst == "chan:event_type:OrderCreated"
+    assert p.resolution == "heuristic" and p.confidence == 0.6
+    assert result.roles[use_id] == {"MessageProducer"}
+    assert not any(e.type == "CONTAINS" for e in result.edges)
+    assert result.stats["producers_resolved"] == 1
+
+
 # -- M7 T2 (OPEN R2): settings:/enum: ValueSpec sources -- producer-side literals
 # from code, and the enum fan-out over-approximation.
 #

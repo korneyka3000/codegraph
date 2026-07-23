@@ -283,10 +283,32 @@ class HttpRouteFromSpec(_Strict):
 
 class HttpVerbFromSpec(_Strict):
     """M6 T2: откуда брать verb — enum-атрибут arg0 конструктора `request_ctor` (напр.
-    `Request(Method.GET, ...)` -> `request_ctor="Request"`, `enum="Method"` -> "GET")."""
+    `Request(Method.GET, ...)` -> `request_ctor="Request"`, `enum="Method"` -> "GET").
+
+    M7 T5 (pilot-rerun.md verb_unresolved=15 -- document-management's real
+    `ProxyRequest(Request)` subclass: `request_ctor: "Request"` alone never matched
+    the subclass ctor's own name): `request_ctor` is now "|"-separated alternatives
+    too ("Request|ProxyRequest") -- same DSL convention as HttpClientIdiom.call (M6
+    T2), matched via the SAME `_call_alternatives`/`_matches_call_alt` machinery in
+    extractors/http_client_ext.py's `_find_verb` (a bare, receiver-less ctor name
+    degrades to plain equality against `CallFact.callee_name`, byte-identical to the
+    pre-M7-T5 single-name comparison)."""
 
     request_ctor: str
     enum: str
+
+    @model_validator(mode="after")
+    def _no_empty_alternative(self) -> HttpVerbFromSpec:
+        # M7 T5: an empty "|"-alternative (trailing/leading/doubled "|", or a bare "")
+        # can only be a config typo -- no ctor is ever named "", so it would validate
+        # but could only ever contribute a permanent, silent non-match. Rejected at
+        # config-load time instead of degrading to a forever-honest
+        # `http_verb_unresolved` miss nobody can explain from the DSL alone.
+        if any(alt == "" for alt in self.request_ctor.split("|")):
+            raise ValueError(
+                f"HttpVerbFromSpec.request_ctor: empty '|'-alternative in {self.request_ctor!r}"
+            )
+        return self
 
 
 class HttpClientIdiom(_Strict):

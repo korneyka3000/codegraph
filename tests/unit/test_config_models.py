@@ -226,6 +226,32 @@ def test_route_from_arg_defaults_to_zero():
     assert spec.arg == 0
 
 
+# -- M7 T5: verb_from.request_ctor "|"-alternatives (pilot-rerun.md verb_unresolved=15:
+# document-management's real `ProxyRequest(Request)` subclass -- `request_ctor:
+# "Request"` alone never matches the subclass ctor's own name) -- same DSL convention
+# as HttpClientIdiom.call (M6 T2), see extractors/http_client_ext.py's
+# `_call_alternatives`/`_matches_call_alt` (reused verbatim for verb-ctor matching).
+
+
+def test_http_verb_from_request_ctor_accepts_pipe_alternatives():
+    spec = HttpVerbFromSpec(request_ctor="Request|ProxyRequest", enum="Method")
+    assert spec.request_ctor == "Request|ProxyRequest"
+
+
+@pytest.mark.parametrize(
+    "request_ctor",
+    ["Request|", "|Request", "Request||ProxyRequest", ""],
+    ids=["trailing-empty", "leading-empty", "double-pipe", "bare-empty"],
+)
+def test_http_verb_from_request_ctor_rejects_empty_alternative(request_ctor):
+    """An empty "|"-alternative can only be a config typo -- no ctor is ever named by
+    the empty string, so it would validate but could never match anything, forever.
+    Rejected at config-load time instead of silently degrading to a permanent honest
+    `http_verb_unresolved` miss."""
+    with pytest.raises(ValidationError):
+        HttpVerbFromSpec(request_ctor=request_ctor, enum="Method")
+
+
 # -- M6 T3: kind="base_class" ConsumerIdiom (GAPS §4/pilot gap 4: shared-lib
 # BaseConsumer[Event] subclasses, CONSUMES=0) --
 

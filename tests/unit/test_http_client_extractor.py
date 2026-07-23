@@ -630,6 +630,101 @@ def test_decorator_sdk_verb_not_found_produces_no_claim_not_null_verb():
     assert result.stats["http_verb_unresolved"] == 1
 
 
+# -- M7 T5: verb_from.request_ctor "|"-alternatives (pilot-rerun.md verb_unresolved=15:
+# document-management's real `ProxyRequest(Request)` subclass, `driver.fetch` --
+# `request_ctor: "Request"` alone never matched the subclass ctor's own name). Same
+# "|"-alternatives DSL/matching convention as `call` (_call_alternatives/
+# _matches_call_alt, reused verbatim) -- a SEPARATE idiom constant, not a mutation of
+# DECORATOR_SDK_IDIOM, so every pre-existing single-name test above stays untouched.
+
+PROXY_REQUEST_IDIOM = HttpClientIdiom(
+    name="decorator-sdk-proxy",
+    file_glob="**/clients/*.py",
+    class_glob="*Client",
+    route_from=HttpRouteFromSpec(decorator="path_template", arg=0),
+    call="driver.fetch_content|driver.fetch",
+    verb_from=HttpVerbFromSpec(request_ctor="Request|ProxyRequest", enum="Method"),
+)
+
+
+PROXY_REQUEST_SRC = b'''from some_sdk import BaseClient, Method, ProxyRequest, path_template
+
+
+class ProxyClient(BaseClient):
+    @path_template("/v1/proxy/{id}")
+    async def get_proxy(self, id):
+        request = ProxyRequest(Method.GET, self.host)
+        return await self.driver.fetch_content(request)
+'''
+
+
+def test_decorator_sdk_verb_ctor_second_alternative_matches():
+    """The SECOND alt ("ProxyRequest") must actually match, not just parse -- proves
+    alternation is tried in full, not just the first entry (mirrors
+    test_decorator_sdk_driver_fetch_alternative_matches's own precedent for `call`)."""
+    ctx, node_ids, consts = _load("app/clients/proxy_client.py", "svc", PROXY_REQUEST_SRC)
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[PROXY_REQUEST_IDIOM]), consts,
+    )
+    assert len(result.claims) == 1
+    assert result.claims[0]["verb"] == "GET"
+    assert result.claims[0]["path_template"] == "/v1/proxy/{id}"
+    assert result.stats["http_verb_unresolved"] == 0
+
+
+PROXY_REQUEST_PLAIN_SRC = b'''from some_sdk import BaseClient, Method, Request, path_template
+
+
+class ProxyPlainClient(BaseClient):
+    @path_template("/v1/proxyplain/{id}")
+    async def get_plain(self, id):
+        request = Request(Method.POST, self.host)
+        return await self.driver.fetch_content(request)
+'''
+
+
+def test_decorator_sdk_verb_ctor_first_alternative_still_matches():
+    """The pre-existing plain `Request` name (first alternative) still matches once
+    the DSL carries a second "|"-alternative alongside it -- adding ProxyRequest
+    support must not regress the common single-ctor case."""
+    ctx, node_ids, consts = _load(
+        "app/clients/proxyplain_client.py", "svc", PROXY_REQUEST_PLAIN_SRC,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[PROXY_REQUEST_IDIOM]), consts,
+    )
+    assert len(result.claims) == 1
+    assert result.claims[0]["verb"] == "POST"
+
+
+PROXY_REQUEST_WRONG_NAME_SRC = b'''from some_sdk import BaseClient, Method, path_template
+from some_sdk import OtherRequest
+
+
+class ProxyWrongClient(BaseClient):
+    @path_template("/v1/proxywrong/{id}")
+    async def get_wrong(self, id):
+        request = OtherRequest(Method.GET, self.host)
+        return await self.driver.fetch_content(request)
+'''
+
+
+def test_decorator_sdk_verb_ctor_non_matching_name_counts_verb_unresolved():
+    """A ctor name outside BOTH "|"-alternatives is still an honest, counted miss --
+    not a silent success (e.g. a loose substring match on "Request" would wrongly
+    fire here) and not a crash. Mirrors
+    test_decorator_sdk_verb_not_found_produces_no_claim_not_null_verb's single-name
+    precedent, now proven under a multi-alternative idiom."""
+    ctx, node_ids, consts = _load(
+        "app/clients/proxywrong_client.py", "svc", PROXY_REQUEST_WRONG_NAME_SRC,
+    )
+    result = extract_http_client(
+        ctx, node_ids, ServiceIdioms(http_clients=[PROXY_REQUEST_IDIOM]), consts,
+    )
+    assert result.claims == []
+    assert result.stats["http_verb_unresolved"] == 1
+
+
 NO_DRIVER_CALL_SRC = b'''from some_sdk import BaseClient, Method, Request, path_template
 
 

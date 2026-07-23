@@ -146,9 +146,12 @@ nothing HTTP-shaped, and arg0 is a `Request` object, not a URL. Per-idiom algori
      handles a call sitting in a nested closure inside the method too, though no fixture
      here actually nests one). No call-site matches -> method skipped, no claim (the
      decorator alone is not sufficient evidence of an HTTP call).
-  4. Verb: `_find_verb` scans `ctx.facts.calls` for a call to `verb_from.request_ctor`
-     (e.g. "Request") nested inside the SAME method (`_is_within_def` again), whose
-     OWN arg0 is an attribute expression -- `enum_part.rpartition(".")` splits e.g.
+  4. Verb: `_find_verb` scans `ctx.facts.calls` for a call matching
+     `verb_from.request_ctor` (e.g. "Request"; M7 T5: "|"-separated alternatives too,
+     e.g. "Request|ProxyRequest" -- the SAME `_call_alternatives`/`_matches_call_alt`
+     pair step 3's `call` field already uses, reused verbatim rather than
+     reimplemented) nested inside the SAME method (`_is_within_def` again), whose OWN
+     arg0 is an attribute expression -- `enum_part.rpartition(".")` splits e.g.
      "Method.GET" into ("Method", "GET"); the enum_part must equal `verb_from.enum`
      exactly. See "the null-verb decision" below for what happens when no such call, or
      no such arg0 shape, is found anywhere in the method.
@@ -158,14 +161,22 @@ nothing HTTP-shaped, and arg0 is a `Request` object, not a URL. Per-idiom algori
      decorator's or the Request-ctor's line) and in the missing-node-id defensive stat.
 
 Cross-idiom dedup: the driver call-site's OWN `callee_start_byte` is added to the SAME
-`claimed_starts` set verb-mode idioms populate, at the SAME point in the control flow
-(right after the call-site is found to match, before path/verb resolution is even
-attempted) -- an idiom that matches a call structurally (route decorator + call-site
-alternative) claims it permanently against later idioms in list order, exactly mirroring
-verb-mode's own "matched the scope gates, even if resolution then fails, still claims
-the byte" convention (see `_emit_claim`'s own call sites in the unmodified verb-mode loop
-below) -- kept consistent so a workspace mixing a decorator-SDK idiom and a verb-mode
-idiom over overlapping globs still dedups by one single, uniform rule.
+`claimed_starts` set verb-mode idioms populate, right after the call-site is found to
+match -- NOT "before path/verb resolution", as an earlier revision of this paragraph
+claimed. Route/path resolution (`_decorator_route`, step 2 above) runs BEFORE the
+call-site search even starts, and a method whose route doesn't resolve (`route is
+None`, or `_ROUTE_ARG_UNRESOLVED`) `continue`s straight past the call-site search
+without ever reaching it -- so path resolution has ALREADY succeeded by the time a
+byte is claimed, and a route-unresolved method never claims a byte at all. Only verb
+resolution (`_find_verb`, step 4, called right after the claim below) is genuinely
+still pending at the claim point. This still mirrors verb-mode's own "claims the byte
+once its call-site structurally matches, even if the one resolution step still
+outstanding then fails" convention (see `_emit_claim`'s own call sites in the
+unmodified verb-mode loop below, where arg0/path resolution is that outstanding step
+instead, deferred entirely to AFTER verb-mode's own claim) -- kept consistent so a
+workspace mixing a decorator-SDK idiom and a verb-mode idiom over overlapping globs
+still dedups by one single, uniform "claim on structural match" rule, just gated by a
+different set of preconditions per mode.
 
 THE NULL-VERB DECISION (M6 T2 brief explicitly asks this be read from the code and
 documented, not assumed): read `linking/http_routes.py` before deciding whether a
@@ -515,11 +526,20 @@ def _find_verb(
     defs_by_index: dict[int, DefFact], calls: list[CallFact], method_idx: int,
     verb_from: HttpVerbFromSpec,
 ) -> str | None:
-    """Scans ALL calls in the file for one to `verb_from.request_ctor` nested inside
-    def #`method_idx`, whose own arg0 is an attribute expression "ENUM.VERB" with
-    ENUM == verb_from.enum -- returns VERB upper-cased. None if no such call/arg0 shape
-    exists anywhere inside the method (see module docstring's "THE NULL-VERB DECISION"
-    for what the caller does then -- NOT a verb=None claim).
+    """Scans ALL calls in the file for one matching `verb_from.request_ctor` nested
+    inside def #`method_idx`, whose own arg0 is an attribute expression "ENUM.VERB"
+    with ENUM == verb_from.enum -- returns VERB upper-cased. None if no such call/arg0
+    shape exists anywhere inside the method (see module docstring's "THE NULL-VERB
+    DECISION" for what the caller does then -- NOT a verb=None claim).
+
+    M7 T5 (pilot-rerun.md verb_unresolved=15 -- document-management's real
+    `ProxyRequest(Request)` subclass): `request_ctor` is "|"-separated alternatives,
+    matched via the SAME `_call_alternatives`/`_matches_call_alt` pair the call-site
+    step above already uses for `idiom.call` -- reused verbatim, not reimplemented. A
+    bare, receiver-less ctor call (`Request(...)`, the overwhelmingly common shape --
+    `_full_call_path` contributes just `[callee_name]` when `receiver_text is None`)
+    against a single, dot-free alternative degrades to exactly the pre-M7-T5
+    `callee_name == request_ctor` comparison, byte-identical.
 
     First-match semantics (M6 T2 review Minor-4): `ctx.facts.calls` is built in AST
     walk order, so if a method body somehow contains TWO matching `Request(Method.X,
@@ -527,8 +547,9 @@ def _find_verb(
     never consulted. The pilot convention this mode models builds exactly one Request
     per method (the whole point of the SDK shape), so this is a documented tiebreak
     for a degenerate input, not a supported pattern."""
+    ctor_alternatives = _call_alternatives(verb_from.request_ctor)
     for call in calls:
-        if call.callee_name != verb_from.request_ctor:
+        if not _matches_call_alt(call, ctor_alternatives):
             continue
         if not _is_within_def(defs_by_index, call, method_idx):
             continue
