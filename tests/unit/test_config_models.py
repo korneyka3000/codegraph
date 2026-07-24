@@ -252,6 +252,25 @@ def test_http_verb_from_request_ctor_rejects_empty_alternative(request_ctor):
         HttpVerbFromSpec(request_ctor=request_ctor, enum="Method")
 
 
+@pytest.mark.parametrize(
+    "call",
+    ["driver.fetch|", "|driver.fetch", "driver.fetch||driver.fetch_content"],
+    ids=["trailing-empty", "leading-empty", "double-pipe"],
+)
+def test_http_client_idiom_call_rejects_empty_alternative(call):
+    """M7 final review Minor-1: `call` uses the SAME "|"-splitting machinery as
+    HttpVerbFromSpec.request_ctor but predates its validator (M6 T2) -- the mirror
+    guard closes the asymmetry: an empty alternative could only ever be a permanent
+    silent non-match."""
+    with pytest.raises(ValidationError):
+        HttpClientIdiom(
+            name="sdk",
+            route_from=HttpRouteFromSpec(decorator="path_template", arg=0),
+            call=call,
+            verb_from=HttpVerbFromSpec(request_ctor="Request", enum="Method"),
+        )
+
+
 # -- M6 T3: kind="base_class" ConsumerIdiom (GAPS §4/pilot gap 4: shared-lib
 # BaseConsumer[Event] subclasses, CONSUMES=0) --
 

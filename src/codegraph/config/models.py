@@ -359,6 +359,18 @@ class HttpClientIdiom(_Strict):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _no_empty_call_alternative(self) -> HttpClientIdiom:
+        # M7 final review Minor-1: mirror of HttpVerbFromSpec._no_empty_alternative for
+        # the SAME "|"-splitting machinery on `call` -- an empty alternative (trailing/
+        # leading/doubled "|") could only ever be a permanent silent non-match. The
+        # asymmetry existed since M6 T2 (call predates the validator convention).
+        if self.call is not None and any(alt == "" for alt in self.call.split("|")):
+            raise ValueError(
+                f"HttpClientIdiom.call: empty '|'-alternative in {self.call!r}"
+            )
+        return self
+
 
 class ServiceIdioms(_Strict):
     producers: list[ProducerIdiom] = Field(default_factory=list)
