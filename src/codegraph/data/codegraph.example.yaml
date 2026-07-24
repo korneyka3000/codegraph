@@ -14,6 +14,14 @@ embedding: { provider: local, model: jinaai/jina-embeddings-v2-base-code }
 # "passage: " (см. README «Ограничения», рекомендация для русскоязычных команд).
 # Читает только provider: local.
 scip: { timeout_min: 20, node_options: "--max-old-space-size=8192" }
+# env_sources (M7, опционально): helm-values-образные YAML с env→URL маппингами —
+# дают env→service карту-ФОЛБЭК для якорения CALLS_HTTP (linking/env_map.py):
+# берётся hostname'ов ПЕРВЫЙ DNS-лейбл и сверяется с именами сервисов workspace'а
+# (точное равенство, без фаззи). Консультируется ТОЛЬКО когда ни один
+# services[].http.base_url_env (первичный реестр) не владеет env-переменной claim'а.
+# Пути — относительно самого yaml; несуществующий путь — ошибка загрузки конфига.
+# env_sources:
+#   - ./deploy/values.yaml        # напр.: SERVICE_ORDERS_URL: "http://orders-api.ns.svc:8000"
 
 services:
   - name: orders-api
@@ -47,6 +55,29 @@ services:
           channel:
             kind: event_type
             event_type_from: { const: "OrderShipped" }
+        - name: outbox-settings-topic                    # M7: топик из pydantic-Settings поля —
+                                                          # "<ClassFQN>.<field>" (суффикс-матч по FQN
+                                                          # класса); строковый ДЕФОЛТ поля -> статичная
+                                                          # идентичность канала (call-site не участвует);
+                                                          # без дефолта, но с env-именем (env_prefix/alias)
+                                                          # -> честный config_ref-плейсхолдер, как {env:}.
+          call: "app.db.outbox.Event"
+          channel:
+            kind: kafka_topic
+            name_from: { settings: "app.config.ServiceSettings.orders_topic" }
+        - name: topic-family-mirror                      # M7: enum-фан-аут — топик вызова динамический,
+                                                          # но СЕМЕЙСТВО возможных топиков — члены
+                                                          # Enum/StrEnum-класса: по одному PRODUCES на член
+                                                          # (fixed heuristic/0.8, mechanism=enum_fanout,
+                                                          # дедуп повторных call-site'ов через
+                                                          # callsite_count) — документированная честная
+                                                          # оверап-проксимация. enum допустим ТОЛЬКО в
+                                                          # name_from kafka_topic-канала (везде ещё —
+                                                          # ошибка конфига, fail-closed).
+          call: "app.services.mirror.TopicMirror.replicate"
+          channel:
+            kind: kafka_topic
+            name_from: { enum: "app.topics.OrderTopicName" }
   - name: kyc-worker
     path: ../kyc-worker
     idioms:
@@ -79,6 +110,16 @@ services:
           file_glob: "**/clients/*_client.py"
           class_glob: "*Client"
           base_url: { attr: "self._base_url", env: DOCUMENT_MANAGEMENT_URL }
+          # M7-альтернативы якорения (явное всегда бьёт авто):
+          #   base_url: { settings: "app.config.ServiceSettings.docs_url" } — env-имя
+          #     поля (env_prefix/alias) из ClassAttrIndex, per-class, без коллизий;
+          #   БЕЗ base_url вовсе — auto-anchor: `self.<host_attr> = <chain>` в теле
+          #     САМОГО класса (наследованный из базового ctor'а — НЕ виден,
+          #     задокументированное ограничение), хвост RHS джойнится по имени на
+          #     УНИКАЛЬНОЕ env-носящее Settings-поле сервиса; коллизия/без-env —
+          #     честно без якоря (unanchored unique — heuristic/0.7, НИКОГДА не
+          #     static/1.0 без якоря).
+          # host_attr: "host"                            # имя атрибута для auto-anchor (дефолт "host")
         - name: decorator-route-sdk                       # альтернативная SDK-конвенция: маршрут — в
                                                             # декораторе (не arg0 самого HTTP-вызова), verb —
                                                             # из Request(Method.X, ...), сам вызов — за
@@ -93,7 +134,11 @@ services:
           base_url: { env: DOCUMENT_MANAGEMENT_URL }
           route_from: { decorator: "path_template", arg: 0 }  # @path_template("/v1/x/{id}")
           call: "driver.fetch_content"                        # "a.b|c.d" — "|"-альтернативы допустимы
-          verb_from: { request_ctor: "Request", enum: "Method" }  # Request(Method.GET, ...)
+          verb_from: { request_ctor: "Request|ProxyRequest", enum: "Method" }
+                                                            # Request(Method.GET, ...); M7: "|"-альтернативы
+                                                            # для сабклассов-конструкторов (ProxyRequest(
+                                                            # Request) в реальном SDK) — пустая альтернатива
+                                                            # ("Request|") отклоняется на загрузке.
   - name: document-management
     path: ../document-management
     http: { base_url_env: DOCUMENT_MANAGEMENT_URL }      # builtin-идиом достаточно
