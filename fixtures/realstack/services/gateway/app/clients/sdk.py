@@ -17,6 +17,14 @@ class Request:
         self.doc_uid = doc_uid
 
 
+class ProxyRequest(Request):
+    """Proxied Request subclass (M7 T5, pilot-rerun verb_unresolved=15): real SDKs
+    substitute `ProxyRequest(Method.X, ...)` for `Request(...)` in some methods --
+    a `request_ctor: "Request"` idiom alone never matches this ctor's own name, so
+    HttpVerbFromSpec.request_ctor accepts "|"-separated alternatives
+    ("Request|ProxyRequest", see workspace.yaml's status-client-proxy-sdk)."""
+
+
 class Driver:
     async def fetch_content(self, request: Request) -> dict:
         return {"doc_uid": request.doc_uid}

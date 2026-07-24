@@ -1,0 +1,12 @@
+# Helm-values-shaped env source (M7 T3, OPEN R1) -- referenced by workspace.yaml's
+# `env_sources:`. linking/env_map.py walks the whole nested mapping, keeps every
+# (KEY, string-value) pair whose value parses as a URL, and maps KEY -> the
+# hostname's FIRST DNS label IFF that label exactly names a workspace service:
+#   SERVICE_WORKER_URL  -> "worker"  (anchors gateway's auto-anchored StatusClient)
+#   SERVICE_GATEWAY_URL -> "gateway" (harvested too; nothing consumes it today)
+#   SERVICE_DOC_EVENTS_TOPIC is NOT a URL (urlparse finds no hostname) -- silently
+#   ignored for service-mapping, exactly the honest-degradation the module pins.
+env:
+  SERVICE_WORKER_URL: "http://worker.kyc.svc.cluster.local:9000"
+  SERVICE_GATEWAY_URL: "http://gateway.kyc.svc.cluster.local:8000"
+  SERVICE_DOC_EVENTS_TOPIC: "kyc.document.events"

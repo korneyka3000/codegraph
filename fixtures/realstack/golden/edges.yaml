@@ -7,6 +7,15 @@
 # здесь сознательно НЕ размечается — вне скоупа M6-гейта (см. task-5-brief.md's
 # Interfaces-раздел: гейт явно перечисляет только эти пять типов).
 #
+# M7 (T6): АДДИТИВНОЕ расширение под все M7-механизмы (open-gaps R1-R3) — новые
+# записи помечены "M7" в комментарии группы; ни одна M6-запись не изменена и не
+# удалена. M6-гейт читает этот же файл: его P/R-проверки теперь строже ровно на
+# новые записи (та же фикстура даёт и новые рёбра), что санкционировано брифом T6
+# ("аддитивная фикстура"). `mechanism:` на PRODUCES-записях ниже — ДОКУМЕНТАЦИЯ
+# (evalx.load_golden_edges фильтрует mechanism только у CALLS; для остальных
+# типов лишние ключи не читаются) — конфиденсы/механизмы пинит M7-гейт напрямую
+# по staged-рёбрам, как M6 пинит heuristic/0.6 у base_class CONSUMES.
+#
 # Каждая запись выведена ВРУЧНУЮ из fixtures/realstack/services/*/app/*.py +
 # workspace.yaml — см. комментарий у каждой группы для конкретного файла:строки.
 version: 1
@@ -52,9 +61,66 @@ edges:
   - src: {service: worker, symbol: app.consumers.doc_submitted.DocSubmittedConsumer.process_event}
     type: CONSUMES
     dst: {channel: "chan:event_type:DocSubmittedEvent"}
+  # --- M7 T2 (OPEN R2) settings-source producer: outbox Event ctor in
+  # app/services/outbox_repo.py's add_document_event; идиома outbox-doc-events
+  # резолвит имя канала из GatewaySettings.doc_events_topic'а СТРОКОВОГО ДЕФОЛТА
+  # ("kyc.document.events", app/config.py) через ClassAttrIndex — call-site не
+  # участвует. Матч ctor'а Event — STATIC (scip резолвит first-party класс), а
+  # Resolved(kind="value") сохраняет tier как есть -> static/1.0 (пин — в гейте).
+  - src: {service: gateway, symbol: app.services.outbox_repo.OutboxRepository.add_document_event}
+    type: PRODUCES
+    dst: {channel: "chan:kafka_topic:kyc.document.events"}
+  # --- M7 T2 (OPEN R2a) enum fan-out: TopicMirror.replicate x2 call-sites в
+  # app/routes/ops.py's replay_document; идиома doc-topic-mirror фан-аутит по
+  # ВСЕМ членам DocTopicName (app/topics.py) — по одному PRODUCES на член,
+  # fixed heuristic/0.8, props {mechanism: enum_fanout, callsite_count: 2}
+  # (дедуп двух call-site'ов в одном def'е; пины — в M7-гейте).
+  - src: {service: gateway, symbol: app.routes.ops.replay_document}
+    type: PRODUCES
+    dst: {channel: "chan:kafka_topic:kyc.doc.review"}
+    mechanism: enum_fanout
+  - src: {service: gateway, symbol: app.routes.ops.replay_document}
+    type: PRODUCES
+    dst: {channel: "chan:kafka_topic:kyc.doc.audit"}
+    mechanism: enum_fanout
+  - src: {service: gateway, symbol: app.routes.ops.replay_document}
+    type: PRODUCES
+    dst: {channel: "chan:kafka_topic:kyc.doc.archive"}
+    mechanism: enum_fanout
+  # --- M7 T4 (OPEN R3) temporal signal pair: worker consumer шлёт
+  # handle.signal("doc-approved", ...) (app/consumers/doc_submitted.py's
+  # process_event) -> PRODUCES heuristic/0.6 mechanism=temporal_signal;
+  # gateway's @workflow.signal(name="doc-approved") хендлер
+  # (app/workflows/submission.py's doc_approved) -> CONSUMES static/1.0.
+  # Кросс-сервисный хоп через канал — легальный мост, как kafka/http.
+  # @workflow.query approval_state — role-only, НИКАКОГО ребра/канала: его
+  # отсутствие здесь + P=R=1.0 по CONSUMES/PRODUCES и есть негативный пин.
+  - src: {service: worker, symbol: app.consumers.doc_submitted.DocSubmittedConsumer.process_event}
+    type: PRODUCES
+    dst: {channel: "chan:temporal_signal:doc-approved"}
+    mechanism: temporal_signal
+  - src: {service: gateway, symbol: app.workflows.submission.DocSubmissionWorkflow.doc_approved}
+    type: CONSUMES
+    dst: {channel: "chan:temporal_signal:doc-approved"}
+  # --- M7 T3 (OPEN R1) env->service anchored CALLS_HTTP: StatusClient.fetch_status
+  # (app/clients/status_client.py) — auto-anchor self.host = config.worker_url ->
+  # field_by_name -> SERVICE_WORKER_URL -> env_values.yaml -> worker; уникальный
+  # строгий form-match на GET /api/v1/status/{doc_uid} -> static/1.0 (пин — в
+  # гейте). Воронка-негатив: worker's GET /{a}/{b}/{c}/misc НЕ получает НИ ОДНОГО
+  # CALLS_HTTP (старое двунаправленное правило сматчило бы {doc_uid} с "misc") —
+  # гейт assert'ит ноль рёбер в этот канал, а P=1.0 по CALLS_HTTP держит это же
+  # структурно (записи для misc-канала здесь НЕТ).
+  - src: {service: gateway, symbol: app.clients.status_client.StatusClient.fetch_status}
+    type: CALLS_HTTP
+    dst: {channel: "chan:http:worker:GET /api/v1/status/{doc_uid}"}
 # channels: block is documentation only (mirrors fixtures/golden/edges.yaml's own
 # convention) -- nothing in evalx reads it; the gate hardcodes both channel ids via
 # core.ids.chan_kafka/chan_event and checks the CONTAINS pair directly against staging.
 channels:
   - id: "chan:kafka_topic:${self.config.topic}"
     contains: ["chan:event_type:DocSubmittedEvent"]
+  # M7: new channels, for the record (nothing reads this block): the settings-source
+  # topic (kyc.document.events), the three enum fan-out topics (kyc.doc.review/
+  # audit/archive), the temporal signal (chan:temporal_signal:doc-approved), and the
+  # two new worker http routes (GET /api/v1/status/{doc_uid}; the misc funnel route
+  # exists as a Channel but must have ZERO CALLS_HTTP into it).

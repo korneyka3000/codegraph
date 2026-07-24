@@ -5,8 +5,22 @@
 # shared literal Kafka topic (GAPS §6's conclusion: producer and consumer match
 # on the event's TYPE, not on a topic string, because the real topic is a
 # dynamic runtime value on both ends of this stack).
+#
+# M7 (open-gaps R1-R3, see docs/superpowers/reports/2026-07-23-pilot-rerun-open-
+# gaps.md) extends the SAME fixture additively with every M7 mechanism: settings-
+# source + enum-fan-out producer topics (T1/T2), env_sources + self.host
+# auto-anchoring + strict path matching incl. the funnel NEGATIVE (T3), temporal
+# signal channels (T4), request_ctor "|"-alternatives (T5). The M6 gate keeps
+# running over this extended fixture unchanged in spirit -- every M6 leg is intact.
 version: 1
 graph_name: realstack
+# M7 T3 (OPEN R1): helm-values-shaped env->URL file; linking/env_map.py turns it
+# into an env->service map (SERVICE_WORKER_URL -> worker via the URL hostname's
+# first DNS label) -- the ADDITIVE fallback anchoring tier, consulted only when no
+# ServiceConfig.http.base_url_env claims the env (none does for SERVICE_WORKER_URL,
+# unlike WORKER_URL below, which the worker service's own http: block registers).
+env_sources:
+  - ./env_values.yaml
 services:
   - name: gateway
     path: ./services/gateway
@@ -23,6 +37,28 @@ services:
           channel:
             kind: event_type
             event_type_from: { const: "DocSubmittedEvent" }
+        # M7 T2 (OPEN R2) settings-source leg: outbox Event ctor is the producer
+        # call-site; its topic ARGUMENT is a Settings attribute (dynamic at the
+        # call-site), so the channel identity comes from the Settings class's own
+        # string-literal field default via the service-wide ClassAttrIndex --
+        # "<ClassFQN>.<field>", no call-site resolution involved at all. A literal
+        # default -> a real static-quality identity (edge keeps the call match's
+        # own tier, static/1.0 here).
+        - name: outbox-doc-events
+          call: "app.models.outbox.Event"
+          channel:
+            kind: kafka_topic
+            name_from: { settings: "app.config.GatewaySettings.doc_events_topic" }
+        # M7 T2 (OPEN R2a) enum fan-out leg: replicate's topic is runtime data,
+        # but the POSSIBLE topics are the DocTopicName StrEnum's members -- the
+        # idiom declares the whole enum and kafka_ext emits one PRODUCES per
+        # member (fixed heuristic/0.8, mechanism=enum_fanout, callsite_count-
+        # deduped per (src, dst)) -- a documented, honest over-approximation.
+        - name: doc-topic-mirror
+          call: "app.services.mirror.TopicMirror.replicate"
+          channel:
+            kind: kafka_topic
+            name_from: { enum: "app.topics.DocTopicName" }
       http_clients:
         # Gap 1: decorator-route HTTP client SDK -- path lives in @path_template,
         # verb in Request(Method.X, ...), the call itself behind driver indirection.
@@ -33,6 +69,18 @@ services:
           route_from: { decorator: "path_template", arg: 0 }
           call: "driver.fetch_content"
           verb_from: { request_ctor: "Request", enum: "Method" }
+        # M7 T3 auto-anchor + T5 request_ctor alternatives: NO base_url on purpose
+        # -- the target service is recovered from StatusClient's OWN
+        # `self.host = config.worker_url` ctor assignment (host_attr defaults to
+        # "host"), joined through ClassAttrIndex.field_by_name -> SERVICE_WORKER_URL
+        # -> env_sources map -> worker. The verb ctor is the ProxyRequest
+        # subclass, matched only via the "|"-alternatives spelling (T5).
+        - name: status-client-proxy-sdk
+          file_glob: "**/clients/status_client.py"
+          class_glob: "*Client"
+          route_from: { decorator: "path_template", arg: 0 }
+          call: "driver.fetch_content"
+          verb_from: { request_ctor: "Request|ProxyRequest", enum: "Method" }
   - name: worker
     path: ./services/worker
     http: { base_url_env: WORKER_URL }
