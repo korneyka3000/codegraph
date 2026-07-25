@@ -302,7 +302,14 @@ def print_report(report: dict, console: Console) -> None:
             # hop -- see linking/router_prefix.py's own docstring), so it fell back
             # to its local-only template. Same "always present, 0 when nothing
             # failed" convention as calls_http_unresolved just above.
-            f"route_prefix_unresolved = {linking.get('route_prefix_unresolved', 0)}"
+            f"route_prefix_unresolved = {linking.get('route_prefix_unresolved', 0)}, "
+            # M8 T2 (rerun-2 R5): linking.signal_send.link's own honest-miss counter
+            # -- a temporal_signal_send claim (temporal_ext.py's typed-sender arg0
+            # resolution, `handle.signal(Cls.method, ...)`) whose own method_symbol
+            # resolved but names no method with a live CONSUMES edge into a
+            # temporal_signal channel -- see linking/signal_send.py's own docstring.
+            # Same "always present, 0-defaulted" convention as route_prefix_unresolved.
+            f"signal_send_unlinked = {linking.get('signal_send_unlinked', 0)}"
         )
 
     # M3 T6 (additive, same "absent -> strict no-op" contract as linking above):

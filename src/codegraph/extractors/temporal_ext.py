@@ -259,13 +259,101 @@ unlike every OTHER edge this module emits.
     the same "channels are the legal bridge" property kafka/http_route channels
     already rely on.
 
-    Neither side here uses `ctx.ref_symbol_lookup` at all (unlike INVOKES_ACTIVITY/
-    start_workflow above, both scip-ref-resolved) -- handler-side identity comes from
-    decorator TEXT (a literal or the method's own name), sender-side identity comes
-    from `consts.resolve_arg` (module-level literals only) -- so signal/update/query
-    extraction resolves IDENTICALLY under real SCIP and under the degraded heuristic
-    fallback, needing no stubbed-lookup unit/integration split the way DEPENDS_ON or
-    INVOKES_ACTIVITY do.
+    Handler-side identity comes from decorator TEXT (a literal or the method's own
+    name) -- unaffected by M8 T2 below, still no ref_symbol_lookup involved, still
+    resolves identically under real SCIP and the degraded heuristic fallback.
+    Sender-side identity, THROUGH M7, came ONLY from `consts.resolve_arg` (module-
+    level literals only), the same real-SCIP/degraded-fallback-identical property.
+    M8 T2 (rerun-2 R5, below) adds a SECOND, `ctx.ref_symbol_lookup`-based resolution
+    path for the typed-method-reference shape -- so this paragraph's claim no longer
+    holds for the sender side as originally stated: a typed
+    `handle.signal(Cls.method, ...)` call now resolves under real SCIP (via
+    ref_symbol_lookup, exactly like INVOKES_ACTIVITY) but NOT under the degraded
+    fallback (which never lays a ref at an ARGUMENT span -- the same documented gap
+    INVOKES_ACTIVITY/start_workflow already carry, see
+    test_pipeline_analyze.py::test_analyze_temporal_active_degraded_fallback_cannot_
+    resolve_invokes_activity for the parallel case). The STRING-literal/module-const
+    sender path is completely unaffected and still resolves identically either way.
+
+M8 T2 (rerun-2 R5, docs/superpowers/reports/2026-07-24-pilot-rerun-2-open-gaps.md):
+real Temporal code overwhelmingly uses the canonical TYPED sender API -- a bound-
+method/function REFERENCE as arg0, not a string -- e.g.
+`handle.signal(PartnerProfileWorkflow.complete_survey, payload)` (attr-shaped) or a
+bare-name imported method, `handle.signal(step_other_evidence_update, payload)`
+(name-shaped) -- which `_resolve_signal_arg0`'s PRE-EXISTING `consts.resolve_arg`
+call can never resolve (consts.py only ever knows MODULE-LEVEL STRING LITERALS; a
+class-method attr chain or an imported function name is neither): every real M7 T4
+sender site landed in `signal_name_unresolved` before this task (rerun-2's own
+evidence: 18 of 18 real send-sites, PRODUCES into temporal_signal channels == 0,
+even though 25 handler channels already existed to pair them with).
+
+Why this is solvable WITHOUT any receiver-type check (this matcher still has none --
+see the FP-risk section above, unchanged by this task): the target CHANNEL NAME is
+already fully known from the OTHER side. The referenced method itself carries
+`@workflow.signal(name=...)` (or falls back to its own method name), and the
+handler-side path above (`_extract_signal_kind_roles`) already turns that into a
+`chan:temporal_signal:<name>` CONSUMES edge. This task only needs to connect arg0 to
+THAT method's IDENTITY -- the channel name itself is never re-derived here, and
+never will be re-derived in this file at all (see below).
+
+Design (the brief's fix direction (a), "claim + линковка" -- explicitly preferred
+over its own alternative (b), an in-file fast path keying off a same-file decorator:
+a typed reference is routinely CROSS-FILE -- `PartnerProfileWorkflow` imported from
+another module entirely, frequently a DIFFERENT service via
+`get_external_workflow_handle` -- so an in-file-only fast path would silently miss
+the overwhelming majority of real sites). `_resolve_signal_arg0`'s own three-way
+split is UNCHANGED, byte-for-byte: the string-literal branch and the "a bare NAME
+resolves through the file's own ConstTable to a module-level string constant"
+branch (`SIGNAL_NAME = "x"; handle.signal(SIGNAL_NAME, ...)`) both keep the EXACT
+SAME heuristic/0.6 direct-PRODUCES-edge behavior as before this task. ONLY when
+THAT resolution fails (arg0 IS name/attr-shaped -- so it still LOOKS like a
+signal-name reference -- but names no known constant) does `_extract_signal_senders`
+now attempt a SECOND resolution: `_resolve_ref` on arg0's own span
+(`arg0.name_start_byte` -- already exactly the right span for both "attr" and
+"name" value_kinds, per T2's contract -- no new span arithmetic needed) -- the
+IDENTICAL helper/span convention `_extract_invokes_activity` already uses for
+`execute_activity(fn_ref, ...)`'s own arg0.
+
+Resolved -> a `sym:`-id method node. UNLIKE invokes_activity/start_workflow, though,
+this file does NOT itself know whether that method is even a signal handler, let
+alone which channel (or service) it answers to -- that fact lives in a DIFFERENT
+file's decorator, possibly a different service entirely -- so no edge is ever
+emitted here. Instead, a `temporal_signal_send` CLAIM is appended: `{src_id:
+<the sender's own enclosing-method node id>, method_symbol: <the resolved node id>,
+evidence_line}` (staged per-file via `staging.add_claims`, the SAME deferred-write
+pattern `temporal_start_mark` already established two sections above -- see that
+paragraph for why a claim, not a direct edge, is the right shape whenever one
+extractor pass can't see everything a fact requires). `TemporalResult` gains a
+SEPARATE `signal_send_claims` field for this -- kept apart from the pre-existing
+`claims` field (which stays temporal_start_mark-only, untouched) rather than merged
+into one flat list conflating two unrelated claim shapes -- mirrors fastapi_ext.py's
+own multi-typed-claim-list precedent (`route_decl_claims`/`router_include_claims`/
+`router_decl_claims`), each claim kind staged under its own `kind` string by
+analyze.py.
+
+Still genuinely unresolvable (arg0 IS name/attr-shaped, but NEITHER consts NOR
+ref_symbol_lookup can name anything -- a true runtime variable, or a real SCIP miss)
+-> the PRE-EXISTING `signal_name_unresolved` counter, unchanged semantics: this task
+narrows WHEN that bucket is reached (a real typed method reference no longer falls
+into it), it does not touch what falls into it once every resolution avenue is
+exhausted. A new stats key, `signal_sender_symbol_resolved` (mirrors
+`invokes_activity_resolved`/`start_workflow_resolved`'s own "a claim was
+successfully emitted" naming precedent -- NOT promoted to the per-service report,
+same as those two: see pipeline/analyze.py's own `temporal_stats` dict, which has
+only ever surfaced `signal_name_unresolved`), counts a successful claim emission
+SEPARATELY from `signal_sender_resolved` (which keeps its PRE-EXISTING meaning -- a
+literal/const NAME resolved straight to a direct edge -- completely untouched).
+
+The other half of this fix -- turning a `temporal_signal_send` claim into a real
+PRODUCES edge -- is deliberately NOT this file's job: see `linking/signal_send.py`
+(S7, wired into `linking.workspace.link_workspace` before `segments.derive`) for the
+full algorithm (a workspace-wide CONSUMES lookup keyed by the claim's own
+`method_symbol`; the honesty rule for a resolved-but-not-a-handler symbol --
+`signal_send_unlinked`, no edge, no guessing; the dedup argument for repeat call
+sites). This split mirrors `temporal_start_mark`'s own S5/S7 division of labor
+exactly: extraction resolves everything IT can see (here: the sender's OWN identity
+and the target method's SYMBOL) and stops there -- cross-file/cross-service channel
+membership is a workspace-wide fact no single-file S5 pass can ever answer honestly.
 """
 
 from __future__ import annotations
@@ -323,6 +411,15 @@ class TemporalResult:
     channels: list[NodeRec]
     edges: list[EdgeRec]
     claims: list[dict]
+    # M8 T2 (rerun-2 R5): `temporal_signal_send` claims -- typed-sender arg0
+    # (attr/name-shaped, resolved via ctx.ref_symbol_lookup to a METHOD SYMBOL node
+    # id) {src_id, method_symbol, evidence_line}, consumed by linking/signal_send.py
+    # (S7) to pair with the handler's own CONSUMES edge. Kept SEPARATE from `claims`
+    # above (which stays temporal_start_mark-only, unchanged) rather than merged into
+    # one flat list -- mirrors fastapi_ext's own multi-typed-claim-list precedent
+    # (route_decl_claims/router_include_claims/router_decl_claims), each staged under
+    # its own claim `kind` by analyze.py. See module docstring's M8 T2 section.
+    signal_send_claims: list[dict]
     stats: dict[str, int]
 
 
@@ -342,6 +439,12 @@ def _stats() -> dict[str, int]:
         # temporal_signal channel a handler CONSUMES from.
         "signal_sender_missing_node_id": 0,
         "signal_sender_resolved": 0,
+        # M8 T2 (rerun-2 R5): arg0 resolved via ctx.ref_symbol_lookup to a METHOD
+        # SYMBOL (a typed `Cls.method`/bare-name reference) -- a `temporal_signal_send`
+        # claim was emitted, NOT a direct edge (see module docstring). Deliberately
+        # separate from `signal_sender_resolved` above, which keeps its PRE-EXISTING
+        # meaning (a literal/const NAME resolved straight to a direct edge).
+        "signal_sender_symbol_resolved": 0,
         "signal_name_unresolved": 0,
     }
 
@@ -535,14 +638,28 @@ def _resolve_signal_arg0(arg0: ArgFact | None, consts: ConstTable) -> tuple[str 
 
 def _extract_signal_senders(
     ctx: FileContext, node_ids: dict[int, str], consts: ConstTable,
-    channels: list[NodeRec], edges: list[EdgeRec], stats: dict[str, int],
+    channels: list[NodeRec], edges: list[EdgeRec], claims: list[dict],
+    stats: dict[str, int],
 ) -> None:
     """`<handle>.signal("<name>", ...)` / `get_external_workflow_handle(...).
     signal(...)` -- ANY receiver except the ONE exact-name exclusion below (mirrors
     `_extract_start_workflow_claims`'s own no-positive-receiver-check precedent),
     callee_name == "signal" exactly -> PRODUCES into the SAME temporal_signal
     channel a handler CONSUMES from. See module docstring (M7 T4) for the residual
-    FP-risk this deliberately accepts."""
+    FP-risk this deliberately accepts.
+
+    M8 T2 (rerun-2 R5): arg0 resolution is now a TWO-STAGE attempt, not one.
+    `_resolve_signal_arg0` (UNCHANGED) still owns the string-literal and
+    module-const-name paths -- when it returns a usable `name`, this function takes
+    the SAME direct-PRODUCES-edge branch as before this task, byte-identical. Only
+    when it does NOT (arg0 is name/attr-shaped but names no known constant) does
+    this function now try a SECOND resolution, `_resolve_ref` on arg0's own span --
+    the identical helper/span convention `_extract_invokes_activity` above uses --
+    to catch a TYPED method reference (`handle.signal(Cls.method, ...)`, or a
+    bare-name imported method). Resolved -> a `temporal_signal_send` claim (NEVER a
+    direct edge -- this file can't see the handler side); still unresolved -> the
+    PRE-EXISTING `signal_name_unresolved` counter, same bucket as before this task.
+    See module docstring's M8 T2 section for the full design."""
     for call in ctx.facts.calls:
         if call.callee_name != "signal":
             continue
@@ -564,20 +681,35 @@ def _extract_signal_senders(
         if enclosing_id is None:
             stats["signal_sender_missing_node_id"] += 1
             continue
-        name, counts_as_miss = _resolve_signal_arg0(_arg0(call), consts)
-        if name is None:
-            if counts_as_miss:
-                stats["signal_name_unresolved"] += 1
+        arg0 = _arg0(call)
+        name, counts_as_miss = _resolve_signal_arg0(arg0, consts)
+        if name is not None:
+            chan = make_channel_node("temporal_signal", name=name)
+            channels.append(chan)
+            edges.append(EdgeRec(
+                src=enclosing_id, dst=chan.id, type="PRODUCES",
+                resolution="heuristic", confidence=0.6, extractor=_EXTRACTOR,
+                evidence_file=ctx.relpath, evidence_line=call.start_line,
+                props={"mechanism": "temporal_signal"},
+            ))
+            stats["signal_sender_resolved"] += 1
             continue
-        chan = make_channel_node("temporal_signal", name=name)
-        channels.append(chan)
-        edges.append(EdgeRec(
-            src=enclosing_id, dst=chan.id, type="PRODUCES",
-            resolution="heuristic", confidence=0.6, extractor=_EXTRACTOR,
-            evidence_file=ctx.relpath, evidence_line=call.start_line,
-            props={"mechanism": "temporal_signal"},
-        ))
-        stats["signal_sender_resolved"] += 1
+        # M8 T2 (rerun-2 R5): a second resolution attempt, ONLY for name/attr-shaped
+        # arg0 that _resolve_signal_arg0 just failed to resolve to a literal/const
+        # NAME above -- see this function's own docstring and the module docstring's
+        # M8 T2 section for the full rationale.
+        if arg0 is not None and arg0.value_kind in ("name", "attr"):
+            method_symbol = _resolve_ref(ctx, arg0.name_start_byte)
+            if method_symbol is not None:
+                claims.append({
+                    "src_id": enclosing_id,
+                    "method_symbol": method_symbol,
+                    "evidence_line": call.start_line,
+                })
+                stats["signal_sender_symbol_resolved"] += 1
+                continue
+        if counts_as_miss:
+            stats["signal_name_unresolved"] += 1
 
 
 def extract_temporal(
@@ -588,6 +720,7 @@ def extract_temporal(
     channels: list[NodeRec] = []
     edges: list[EdgeRec] = []
     claims: list[dict] = []
+    signal_send_claims: list[dict] = []
     stats = _stats()
 
     _extract_defn_roles(ctx, node_ids, roles, node_props, stats)
@@ -598,9 +731,11 @@ def extract_temporal(
             ctx, node_ids, pattern, signal_kind, roles, node_props, channels, edges, stats,
         )
     _extract_query_roles(ctx, node_ids, roles, node_props, stats)
-    _extract_signal_senders(ctx, node_ids, consts, channels, edges, stats)
+    _extract_signal_senders(
+        ctx, node_ids, consts, channels, edges, signal_send_claims, stats,
+    )
 
     return TemporalResult(
         roles=roles, node_props=node_props, channels=channels, edges=edges,
-        claims=claims, stats=stats,
+        claims=claims, signal_send_claims=signal_send_claims, stats=stats,
     )

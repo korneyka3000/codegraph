@@ -458,6 +458,14 @@ def _extract_join_and_stage(
                 # temporal_start_mark: per-file claim, consumed later by S7 (T7) via
                 # staging.claims_for + update_edge_props on the matching CALLS edge.
                 staging.add_claims(svc.name, rp, "temporal_start_mark", tr.claims)
+                # M8 T2 (rerun-2 R5): temporal_signal_send -- a SEPARATE per-file
+                # claim kind (typed-sender arg0 resolved to a method SYMBOL, not yet
+                # a channel), consumed later by S7's linking/signal_send.py via
+                # staging.claims_for + a workspace-wide CONSUMES lookup keyed by that
+                # symbol.
+                staging.add_claims(
+                    svc.name, rp, "temporal_signal_send", tr.signal_send_claims,
+                )
                 for key in temporal_stats:
                     temporal_stats[key] += tr.stats[key]
 

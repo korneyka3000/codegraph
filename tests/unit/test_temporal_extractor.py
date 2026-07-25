@@ -116,13 +116,15 @@ def _def(ctx: FileContext, name: str):
 
 def test_temporal_result_field_shape():
     r = TemporalResult(
-        roles={}, node_props={}, channels=[], edges=[], claims=[], stats={},
+        roles={}, node_props={}, channels=[], edges=[], claims=[], signal_send_claims=[],
+        stats={},
     )
     assert r.roles == {}
     assert r.node_props == {}
     assert r.channels == []
     assert r.edges == []
     assert r.claims == []
+    assert r.signal_send_claims == []
     assert r.stats == {}
 
 
@@ -130,7 +132,8 @@ def test_no_decorators_or_temporal_calls_is_a_noop():
     ctx, node_ids, consts = _load("m.py", "svc", b"def plain():\n    pass\n")
     result = extract_temporal(ctx, node_ids, consts)
     assert result == TemporalResult(
-        roles={}, node_props={}, channels=[], edges=[], claims=[], stats=result.stats,
+        roles={}, node_props={}, channels=[], edges=[], claims=[], signal_send_claims=[],
+        stats=result.stats,
     )
 
 
@@ -736,6 +739,10 @@ def test_signal_sender_missing_node_id_skips_gracefully():
     assert not any(e.type == "PRODUCES" for e in result.edges)
     assert result.channels == []  # M7 T4 review: parity with the handler-side sibling
     assert result.stats["signal_sender_missing_node_id"] == 1
+    # M8 T2 (rerun-2 R5): the missing-node-id guard fires BEFORE arg0 is even
+    # inspected, so it must short-circuit the new claim path exactly as it already
+    # does the direct-edge path above.
+    assert result.signal_send_claims == []
 
 
 EXTERNAL_HANDLE_SIGNAL_SRC = b'''async def notify(wf_id):
@@ -919,3 +926,175 @@ def test_stdlib_signal_signal_receiver_filtered_no_edge_no_counter():
     assert not any(e.type == "PRODUCES" for e in result.edges)
     assert result.stats["signal_name_unresolved"] == 0
     assert result.stats["signal_sender_resolved"] == 0
+
+
+# =========================================================================================
+# M8 T2 (rerun-2 R5, docs/superpowers/reports/2026-07-24-pilot-rerun-2-open-gaps.md):
+# typed signal senders -- `handle.signal(Cls.method, payload)` / a bare-name imported
+# method arg0. `_resolve_signal_arg0`'s pre-existing consts-only resolution NEVER
+# matches either shape (consts.py only knows module-level STRING literals) -- these
+# arg0s are attr/name-shaped, so they fall through to a SECOND resolution attempt:
+# `_resolve_ref` on arg0's own span, the exact same helper/span convention
+# `_extract_invokes_activity` already uses for `execute_activity(fn_ref, ...)`.
+# Resolved -> a `temporal_signal_send` CLAIM {src_id, method_symbol, evidence_line} --
+# NEVER a direct edge (this file alone can't see whether that symbol is even a signal
+# handler, let alone which channel/service it belongs to) -- linking (S7,
+# linking/signal_send.py) pairs it with the handler's own CONSUMES edge later. The
+# string-literal/module-const-name paths above are completely UNCHANGED (same
+# _resolve_signal_arg0 call, same early-return branch); only the case where THAT
+# resolution fails now gets a second chance here before conceding
+# signal_name_unresolved.
+# =========================================================================================
+
+TYPED_SIGNAL_SENDER_ATTR_SRC = b'''class PartnerProfileWorkflow:
+    @workflow.signal(name="complete-survey")
+    async def complete_survey(self, payload):
+        pass
+
+
+async def notify(handle, payload):
+    await handle.signal(PartnerProfileWorkflow.complete_survey, payload)
+'''
+
+
+def test_signal_sender_attr_arg0_resolves_via_ref_symbol_lookup_to_claim():
+    """The real R5 shape: `handle.signal(Cls.method, payload)` -- arg0 is
+    attr-shaped and names no module-level const, so resolution must fall through to
+    ref_symbol_lookup on arg0's own span -- producing a CLAIM, never a direct edge
+    (the channel name lives on the handler side, in this SAME file here but that is
+    incidental -- the real case is cross-file, see the bare-name/cross-file tests
+    below)."""
+    ctx0, _, _ = _load("m.py", "svc", TYPED_SIGNAL_SENDER_ATTR_SRC)
+    call = next(c for c in ctx0.facts.calls if c.callee_name == "signal")
+    arg0 = next(a for a in call.args if a.index == 0)
+    assert arg0.value_kind == "attr"
+    span = arg0.name_start_byte
+    target_sym = "scip-python python svc 0.0 `m`/PartnerProfileWorkflow#complete_survey()."
+    target_id = "sym:svc:`m`/PartnerProfileWorkflow#complete_survey()."
+
+    def ref_lookup(rp, sb):
+        return target_sym if (rp, sb) == ("m.py", span) else None
+
+    ctx, node_ids, consts = _load(
+        "m.py", "svc", TYPED_SIGNAL_SENDER_ATTR_SRC, ref_symbol_lookup=ref_lookup,
+    )
+    result = extract_temporal(ctx, node_ids, consts)
+    sender_id = node_ids[_def(ctx, "notify").index]
+
+    # NEVER a direct edge -- the channel name lives on the handler side only.
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.stats["signal_name_unresolved"] == 0
+    assert result.stats["signal_sender_symbol_resolved"] == 1
+    assert result.stats["signal_sender_resolved"] == 0  # NOT the literal-name counter
+
+    assert len(result.signal_send_claims) == 1
+    assert result.signal_send_claims[0] == {
+        "src_id": sender_id, "method_symbol": target_id, "evidence_line": call.start_line,
+    }
+
+
+BARE_NAME_IMPORTED_METHOD_SRC = b'''from app.workflows.survey import step_other_evidence_update
+
+
+async def notify(handle, update_input):
+    await handle.signal(step_other_evidence_update, update_input)
+'''
+
+
+def test_signal_sender_bare_name_imported_method_resolves_via_ref_symbol_lookup_to_claim():
+    """Bare-name arg0 (an imported function/method reference, no attribute dots at
+    all -- brief's own second real-code example) -- the SAME ref_symbol_lookup path
+    as the attr-shaped case above, just through ArgFact's "name" value_kind instead
+    of "attr" (mirrors INVOKES_ACTIVITY's own name-vs-attr-agnostic arg0
+    resolution, see _resolve_ref/_arg0 above)."""
+    ctx0, _, _ = _load("m.py", "svc", BARE_NAME_IMPORTED_METHOD_SRC)
+    call = next(c for c in ctx0.facts.calls if c.callee_name == "signal")
+    arg0 = next(a for a in call.args if a.index == 0)
+    assert arg0.value_kind == "name"
+    span = arg0.name_start_byte
+    target_sym = (
+        "scip-python python svc 0.0 `app.workflows.survey`/step_other_evidence_update()."
+    )
+    target_id = "sym:svc:`app.workflows.survey`/step_other_evidence_update()."
+
+    def ref_lookup(rp, sb):
+        return target_sym if (rp, sb) == ("m.py", span) else None
+
+    ctx, node_ids, consts = _load(
+        "m.py", "svc", BARE_NAME_IMPORTED_METHOD_SRC, ref_symbol_lookup=ref_lookup,
+    )
+    result = extract_temporal(ctx, node_ids, consts)
+    sender_id = node_ids[_def(ctx, "notify").index]
+
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.stats["signal_name_unresolved"] == 0
+    assert result.stats["signal_sender_symbol_resolved"] == 1
+    assert len(result.signal_send_claims) == 1
+    assert result.signal_send_claims[0] == {
+        "src_id": sender_id, "method_symbol": target_id, "evidence_line": call.start_line,
+    }
+
+
+UNRESOLVABLE_ATTR_SIGNAL_SRC = b'''async def notify(handle, payload):
+    await handle.signal(some_module.SomeClass.some_method, payload)
+'''
+
+
+def test_signal_sender_attr_arg0_unresolvable_symbol_bumps_counter_no_claim_no_edge():
+    """arg0 IS attr-shaped (looks exactly like a typed method reference) but
+    ref_symbol_lookup genuinely finds nothing for its span (e.g. a real SCIP miss)
+    -- falls back to the SAME honest-miss bucket as before this task
+    (signal_name_unresolved), never a claim. This is the report's own negative pin
+    ("handle.signal(some_runtime_var) -> счётчик, не ребро"), exercised here with a
+    WIRED-but-missing lookup, complementing the pre-existing unwired-lookup variant
+    (test_signal_sender_unresolvable_variable_bumps_counter_no_edge below, which
+    never even attempts ref_symbol_lookup because ctx.ref_symbol_lookup is None)."""
+    ctx, node_ids, consts = _load(
+        "m.py", "svc", UNRESOLVABLE_ATTR_SIGNAL_SRC, ref_symbol_lookup=lambda rp, sb: None,
+    )
+    result = extract_temporal(ctx, node_ids, consts)
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert result.signal_send_claims == []
+    assert result.stats["signal_name_unresolved"] == 1
+    assert result.stats["signal_sender_symbol_resolved"] == 0
+
+
+EXTERNAL_HANDLE_TYPED_SIGNAL_SRC = b'''class ChildWorkflow:
+    @workflow.signal(name="go")
+    async def go(self, payload):
+        pass
+
+
+async def notify(wf_id, payload):
+    await get_external_workflow_handle(wf_id).signal(ChildWorkflow.go, payload)
+'''
+
+
+def test_signal_sender_via_external_workflow_handle_with_typed_method_ref_produces_claim():
+    """`get_external_workflow_handle(...).signal(Cls.method, ...)` -- same
+    receiver-agnostic matcher as the string-literal EXTERNAL_HANDLE test above
+    (_extract_signal_senders never inspects receiver_text at all) -- proves the R5
+    fix reaches this chained-call SHAPE too, not just a plain `handle.signal(...)`;
+    only arg0's own resolution changes, the matcher itself needed no code change."""
+    ctx0, _, _ = _load("m.py", "svc", EXTERNAL_HANDLE_TYPED_SIGNAL_SRC)
+    call = next(c for c in ctx0.facts.calls if c.callee_name == "signal")
+    assert call.receiver_text == "get_external_workflow_handle(wf_id)"
+    arg0 = next(a for a in call.args if a.index == 0)
+    span = arg0.name_start_byte
+    target_sym = "scip-python python svc 0.0 `m`/ChildWorkflow#go()."
+    target_id = "sym:svc:`m`/ChildWorkflow#go()."
+
+    def ref_lookup(rp, sb):
+        return target_sym if (rp, sb) == ("m.py", span) else None
+
+    ctx, node_ids, consts = _load(
+        "m.py", "svc", EXTERNAL_HANDLE_TYPED_SIGNAL_SRC, ref_symbol_lookup=ref_lookup,
+    )
+    result = extract_temporal(ctx, node_ids, consts)
+    sender_id = node_ids[_def(ctx, "notify").index]
+
+    assert not any(e.type == "PRODUCES" for e in result.edges)
+    assert len(result.signal_send_claims) == 1
+    assert result.signal_send_claims[0] == {
+        "src_id": sender_id, "method_symbol": target_id, "evidence_line": call.start_line,
+    }

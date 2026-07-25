@@ -535,6 +535,29 @@ def test_print_report_linking_line_defaults_route_prefix_unresolved_to_zero_when
     assert "route_prefix_unresolved = 0" in text
 
 
+def test_print_report_shows_signal_send_unlinked_on_linking_line():
+    """M8 T2 (rerun-2 R5): signal_send_unlinked joins the linking summary line, same
+    "always present, 0-defaulted" convention as route_prefix_unresolved."""
+    link_stats_with_signal_send = {**LINK_STATS, "signal_send_unlinked": 3}
+    report = build_report([SERVICE_OK], LOAD_STATS, link_stats_with_signal_send)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+
+    assert "signal_send_unlinked" in text
+    assert "3" in text
+
+
+def test_print_report_linking_line_defaults_signal_send_unlinked_to_zero_when_absent():
+    """A link_stats dict predating M8 T2 (no signal_send_unlinked key at all) must
+    not KeyError -- the line just shows 0."""
+    report = build_report([SERVICE_OK], LOAD_STATS, LINK_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise
+    text = console.export_text()
+    assert "signal_send_unlinked = 0" in text
+
+
 def test_print_report_no_linking_line_when_absent():
     """Backward compatibility: a report built without link_stats (or hand-built without
     a "linking" key at all, as every pre-T7 report was) must not print anything new."""

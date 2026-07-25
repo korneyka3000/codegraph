@@ -307,6 +307,9 @@ def test_link_workspace_returns_all_expected_counter_keys(tmp_path):
         # linking/router_prefix.py's own docstring for the four failure shapes it
         # counts.
         "route_prefix_unresolved",
+        # M8 T2 (rerun-2 R5): linking.signal_send.link's own honest-miss counter --
+        # see linking/signal_send.py's own docstring.
+        "signal_send_unlinked",
     }
 
 
@@ -335,3 +338,53 @@ def test_link_workspace_propagates_part_of_process_ambiguous_count(tmp_path):
     report = link_workspace(cfg, st)
 
     assert report["part_of_process_ambiguous"] == 1
+
+
+# -- M8 T2 (rerun-2 R5): linking.signal_send.link runs before segments.derive --
+
+
+def test_link_workspace_links_signal_send_claim_and_feeds_segments_derive(tmp_path):
+    """temporal_signal_send claim + a pre-staged CONSUMES(handler -> channel) edge
+    (temporal_ext.py's own S5 handler-side emission) must produce a PRODUCES(sender
+    -> channel) edge AND feed straight into segments.derive's own exact-channel
+    pairing -- proving linking.signal_send.link runs BEFORE segments.derive, not
+    just that it runs at all (see linking/signal_send.py's own module docstring for
+    why this ordering is load-bearing)."""
+    st = Staging(tmp_path / "s.db")
+    chan = make_channel_node("temporal_signal", name="complete-survey")
+    sender = _fn("sym:worker:notify", "worker", "notify", "q.notify")
+    handler = _fn("sym:gateway:complete_survey", "gateway", "complete_survey", "q.cs")
+    st.upsert_nodes([chan, sender, handler])
+    st.upsert_edges(
+        [_edge(handler.id, chan.id, "CONSUMES", extractor="temporal")],
+        origin_service="gateway",
+    )
+    st.add_claims("worker", "app/consumers/doc.py", "temporal_signal_send", [{
+        "src_id": sender.id, "method_symbol": handler.id, "evidence_line": 5,
+    }])
+
+    report = link_workspace(_cfg(), st)
+
+    assert report["signal_send_unlinked"] == 0
+    produces = next(e for e in st.iter_edges() if e.type == "PRODUCES")
+    assert (produces.src, produces.dst) == (sender.id, chan.id)
+    assert produces.resolution == "static" and produces.confidence == 1.0
+
+    assert report["next_segments"] == 1
+    next_seg = next(e for e in st.iter_edges() if e.type == "NEXT_SEGMENT")
+    assert (next_seg.src, next_seg.dst) == (sender.id, handler.id)
+
+
+def test_link_workspace_signal_send_unlinked_counter_propagates(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    sender = _fn("sym:worker:notify", "worker", "notify", "q.notify")
+    st.upsert_nodes([sender])
+    st.add_claims("worker", "app/consumers/doc.py", "temporal_signal_send", [{
+        "src_id": sender.id, "method_symbol": "sym:gateway:`app.x`/NotAHandler#m().",
+        "evidence_line": 1,
+    }])
+
+    report = link_workspace(_cfg(), st)
+
+    assert report["signal_send_unlinked"] == 1
+    assert not any(e.type == "PRODUCES" for e in st.iter_edges())
