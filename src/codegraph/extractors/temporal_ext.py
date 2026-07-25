@@ -299,10 +299,11 @@ never will be re-derived in this file at all (see below).
 Design (the brief's fix direction (a), "claim + линковка" -- explicitly preferred
 over its own alternative (b), an in-file fast path keying off a same-file decorator:
 a typed reference is routinely CROSS-FILE -- `PartnerProfileWorkflow` imported from
-another module entirely, frequently a DIFFERENT service via
-`get_external_workflow_handle` -- so an in-file-only fast path would silently miss
-the overwhelming majority of real sites). `_resolve_signal_arg0`'s own three-way
-split is UNCHANGED, byte-for-byte: the string-literal branch and the "a bare NAME
+another module entirely -- so an in-file-only fast path would silently miss the
+overwhelming majority of real sites; cross-file within ONE service is the case that
+matters here, see the cross-SERVICE TRACKED LIMITATION below).
+`_resolve_signal_arg0`'s own three-way split is UNCHANGED, byte-for-byte: the
+string-literal branch and the "a bare NAME
 resolves through the file's own ConstTable to a module-level string constant"
 branch (`SIGNAL_NAME = "x"; handle.signal(SIGNAL_NAME, ...)`) both keep the EXACT
 SAME heuristic/0.6 direct-PRODUCES-edge behavior as before this task. ONLY when
@@ -331,6 +332,26 @@ own multi-typed-claim-list precedent (`route_decl_claims`/`router_include_claims
 `router_decl_claims`), each claim kind staged under its own `kind` string by
 analyze.py.
 
+TRACKED LIMITATION (M8 T2 review Important-1) -- cross-SERVICE typed sends do NOT
+resolve through this mechanism: `_resolve_ref` stamps ctx.service -- the SENDER's
+own service -- into the resolved node id (`symbol_to_node_id(ctx.service, ...)`,
+package-blind by design, see resolvers/scip/symbols.py), so a typed reference to
+ANOTHER service's method -- expressible at all only when that service's code is
+importable from this one (a monorepo layout; separate-repo services, the pilot's
+own layout, cannot even write the shape) -- resolves to a `sym:<sender-service>:...`
+id that linking/signal_send.py's CONSUMES map (keyed by the HANDLER service's own
+`sym:<handler-service>:...` id) can never match. Such a claim lands honestly in
+`signal_send_unlinked` at link time -- never a wrong edge (fails safe). Real
+cross-service signaling instead uses
+`get_external_workflow_handle(wf_id).signal("<name>", ...)` with a STRING --
+precisely because the foreign class isn't importable -- which the unchanged
+string-literal path above already fully covers (heuristic/0.6, the channel as the
+legal cross-service bridge; the pilot's only cross-service signal is exactly this
+shape, fixtures/realstack's worker->gateway "doc-approved"). Lifting this would
+need a package-aware symbol->service mapping inside `_resolve_ref` -- deliberately
+out of scope, the same honesty-over-guessing reasoning as http_client_ext.py's own
+inherited-self.host TRACKED LIMITATION (M7 T3 review Important-2).
+
 Still genuinely unresolvable (arg0 IS name/attr-shaped, but NEITHER consts NOR
 ref_symbol_lookup can name anything -- a true runtime variable, or a real SCIP miss)
 -> the PRE-EXISTING `signal_name_unresolved` counter, unchanged semantics: this task
@@ -352,8 +373,8 @@ full algorithm (a workspace-wide CONSUMES lookup keyed by the claim's own
 `signal_send_unlinked`, no edge, no guessing; the dedup argument for repeat call
 sites). This split mirrors `temporal_start_mark`'s own S5/S7 division of labor
 exactly: extraction resolves everything IT can see (here: the sender's OWN identity
-and the target method's SYMBOL) and stops there -- cross-file/cross-service channel
-membership is a workspace-wide fact no single-file S5 pass can ever answer honestly.
+and the target method's SYMBOL) and stops there -- cross-file channel membership is
+a workspace-wide fact no single-file S5 pass can ever answer honestly.
 """
 
 from __future__ import annotations

@@ -129,13 +129,23 @@ def test_consumes_edge_into_non_temporal_signal_channel_does_not_satisfy_the_cla
     assert not any(e.type == "PRODUCES" for e in st.iter_edges())
 
 
-# -- cross-file / cross-service: handler in service B, sender claim from service A --
+# -- linking-layer bridge property (NOT a reachable cross-service extraction state) --
 
 
-def test_cross_service_sender_and_handler_link_through_the_channel(tmp_path):
-    """sym-to-sym directly would be forbidden by staging's own cross-service
-    invariant, but this edge's dst is chan:-prefixed -- upsert_edges exempts it
-    unconditionally (see Staging.upsert_edges' own docstring)."""
+def test_linking_layer_bridges_channel_regardless_of_services(tmp_path):
+    """Pins the LINKING layer's own service-agnosticism, in isolation: the CONSUMES
+    map is workspace-wide, and the created PRODUCES' chan:-prefixed dst passes
+    upsert_edges' cross-service invariant unconditionally (sym-to-sym directly
+    would be forbidden; the channel is the legal bridge). The foreign-service
+    method id below is HAND-CRAFTED -- real extraction can never produce it:
+    temporal_ext._resolve_ref stamps the SENDER's own service into method_symbol
+    (symbol_to_node_id(ctx.service, ...)), so a REAL cross-service typed send
+    resolves to a sym:<sender-svc>:... id, matches nothing here, and lands in
+    signal_send_unlinked -- the TRACKED LIMITATION documented in both
+    temporal_ext.py and linking/signal_send.py (M8 T2 review Important-1). This
+    pin therefore proves the linking-side bridge ALONE: if the extraction-side
+    limitation is ever lifted (a package-aware symbol->service mapping), no
+    linking change will be needed."""
     st = Staging(tmp_path / "s.db")
     chan = make_channel_node("temporal_signal", name="doc-approved")
     sender = _fn(SENDER_SYMBOL, "worker")
@@ -182,11 +192,15 @@ def test_two_call_sites_in_same_sender_method_collapse_to_one_edge(tmp_path):
     """Two `.signal(WF.go, ...)` call sites inside the SAME enclosing method emit
     TWO temporal_signal_send claims sharing the identical (src_id, method_symbol)
     pair -- both compose the SAME (src, dst) PRODUCES edge, which staging's own PK
-    (src, dst, type, via_channel, origin_service) collapses to one row, last-claim
-    evidence winning. Documented, accepted property (mirrors temporal_ext.py's OWN
-    pre-existing multi-call-site dedup, see its module docstring's "No cross-
-    request dedup" paragraph) -- the EDGE (a PRODUCES relationship exists) is what
-    matters, not which one of N identical call sites' own evidence_line survives."""
+    (src, dst, type, via_channel, origin_service) collapses to one row. The
+    surviving evidence is the lexicographically-LAST payload_json's (claims_for
+    orders rows by (service, relpath, payload_json) -- byte-deterministic across
+    runs, NOT source-order): here `{"evidence_line": 9, ...}` sorts after
+    `{"evidence_line": 3, ...}`, so line 9 survives. Documented, accepted property
+    (mirrors temporal_ext.py's OWN pre-existing multi-call-site dedup, see its
+    module docstring's "No cross-request dedup" paragraph) -- the EDGE (a PRODUCES
+    relationship exists) is what matters, not which one of N identical call sites'
+    own evidence_line survives."""
     st = Staging(tmp_path / "s.db")
     chan = make_channel_node("temporal_signal", name="complete-survey")
     sender = _fn(SENDER_SYMBOL, "worker")
@@ -201,7 +215,8 @@ def test_two_call_sites_in_same_sender_method_collapse_to_one_edge(tmp_path):
     assert report == {"signal_send_unlinked": 0}
     produces = [e for e in st.iter_edges() if e.type == "PRODUCES"]
     assert len(produces) == 1
-    assert produces[0].evidence_line == 9  # last-claim wins, staging PK dedup
+    # lexicographically-last payload_json wins (claims_for ORDER BY) via staging PK dedup
+    assert produces[0].evidence_line == 9
 
 
 def test_resolved_symbol_with_two_distinct_consumes_channels_produces_edge_per_channel(tmp_path):

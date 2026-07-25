@@ -40,23 +40,42 @@ the SAME "no guessing, ever" honesty rule every other linking module in this
 codebase already follows (http_routes.py/router_prefix.py's own binding
 constraint).
 
-CROSS-SERVICE sends (sender in service A, handler in service B --
-`get_external_workflow_handle(...).signal(Cls.m, ...)` legitimately crosses
-services): the CONSUMES lookup above is workspace-wide staged state, not scoped to
-any one service, so this needs no special-casing at all -- and the resulting
-PRODUCES edge crosses services ONLY through the channel endpoint
-(`chan:temporal_signal:...`), which `Staging.upsert_edges`'s own cross-service
-invariant already exempts unconditionally (a chan:-prefixed endpoint on either side
-skips the same-service check entirely, see that method's own docstring) -- the
-exact same "channels are the legal bridge" property kafka/http_route channels
-already rely on. Verified by this module's own cross-service test, no staging
-change needed.
+SERVICE SCOPE (M8 T2 review Important-1 -- what is and is NOT covered):
+SAME-SERVICE typed sends -- a consumer/route/workflow in service A signaling
+service A's OWN workflow method; the dominant real shape, and every one of
+rerun-2's 18 real send-sites -- are what this mechanism actually resolves,
+verified end-to-end. Cross-SERVICE TYPED sends are a TRACKED LIMITATION that
+fails safe, NOT a supported path: temporal_ext.py's `_resolve_ref` stamps the
+SENDER's own service into the claim's method_symbol
+(`symbol_to_node_id(ctx.service, ...)`), so the HANDLER service's own
+`sym:<handler-svc>:...`-keyed CONSUMES entry here can never match it -- such a
+claim lands honestly in `signal_send_unlinked`, never a wrong edge (see
+temporal_ext.py's own TRACKED LIMITATION paragraph for the full mechanics, and
+for why real code can rarely even express the shape: the foreign class isn't
+importable across separate repos, and the pilot's only cross-service signal is a
+STRING literal -- fully covered by the extractor's unchanged direct-emission
+path, where the channel already is the legal cross-service bridge). The linking
+layer ITSELF is deliberately service-agnostic regardless: the CONSUMES map is
+workspace-wide, and a PRODUCES edge with a `chan:temporal_signal:...` dst passes
+`Staging.upsert_edges`'s cross-service invariant unconditionally (a
+chan:-prefixed endpoint skips the same-service check entirely, see that method's
+own docstring -- the same "channels are the legal bridge" property
+kafka/http_route channels rely on). Pinned by
+test_linking_layer_bridges_channel_regardless_of_services, which HAND-CRAFTS a
+foreign-service method id precisely because real extraction cannot produce one --
+the pin proves the bridge alone, so if the extraction-side limitation is ever
+lifted (a package-aware symbol->service mapping), no linking change will be
+needed.
 
 DEDUP: PRODUCES' real primary key is (src, dst, type, via_channel, origin_service)
 -- see core/schema.py's SCHEMA_VERSION history "5 -> 6". Two DIFFERENT sender call
 sites sharing the identical (src_id, method_symbol) pair (e.g. two
 `.signal(WF.go, ...)` calls inside the SAME enclosing method) collapse onto ONE
-edge row here (last-claim-processed evidence wins) -- a documented, ACCEPTED
+edge row here -- the surviving evidence is the lexicographically-LAST
+payload_json's (`claims_for` returns rows ordered by (service, relpath,
+payload_json), see stores/staging.py -- so the winner is byte-deterministic
+across runs, though NOT source-order: it is whichever claim's sorted-JSON payload
+string compares last, not the highest evidence_line) -- a documented, ACCEPTED
 evidence-choice, not a correctness bug: the EDGE (a PRODUCES relationship exists
 between this method and this channel) is unaffected by which one of N identical
 call sites' own evidence_line survives, mirroring temporal_ext.py's OWN
