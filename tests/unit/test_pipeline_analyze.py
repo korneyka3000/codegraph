@@ -233,6 +233,7 @@ def test_analyze_fastapi_inactive_by_default_no_route_roles_or_channels(tmp_path
     assert not any(e.type in ("HANDLES", "DEPENDS_ON") for e in st.iter_edges())
     assert st.claims_for("route_decl", "orders-api") == []
     assert st.claims_for("router_include", "orders-api") == []
+    assert st.claims_for("router_decl", "orders-api") == []
 
 
 def test_analyze_fastapi_active_wires_route_roles_and_route_decl_claims(tmp_path):
@@ -283,6 +284,14 @@ def test_analyze_fastapi_active_wires_route_roles_and_route_decl_claims(tmp_path
     assert len(includes) == 1
     assert includes[0]["_relpath"] == "app/main.py"
     assert includes[0]["prefix"] is None  # no prefix= kwarg on that real call site
+    # router_decl (M8 review Important-1): same degraded-path gap as router_symbol
+    # above -- the fallback resolver lays no defs at assignment targets, so every
+    # APIRouter()/FastAPI() assignment's symbol is unresolvable and an unkeyable
+    # claim is deliberately NOT emitted (see fastapi_ext._collect_router_decls).
+    # Under real SCIP both `router` (orders.py) and `app` (main.py) resolve --
+    # proven live by the M2/M6/M7 gates, whose chains now compose THROUGH these
+    # claims (a missing hop decl would discard + count, and the gates re-ran green).
+    assert st.claims_for("router_decl", "orders-api") == []
 
 
 def test_analyze_fastapi_active_degraded_fallback_cannot_resolve_depends_on(tmp_path):
@@ -314,6 +323,7 @@ def test_analyze_non_fastapi_active_idiom_is_a_noop_for_fastapi_wiring(tmp_path)
     assert not any(n.kind == "Channel" for n in st.iter_nodes())
     assert st.claims_for("route_decl", "orders-api") == []
     assert st.claims_for("router_include", "orders-api") == []
+    assert st.claims_for("router_decl", "orders-api") == []
 
 
 # -- M2 T5: kafka_ext/temporal_ext wiring (idioms param, active_idioms), degraded path --

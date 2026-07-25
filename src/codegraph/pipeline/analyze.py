@@ -20,11 +20,13 @@ M8 T1 (rerun-2 R4, docs/superpowers/reports/2026-07-24-pilot-rerun-2-open-gaps.m
 fastapi's OWN contribution to "channels/edges идут в те же upsert_nodes/upsert_edges
 вызовы" above no longer holds -- a route's full identity now needs the cross-file
 `include_router` chain a single file's own S5 pass can't see, so fastapi_ext.py emits
-ONLY DEPENDS_ON edges directly (domain_edges, unchanged) plus two per-file CLAIM kinds
-("route_decl"/"router_include", staged via staging.add_claims -- same http_call/
-temporal_start_mark pattern T6/T7 already established below), consumed later by
-linking/router_prefix.py (S7, workspace.py). roles/node_props are UNCHANGED (file-local,
-still merged here exactly as this paragraph describes).
+ONLY DEPENDS_ON edges directly (domain_edges, unchanged) plus three per-file CLAIM
+kinds ("route_decl"/"router_include"/"router_decl" -- the last is the M8 review
+Important-1 addition: each router's own declared prefix, needed for intermediate
+aggregator hops; staged via staging.add_claims -- same http_call/temporal_start_mark
+pattern T6/T7 already established below), consumed later by linking/router_prefix.py
+(S7, workspace.py). roles/node_props are UNCHANGED (file-local, still merged here
+exactly as this paragraph describes).
 
 M2 T5: kafka_ext/temporal_ext добавлены в тот же S5-проход. kafka — ДАННЫЕ-идиома: её
 активация НЕ читает active_idioms вовсе, а зависит от параметра `idioms` (effective
@@ -409,13 +411,16 @@ def _extract_join_and_stage(
                 # M8 T1 (rerun-2 R4): DEPENDS_ON is the only edge type fastapi_ext
                 # still emits directly (file-local, unchanged) -- route/HANDLES
                 # identity now needs the FULL cross-file include_router chain, which
-                # a single file can't see, so it's staged as two per-file claim
-                # kinds instead and composed later by linking/router_prefix.py (S7,
-                # consumed via staging.claims_for -- same pattern http_call/
-                # temporal_start_mark already use).
+                # a single file can't see, so it's staged as three per-file claim
+                # kinds instead (router_decl: M8 review Important-1 -- each router's
+                # own declared prefix, needed for intermediate aggregator hops) and
+                # composed later by linking/router_prefix.py (S7, consumed via
+                # staging.claims_for -- same pattern http_call/temporal_start_mark
+                # already use).
                 domain_edges.extend(fr.edges)
                 staging.add_claims(svc.name, rp, "route_decl", fr.route_decl_claims)
                 staging.add_claims(svc.name, rp, "router_include", fr.router_include_claims)
+                staging.add_claims(svc.name, rp, "router_decl", fr.router_decl_claims)
 
             if kafka_active:
                 # consts is typed `ConstTable | None` above (the ternary's else-branch),

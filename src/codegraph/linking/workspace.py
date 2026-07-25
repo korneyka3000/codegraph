@@ -27,13 +27,15 @@ Fixed pipeline order, each stage consuming the previous stage's output:
      into a route that no longer exists in source and keeping the stale Channel "alive"
      forever (empirically caught by this fix's own double-run regression test).
   3. temporal_start_mark claims -> CALLS edges (see `_apply_temporal_start_marks`).
-  4. `router_prefix.link` -- route_decl/router_include claims (M8 T1, rerun-2 R4) ->
-     Channel(http_route) + HANDLES, composed across cross-file `include_router`
-     chains (see linking/router_prefix.py's own module docstring for the full
-     algorithm and honesty rule). Must run BEFORE http_routes.link (step 5): that
-     stage's own `_route_table` scan reads whatever Channel(http_route) nodes are
-     ALREADY staged, and this step is what stages them now -- fastapi_ext.py (S5)
-     no longer creates them directly.
+  4. `router_prefix.link` -- route_decl/router_include/router_decl claims (M8 T1,
+     rerun-2 R4; router_decl -- each router's own declared prefix, folded in at
+     every hop -- is the M8 review Important-1 addition) -> Channel(http_route) +
+     HANDLES, composed across cross-file `include_router` chains (see
+     linking/router_prefix.py's own module docstring for the full algorithm and
+     honesty rule). Must run BEFORE http_routes.link (step 5): that stage's own
+     `_route_table` scan reads whatever Channel(http_route) nodes are ALREADY
+     staged, and this step is what stages them now -- fastapi_ext.py (S5) no longer
+     creates them directly.
   5. `http_routes.link` -- claims -> CALLS_HTTP.
   6. `segments.derive` -- PRODUCES/CONSUMES/CALLS_HTTP/HANDLES/CONTAINS -> NEXT_SEGMENT.
      Must run AFTER http_routes.link: one of its two pairing rules consumes CALLS_HTTP

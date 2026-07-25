@@ -265,19 +265,24 @@ def test_link_workspace_composes_router_prefix_before_http_routes_link(tmp_path)
     """router_prefix.link must run before http_routes.link -- that stage's own
     _route_table scan reads whatever Channel(http_route) nodes are ALREADY staged,
     and router_prefix.link is what stages them now (see linking/router_prefix.py's
-    own module docstring). This single scenario chains route_decl+router_include
-    claims -> composed Channel/HANDLES -> CALLS_HTTP end to end."""
+    own module docstring). This single scenario chains route_decl+router_include+
+    router_decl claims (the last: M8 review Important-1 -- the hop parent's own
+    declared prefix, required for composition) -> composed Channel/HANDLES ->
+    CALLS_HTTP end to end."""
     st = Staging(tmp_path / "s.db")
     handler = _fn("sym:worker:handler", "worker", "handler", "q.handler")
     client = _fn("sym:caller:client", "caller", "client", "q.client")
     st.upsert_nodes([handler, client])
     st.add_claims("worker", "app/routes/steps.py", "route_decl", [{
         "router_symbol": "sym:worker:router", "verb": "GET", "path": "/steps/{id}",
-        "handler_node_id": handler.id, "prefix_local": "",
+        "handler_node_id": handler.id, "prefix_local": "", "evidence_line": 5,
     }])
     st.add_claims("worker", "app/main.py", "router_include", [{
         "parent_symbol": "sym:worker:app", "child_symbol": "sym:worker:router",
         "prefix": "/api/v1",
+    }])
+    st.add_claims("worker", "app/main.py", "router_decl", [{
+        "router_symbol": "sym:worker:app", "prefix_local": "",
     }])
     st.add_claims("caller", "app/client.py", "http_call", [{
         "src_id": client.id, "verb": "GET", "path_template": "/api/v1/steps/{id}",
@@ -299,7 +304,7 @@ def test_link_workspace_returns_all_expected_counter_keys(tmp_path):
         "calls_http", "calls_http_unresolved", "next_segments", "processes", "marks",
         "channels_gc", "part_of_process_ambiguous",
         # M8 T1 (rerun-2 R4): router_prefix.link's own honest-miss counter -- see
-        # linking/router_prefix.py's own docstring for the three failure shapes it
+        # linking/router_prefix.py's own docstring for the four failure shapes it
         # counts.
         "route_prefix_unresolved",
     }

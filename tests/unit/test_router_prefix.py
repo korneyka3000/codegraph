@@ -1,21 +1,22 @@
 """M8 T1 (rerun-2 R4): linking.router_prefix -- composes FastAPI route path templates
 across `include_router` chains that span file (and even service) boundaries, from the
-per-file `route_decl`/`router_include` claims fastapi_ext.py now emits instead of
-directly building Channel(http_route)/HANDLES itself (see that module's own docstring
-for the full "why" -- a single file can never see the whole chain).
+per-file `route_decl`/`router_include`/`router_decl` claims fastapi_ext.py now emits
+instead of directly building Channel(http_route)/HANDLES itself (see that module's own
+docstring for the full "why" -- a single file can never see the whole chain).
 
 Algorithm (`link`): build a `child_symbol -> (parent_symbol, prefix)` graph from every
-staged `router_include` claim (symbols already bake in `service` -- see
-resolvers/scip/symbols.symbol_to_node_id -- so no cross-service leakage is possible,
-and no service scoping is needed here). For each `route_decl` claim, DFS from its own
-`router_symbol` up the graph, concatenating each hop's `prefix` in root-to-leaf order,
-until a node with no parent (a root -- nobody includes it: a bare `FastAPI()`, or a
-router no `include_router` call anywhere ever names as arg0) is reached -- prepend that
-accumulated prefix to `prefix_local` + `path` (a route's own same-file
-`APIRouter(prefix=...)` and literal path, computed identically to before this task).
+staged `router_include` claim, plus a `router_symbol -> own declared prefix` map from
+every `router_decl` claim (M8 review Important-1). For each `route_decl` claim, DFS
+from its own `router_symbol` up the graph to a root, composing at each mount
+[include-kwarg prefix] + [mounted router's own declared prefix] in root-to-leaf order,
+then + prefix_local + path. The order is REAL FastAPI semantics, verified empirically
+against fastapi 0.140.0 (see linking/router_prefix.py's own docstring for the raw
+OpenAPI-schema proof): `app.include_router(B, prefix="/ia")` where
+`B = APIRouter(prefix="/pb")` and `B.include_router(A, prefix="/ib")` with
+`A = APIRouter(prefix="/pa")` + route "/x" serves `/ia/pb/ib/pa/x`.
 
 HONESTY RULE (no guessing, ever -- mirrors http_routes.py's own "NO static/1.0 without
-anchor" binding constraint): three distinct failure shapes ALL collapse to the SAME
+anchor" binding constraint): FOUR distinct failure shapes ALL collapse to the SAME
 outcome -- the composed template is DISCARDED entirely, falling back to
 `prefix_local + path` alone (byte-identical to today's pre-M8 `_template` output),
 and the route is counted in `route_prefix_unresolved`:
@@ -25,6 +26,12 @@ and the route is counted in `route_prefix_unresolved`:
   3. An UNRESOLVABLE or AMBIGUOUS hop partway up the chain (a router_include claim
      whose own parent_symbol is None, or two DISTINCT parents both naming the same
      child_symbol -- a real config ambiguity, never silently picked).
+  4. (M8 review Important-1) A hop PARENT with NO router_decl claim (its own declared
+     prefix is unknown -- e.g. a factory-built router), or with CONFLICTING
+     router_decl claims (two different prefix_local values for one symbol) -- an
+     intermediate aggregator's own `APIRouter(prefix="/v2")` is part of the real
+     path, so composing WITHOUT knowing it would mint a confident-but-INCOMPLETE
+     template, the exact funnel-class silent-wrong M7 exists to prevent.
 
 The TRIVIAL case -- no `router_include` claim anywhere names this router_symbol as a
 child at all (a genuine root: same-file `APIRouter(prefix=...)`, no cross-file
@@ -38,10 +45,13 @@ Channel/HANDLES creation mirrors fastapi_ext's OLD direct-emission shape exactly
 (make_channel_node("http_route", ...) + HANDLES chan->handler), just relocated here and
 now `extractor="linking"` (cleared by clear_workspace_layer, rebuilt fresh every S7 run
 -- Channel-GC continues to work, same "GC-then-recreate" pattern already documented for
-http_routes.py's own unresolved-fallback channel) instead of "fastapi". `evalx.edges_eval`
-does not compare extractor/resolution at all (verified by reading EdgeTuple's own
-construction) -- only (type, src_service, src_qualified, dst_channel_id) for HANDLES --
-so this relocation cannot itself shift any golden HANDLES/CALLS_HTTP tuple.
+http_routes.py's own unresolved-fallback channel) instead of "fastapi", carrying the
+route_decl claim's own evidence_file/evidence_line (M8 review Important-2 -- the same
+claim-evidence pass-through http_routes.py's CALLS_HTTP edges already do).
+`evalx.edges_eval` does not compare extractor/resolution at all (verified by reading
+EdgeTuple's own construction) -- only (type, src_service, src_qualified,
+dst_channel_id) for HANDLES -- so this relocation cannot itself shift any golden
+HANDLES/CALLS_HTTP tuple.
 """
 
 from __future__ import annotations
@@ -55,11 +65,12 @@ from codegraph.stores.staging import Staging
 def _route_decl(
     staging: Staging, service: str, relpath: str, *,
     router_symbol: str | None, verb: str, path: str,
-    handler_node_id: str, prefix_local: str = "",
+    handler_node_id: str, prefix_local: str = "", evidence_line: int | None = None,
 ) -> None:
     staging.add_claims(service, relpath, "route_decl", [{
         "router_symbol": router_symbol, "verb": verb, "path": path,
         "handler_node_id": handler_node_id, "prefix_local": prefix_local,
+        "evidence_line": evidence_line,
     }])
 
 
@@ -69,6 +80,18 @@ def _router_include(
 ) -> None:
     staging.add_claims(service, relpath, "router_include", [{
         "parent_symbol": parent_symbol, "child_symbol": child_symbol, "prefix": prefix,
+    }])
+
+
+def _router_decl_claim(
+    staging: Staging, service: str, relpath: str, *,
+    router_symbol: str, prefix_local: str = "",
+) -> None:
+    """M8 review Important-1: one router_decl claim per `X = APIRouter(...)`/
+    `X = FastAPI(...)` assignment -- the hop-parent own-prefix source
+    _resolve_prefix folds in at every mount (see module docstring)."""
+    staging.add_claims(service, relpath, "router_decl", [{
+        "router_symbol": router_symbol, "prefix_local": prefix_local,
     }])
 
 
@@ -163,6 +186,7 @@ def test_two_level_chain_composes_include_prefix_with_local_path(tmp_path):
         st, "worker", "app/main.py",
         parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
     )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
 
     report = router_prefix.link(st)
 
@@ -175,6 +199,8 @@ def test_two_level_chain_composes_include_prefix_with_local_path(tmp_path):
 # -- 3-level chain: the REAL pilot shape (rerun-2 open-gaps R4's own repro) -----------
 # router = APIRouter() (leaf, file A) -> parent.include_router(leaf.router) (file B,
 # NO prefix) -> app.include_router(parent.router, prefix="/api/v1") (file C).
+# This is ALSO the coordinator-review "aggregator WITHOUT own prefix" pin: ROUTER_B's
+# own router_decl carries prefix_local="" -- composition result unchanged from pre-fix.
 
 
 def test_three_level_chain_concatenates_prefixes_root_to_leaf(tmp_path):
@@ -193,6 +219,9 @@ def test_three_level_chain_concatenates_prefixes_root_to_leaf(tmp_path):
         st, "worker", "app/main.py",
         parent_symbol=APP, child_symbol=ROUTER_B, prefix="/api/v1",
     )
+    _router_decl_claim(st, "worker", "app/routes/steps/__init__.py",
+                       router_symbol=ROUTER_B, prefix_local="")
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
 
     report = router_prefix.link(st)
 
@@ -220,11 +249,108 @@ def test_three_level_chain_same_file_prefix_local_still_applies(tmp_path):
         st, "worker", "app/main.py",
         parent_symbol=APP, child_symbol=ROUTER_B, prefix="/api/v1",
     )
+    _router_decl_claim(st, "worker", "app/routes/steps/__init__.py",
+                       router_symbol=ROUTER_B, prefix_local="")
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
 
     router_prefix.link(st)
 
     chan = next(n for n in st.iter_nodes() if n.kind == "Channel")
     assert chan.id == "chan:http:worker:GET /api/v1/steps/{step_uid}"
+
+
+# -- M8 review Important-1: intermediate aggregator's OWN APIRouter(prefix=...) -------
+# The versioned-aggregator-in-__init__.py convention: B = APIRouter(prefix="/v2") has
+# no routes of its own, includes A, and is included by the app. Empirically verified
+# against real FastAPI 0.140.0 (OpenAPI schema): the served path is /api/v2/x.
+
+
+def test_intermediate_aggregator_router_own_prefix_is_composed(tmp_path):
+    """THE review Important-1 pin (RED against the pre-review code, which silently
+    composed /api/x -- confident, counter 0, WRONG -- because no claim form carried
+    B's own /v2): FastAPI's real per-mount order is [include-kwarg prefix] + [mounted
+    router's own declared prefix], so the full chain here is /api (include of B) +
+    /v2 (B's own) + "" (include of A) + "" (A's own prefix_local) + /x."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "worker", "app/routes/a.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/api/__init__.py",
+        parent_symbol=ROUTER_B, child_symbol=ROUTER_A, prefix=None,
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_B, prefix="/api",
+    )
+    _router_decl_claim(st, "worker", "app/api/__init__.py",
+                       router_symbol=ROUTER_B, prefix_local="/v2")
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    report = router_prefix.link(st)
+
+    chan = next(n for n in st.iter_nodes() if n.kind == "Channel")
+    assert chan.id == "chan:http:worker:GET /api/v2/x"
+    assert report["route_prefix_unresolved"] == 0
+
+
+def test_hop_parent_without_router_decl_discards_and_counts(tmp_path):
+    """Review Important-1's honesty companion (failure shape 4): a hop parent whose
+    own declared prefix is UNKNOWN (no router_decl claim for its symbol -- e.g. a
+    router built by a factory call rather than a visible APIRouter(...)/FastAPI(...)
+    assignment) poisons the WHOLE chain -- the composed prefix is discarded entirely
+    (never partially applied), local template, counter. Before the review fix this
+    exact scenario composed /api/v1/steps/{id} confidently -- but only by silently
+    ASSUMING the unknown parent's own prefix was empty."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "worker", "app/routes/steps.py",
+        router_symbol=ROUTER_A, verb="GET", path="/steps/{id}", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
+    )
+    # NO router_decl for APP.
+
+    report = router_prefix.link(st)
+
+    assert report["route_prefix_unresolved"] == 1
+    chan = next(n for n in st.iter_nodes() if n.kind == "Channel")
+    assert chan.id == "chan:http:worker:GET /steps/{id}"
+
+
+def test_conflicting_router_decls_for_hop_parent_discard_and_count(tmp_path):
+    """Two router_decl claims for the SAME hop-parent symbol with DIFFERENT
+    prefix_local values (a genuine same-symbol re-declaration ambiguity) -- never
+    silently pick one; whole-prefix discard + counter, same spirit as the
+    multi-parent include ambiguity."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "worker", "app/routes/a.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/api/__init__.py",
+        parent_symbol=ROUTER_B, child_symbol=ROUTER_A, prefix=None,
+    )
+    _router_decl_claim(st, "worker", "app/api/__init__.py",
+                       router_symbol=ROUTER_B, prefix_local="/v2")
+    _router_decl_claim(st, "worker", "app/api/legacy.py",
+                       router_symbol=ROUTER_B, prefix_local="/v3")
+
+    report = router_prefix.link(st)
+
+    assert report["route_prefix_unresolved"] == 1
+    chan = next(n for n in st.iter_nodes() if n.kind == "Channel")
+    assert chan.id == "chan:http:worker:GET /x"
 
 
 # -- two routes sharing one router: BOTH get the composed prefix ---------------------
@@ -248,6 +374,7 @@ def test_two_routes_same_router_both_get_composed_prefix(tmp_path):
         st, "worker", "app/main.py",
         parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
     )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
 
     report = router_prefix.link(st)
 
@@ -273,6 +400,8 @@ def test_cycle_falls_back_to_local_template_and_counts(tmp_path):
     # A includes B, B includes A -- a cycle, never structurally valid FastAPI, but the
     # extractor has no way to rule it out ahead of time (claims are per-file, blind to
     # the workspace-wide graph shape) -- composition must not infinitely recurse.
+    # BOTH hop parents carry router_decl claims, so the CYCLE (not a missing hop
+    # decl, failure shape 4) is what this test actually exercises.
     _router_include(
         st, "worker", "app/routes/a.py",
         parent_symbol=ROUTER_A, child_symbol=ROUTER_B, prefix="/b",
@@ -281,6 +410,8 @@ def test_cycle_falls_back_to_local_template_and_counts(tmp_path):
         st, "worker", "app/routes/b.py",
         parent_symbol=ROUTER_B, child_symbol=ROUTER_A, prefix="/a",
     )
+    _router_decl_claim(st, "worker", "app/routes/a.py", router_symbol=ROUTER_A, prefix_local="")
+    _router_decl_claim(st, "worker", "app/routes/b.py", router_symbol=ROUTER_B, prefix_local="")
 
     report = router_prefix.link(st)
 
@@ -387,6 +518,25 @@ def test_channel_owner_service_comes_from_the_claims_own_service(tmp_path):
     assert chan.props["http_method"] == "GET"
 
 
+def test_handles_edge_carries_evidence_file_and_line(tmp_path):
+    """M8 review Important-2: HANDLES must carry the route DECORATOR site's own
+    evidence -- evidence_file from the claim's _relpath (injected by claims_for),
+    evidence_line from route_decl's own evidence_line (the handler def's start_line,
+    same value the pre-M8 direct-emission HANDLES carried) -- the identical
+    claim-evidence pass-through http_routes.py's CALLS_HTTP edges already do."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "orders-api", "app/routes/orders.py",
+        router_symbol=None, verb="POST", path="", handler_node_id=HANDLER,
+        prefix_local="/orders", evidence_line=11,
+    )
+    router_prefix.link(st)
+    handles = next(e for e in st.iter_edges() if e.type == "HANDLES")
+    assert handles.evidence_file == "app/routes/orders.py"
+    assert handles.evidence_line == 11
+
+
 # -- end-to-end: composed route feeds http_routes.link into a static/1.0 CALLS_HTTP --
 # The brief's own explicit acceptance scenario: "сервис B с клиентом на
 # /api/v1/steps/{id} и якорем на A -> ожидать одно CALLS_HTTP static/1.0".
@@ -423,6 +573,7 @@ def test_composed_route_resolves_client_claim_to_static_calls_http(tmp_path):
         st, "worker", "app/main.py",
         parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
     )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
     _client_claim(st)
 
     router_prefix.link(st)

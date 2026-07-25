@@ -14,27 +14,48 @@ file boundaries (`router = APIRouter()` in file A; `parent.include_router(a.rout
 file B; `app.include_router(b.router, prefix="/api/v1")` in file C) -- a single-file
 extractor pass can never see that whole chain, so this module no longer emits the
 Channel(http_route) node or the HANDLES edge itself (both require walking that chain,
-workspace-wide, in S7 -- linking/router_prefix.py's job). Instead it emits two per-file
-CLAIMS (consumed by router_prefix.py, mirroring http_client_ext's own claims-not-edges
-precedent):
-  - route_decl: {router_symbol, verb, path, handler_node_id, prefix_local} -- one per
-    matched route decorator. `path`/`prefix_local` are the exact same two pieces the
-    OLD `_template(_route_prefix(assign), path)` call combined directly -- kept
-    separate here so router_prefix.py can prepend any ADDITIONAL cross-file prefix
-    before prefix_local+path (the trivial, no-chain case reproduces today's byte-exact
-    template: see router_prefix.py's own docstring/tests for the composition proof).
-    `router_symbol` identifies the SPECIFIC router object the route's receiver is bound
-    to (the `assign: AssignFact` `_match_route` already locates syntactically,
-    same-file) -- resolved via ctx.def_symbol_lookup on that assignment's OWN target
-    token (a DEFINITION occurrence, `assign.target_start_byte`), giving a
-    cross-file-stable id any OTHER file's `include_router(this_router)` call can
-    independently resolve to the identical symbol via a REFERENCE occurrence (proven
-    against real scip-python output: see test_pipeline_analyze.py's wiring test
-    docstring). None when unresolvable (no lookup wired, a degraded-fallback miss --
-    fallback.py never lays defs at an assignment target at all, only at
-    class/function defs -- or a genuine SCIP miss); router_prefix.py then falls back to
-    the LOCAL template alone (prefix_local+path) + a route_prefix_unresolved counter,
-    never a guess.
+workspace-wide, in S7 -- linking/router_prefix.py's job). Instead it emits three
+per-file CLAIM kinds (consumed by router_prefix.py, mirroring http_client_ext's own
+claims-not-edges precedent):
+  - route_decl: {router_symbol, verb, path, handler_node_id, prefix_local,
+    evidence_line} -- one per matched route decorator. `path`/`prefix_local` are the
+    exact same two pieces the OLD `_template(_route_prefix(assign), path)` call
+    combined directly -- kept separate here so router_prefix.py can prepend any
+    ADDITIONAL cross-file prefix before prefix_local+path (the trivial, no-chain case
+    reproduces today's byte-exact template: see router_prefix.py's own docstring/tests
+    for the composition proof). `router_symbol` identifies the SPECIFIC router object
+    the route's receiver is bound to (the `assign: AssignFact` `_match_route` already
+    locates syntactically, same-file) -- resolved via ctx.def_symbol_lookup on that
+    assignment's OWN target token (a DEFINITION occurrence,
+    `assign.target_start_byte`), giving a cross-file-stable id any OTHER file's
+    `include_router(this_router)` call can independently resolve to the identical
+    symbol via a REFERENCE occurrence (proven against real scip-python output: see
+    test_pipeline_analyze.py's wiring test docstring). None when unresolvable (no
+    lookup wired, a degraded-fallback miss -- fallback.py never lays defs at an
+    assignment target at all, only at class/function defs -- or a genuine SCIP miss);
+    router_prefix.py then falls back to the LOCAL template alone (prefix_local+path)
+    + a route_prefix_unresolved counter, never a guess. `evidence_line` (M8 review
+    Important-2) is the handler def's own start_line -- the exact value the pre-M8
+    direct-emission HANDLES edge carried, passed through the claim so
+    router_prefix.py's HANDLES restores it (evidence_file rides on the claims table's
+    own relpath column, injected back by claims_for as `_relpath`).
+  - router_decl (M8 review Important-1): {router_symbol, prefix_local} -- one per
+    `X = APIRouter(...)`/`X = FastAPI(...)` assignment, REGARDLESS of whether X has
+    any routes or include_router calls of its own in this file. This is what lets
+    router_prefix.py fold an INTERMEDIATE aggregator router's own declared prefix
+    (`B = APIRouter(prefix="/v2")`, no routes, includes A, included by C -- the
+    versioned-aggregator-in-__init__.py convention) into the composed template:
+    before this claim existed, that prefix was invisible to EVERY claim form, so the
+    chain composed "successfully" into a silently-INCOMPLETE confident template with
+    no counter -- the funnel-class silent-wrong M7 exists to prevent. FastAPI()
+    assignments emit too (prefix_local always "" -- `_route_prefix`'s own FastAPI
+    rule): the chain ROOT is itself a hop parent whose own prefix router_prefix.py
+    must know, and its missing-hop-decl rule (no router_decl for a hop parent ->
+    whole-prefix discard + counter) would otherwise spuriously discard every chain
+    ending at an app object. A None router_symbol (same resolution mechanism/misses
+    as route_decl's, above) emits NOTHING -- an unkeyable claim is unusable at
+    composition (mirrors temporal_start_mark's own "no claim without a dst"
+    precedent); the affected chains already discard honestly downstream.
   - router_include: {parent_symbol, child_symbol, prefix} -- one per
     `<parent>.include_router(<child>, prefix=...)` call, ANY receiver/arg0 shape (NOT
     gated on "receiver looks like a known same-file APIRouter" the way route matching
@@ -116,11 +137,14 @@ class FastapiResult:
     roles: dict[str, set[str]]
     node_props: dict[str, dict]
     edges: list[EdgeRec]
-    # M8 T1 (rerun-2 R4): route_decl/router_include replace the old direct
+    # M8 T1 (rerun-2 R4): route_decl/router_include/router_decl replace the old direct
     # channels/HANDLES output -- see module docstring for the full claim shapes and
-    # why (cross-file `include_router` chains can't be resolved from a single file).
+    # why (cross-file `include_router` chains can't be resolved from a single file;
+    # router_decl is the M8 review Important-1 addition -- intermediate routers' own
+    # declared prefixes).
     route_decl_claims: list[dict]
     router_include_claims: list[dict]
+    router_decl_claims: list[dict]
     stats: dict[str, int]
 
 
@@ -306,6 +330,25 @@ def _collect_router_includes(ctx: FileContext, claims: list[dict]) -> None:
         })
 
 
+def _collect_router_decls(ctx: FileContext, claims: list[dict]) -> None:
+    """M8 review Important-1: one router_decl claim per `X = APIRouter(...)`/
+    `X = FastAPI(...)` assignment -- {router_symbol, prefix_local} -- REGARDLESS of
+    whether X has any routes or include_router calls of its own in this file (the
+    versioned-aggregator-in-__init__.py convention has neither routes NOR its own
+    prefix visible any other way -- see module docstring). Symbol resolution is the
+    IDENTICAL def-site mechanism route_decl's router_symbol uses
+    (`_resolve_router_symbol`); a None symbol emits nothing (an unkeyable claim is
+    unusable at composition -- the affected chains already discard honestly
+    downstream via router_prefix.py's missing-hop-decl rule)."""
+    for a in ctx.facts.assigns:
+        if a.callee_name not in _ROUTER_CALLEES:
+            continue
+        sym = _resolve_router_symbol(ctx, a)
+        if sym is None:
+            continue
+        claims.append({"router_symbol": sym, "prefix_local": _route_prefix(a)})
+
+
 def extract_fastapi(ctx: FileContext, node_ids: dict[int, str]) -> FastapiResult:
     facts = ctx.facts
     roles: dict[str, set[str]] = {}
@@ -313,6 +356,7 @@ def extract_fastapi(ctx: FileContext, node_ids: dict[int, str]) -> FastapiResult
     edges: list[EdgeRec] = []
     route_decl_claims: list[dict] = []
     router_include_claims: list[dict] = []
+    router_decl_claims: list[dict] = []
     stats = {"routes": 0, "depends_resolved": 0, "depends_unresolved": 0}
 
     assigns_by_target: dict[str, list[AssignFact]] = {}
@@ -349,6 +393,10 @@ def extract_fastapi(ctx: FileContext, node_ids: dict[int, str]) -> FastapiResult
                 "path": path,
                 "handler_node_id": handler_id,
                 "prefix_local": prefix_local,
+                # M8 review Important-2: the handler def's own start_line -- the
+                # exact evidence_line the pre-M8 direct-emission HANDLES carried,
+                # restored onto the S7-built HANDLES by router_prefix.py.
+                "evidence_line": d.start_line,
             })
             stats["routes"] += 1
 
@@ -356,9 +404,11 @@ def extract_fastapi(ctx: FileContext, node_ids: dict[int, str]) -> FastapiResult
             _collect_depends(ctx, d, handler_id, edges, stats)
 
     _collect_router_includes(ctx, router_include_claims)
+    _collect_router_decls(ctx, router_decl_claims)
 
     return FastapiResult(
         roles=roles, node_props=node_props, edges=edges,
         route_decl_claims=route_decl_claims, router_include_claims=router_include_claims,
+        router_decl_claims=router_decl_claims,
         stats=stats,
     )

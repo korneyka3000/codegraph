@@ -142,13 +142,14 @@ def test_file_context_ref_symbol_lookup_defaults_to_none():
 def test_fastapi_result_field_shape():
     r = FastapiResult(
         roles={}, node_props={}, edges=[],
-        route_decl_claims=[], router_include_claims=[], stats={},
+        route_decl_claims=[], router_include_claims=[], router_decl_claims=[], stats={},
     )
     assert r.roles == {}
     assert r.node_props == {}
     assert r.edges == []
     assert r.route_decl_claims == []
     assert r.router_include_claims == []
+    assert r.router_decl_claims == []
     assert r.stats == {}
 
 
@@ -220,7 +221,8 @@ def test_route_decl_claims_match_self_review_checklist_all_four_routes():
 def test_route_decl_claim_shape_and_handler_node_id():
     ctx, node_ids = _orders_ctx()
     result = extract_fastapi(ctx, node_ids)
-    create_id = node_ids[_def(ctx, "create_order").index]
+    create_order = _def(ctx, "create_order")
+    create_id = node_ids[create_order.index]
 
     claim = next(c for c in result.route_decl_claims if c["verb"] == "POST")
     assert claim == {
@@ -229,6 +231,10 @@ def test_route_decl_claim_shape_and_handler_node_id():
         "path": "",
         "handler_node_id": create_id,
         "prefix_local": "/orders",
+        # M8 review Important-2: the handler def's own start_line -- the exact value
+        # the pre-M8 direct-emission HANDLES edge carried as evidence_line, now
+        # passed through the claim so linking/router_prefix.py can restore it.
+        "evidence_line": create_order.start_line,
     }
 
 
@@ -273,6 +279,12 @@ def handler(id: str):
     assert claim["prefix_local"] == "/orders"
     handler_id = node_ids[_def(ctx, "handler").index]
     assert claim["handler_node_id"] == handler_id
+    # M8 review Important-1: the SAME resolved assignment also emits its own
+    # router_decl claim (router_symbol + own declared prefix) -- the hop-parent
+    # own-prefix source linking/router_prefix.py folds in at every mount.
+    assert result.router_decl_claims == [{
+        "router_symbol": target_id, "prefix_local": "/orders",
+    }]
 
 
 def test_route_decl_router_symbol_none_when_def_symbol_lookup_misses():
@@ -282,6 +294,89 @@ def test_route_decl_router_symbol_none_when_def_symbol_lookup_misses():
     assert all(c["router_symbol"] is None for c in result.route_decl_claims)
 
 
+# -- router_decl claims: EVERY APIRouter()/FastAPI() assignment (M8 review Important-1)
+# -- regardless of whether the router has any routes or include_router calls of its
+# own in this file: a versioned aggregator (`B = APIRouter(prefix="/v2")`, no routes,
+# includes A, included by C) is precisely the shape whose own prefix was invisible to
+# every claim form before this, silently composing an INCOMPLETE confident template.
+
+
+def test_router_decl_emitted_for_routeless_aggregator_apirouter_assignment():
+    src = b'''from fastapi import APIRouter
+
+router = APIRouter(prefix="/v2")
+'''
+    relpath = "app/api/__init__.py"
+    facts0 = build_file_facts(relpath, src)
+    router_assign = next(a for a in facts0.assigns if a.target == "router")
+    span = router_assign.target_start_byte
+    target_sym = "scip-python python svc 0.0 `app.api`/router."
+
+    def def_lookup(rp, sb):
+        return target_sym if (rp, sb) == (relpath, span) else None
+
+    ctx, node_ids = _load(relpath, "svc", src, def_symbol_lookup=def_lookup)
+    result = extract_fastapi(ctx, node_ids)
+
+    assert result.router_decl_claims == [{
+        "router_symbol": "sym:svc:`app.api`/router.",
+        "prefix_local": "/v2",
+    }]
+    assert result.route_decl_claims == []  # no routes in this file at all
+
+
+def test_router_decl_emitted_for_fastapi_assignment_with_empty_prefix():
+    """FastAPI() assignments emit too (prefix_local always "" -- FastAPI has no
+    prefix concept): the chain ROOT is itself a hop parent whose own prefix
+    router_prefix.py must know -- without the app's own claim, every chain ending at
+    a FastAPI() root would spuriously discard under the missing-hop-decl rule."""
+    src = b'''from fastapi import FastAPI
+
+app = FastAPI(title="svc")
+'''
+    relpath = "app/main.py"
+    facts0 = build_file_facts(relpath, src)
+    app_assign = next(a for a in facts0.assigns if a.target == "app")
+    span = app_assign.target_start_byte
+    target_sym = "scip-python python svc 0.0 `app.main`/app."
+
+    def def_lookup(rp, sb):
+        return target_sym if (rp, sb) == (relpath, span) else None
+
+    ctx, node_ids = _load(relpath, "svc", src, def_symbol_lookup=def_lookup)
+    result = extract_fastapi(ctx, node_ids)
+
+    assert result.router_decl_claims == [{
+        "router_symbol": "sym:svc:`app.main`/app.",
+        "prefix_local": "",
+    }]
+
+
+def test_router_decl_skipped_when_router_symbol_unresolvable():
+    """A None router_symbol (degraded fallback -- no defs at assignment targets --
+    or a genuine SCIP miss) emits NOTHING: an unkeyable claim is unusable at
+    composition (mirrors temporal_start_mark's own "no claim without a dst"
+    precedent); the affected chains already discard honestly downstream."""
+    src = b'''from fastapi import APIRouter
+
+router = APIRouter(prefix="/v2")
+'''
+    ctx, node_ids = _load("m.py", "svc", src)  # default def lookup: always miss
+    result = extract_fastapi(ctx, node_ids)
+    assert result.router_decl_claims == []
+
+
+def test_router_decl_not_emitted_for_non_router_assignments():
+    src = b'''client = HttpClient()
+'''
+    # a lookup that WOULD resolve anything -- proves the callee gate (not a lookup
+    # miss) is what rejects the non-router assignment.
+    ctx, node_ids = _load(
+        "m.py", "svc", src,
+        def_symbol_lookup=lambda rp, sb: "scip-python python svc 0.0 `m`/client.",
+    )
+    result = extract_fastapi(ctx, node_ids)
+    assert result.router_decl_claims == []
 
 
 # -- router_include claims: X.include_router(Y, prefix=...) --
@@ -718,7 +813,8 @@ def test_no_decorators_at_all_is_a_noop():
     result = extract_fastapi(ctx, node_ids)
     expected = FastapiResult(
         roles={}, node_props={}, edges=[],
-        route_decl_claims=[], router_include_claims=[], stats=result.stats,
+        route_decl_claims=[], router_include_claims=[], router_decl_claims=[],
+        stats=result.stats,
     )
     assert result == expected
     assert result.stats["routes"] == 0
