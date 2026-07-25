@@ -84,6 +84,20 @@ class CallFact:
     enclosing_def: int | None
     args: list[ArgFact] = field(default_factory=list)
     receiver_text: str | None = None
+    # M8 T1 sanctioned additive extension (mirrors ArgFact's own "attr" value_kind
+    # convention: a dotted receiver's span is its LAST segment, the actual object
+    # being referenced -- "self._db" resolves "_db", not "self"): byte span of the
+    # receiver TOKEN itself (identifier, or an attribute chain's last segment).
+    # receiver_text alone is raw text with no position, insufficient for
+    # ctx.ref_symbol_lookup (linking/router_prefix.py's router_include parent-symbol
+    # resolution: "app" in `app.include_router(...)`). None whenever the receiver is
+    # neither a bare identifier nor an attribute chain (a subscript/call-expression
+    # receiver, e.g. `get_routers()[0].include_router(...)`) -- honestly "not a
+    # resolvable shape", never a guess. New LAST fields with defaults so every
+    # pre-existing positional/keyword CallFact(...) construction site keeps working
+    # unchanged.
+    receiver_start_byte: int | None = None
+    receiver_end_byte: int | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +111,16 @@ class AssignFact:
     callee_name: str | None
     call_args: list[ArgFact] | None
     start_line: int
+    # M8 T1 sanctioned additive extension (mirrors ParamFact.annotation_start_byte's
+    # own M2 T4 precedent): byte span of the LHS target token itself -- e.g. "router"
+    # in `router = APIRouter(prefix="/x")` -- needed to resolve this assignment's own
+    # DEFINITION occurrence via ctx.def_symbol_lookup (linking/router_prefix.py's
+    # router-symbol identity: a cross-file-stable id `include_router(...)` calls
+    # elsewhere can point back at via a REFERENCE occurrence -- same descriptor-based
+    # id either way, see resolvers/scip/symbols.symbol_to_node_id). New LAST field
+    # with a default so every pre-existing positional AssignFact(...) construction
+    # site keeps working unchanged.
+    target_start_byte: int | None = None
 
 
 @dataclass(frozen=True)
@@ -594,6 +618,8 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
             fn = node.child_by_field_name("function")
             token = None
             receiver_text = None
+            receiver_start_byte = None
+            receiver_end_byte = None
             if fn is not None and fn.type == "identifier":
                 token = fn
             elif fn is not None and fn.type == "attribute":
@@ -601,6 +627,19 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
                 obj = fn.child_by_field_name("object")
                 if obj is not None:
                     receiver_text = obj.text.decode("utf-8", errors="replace")
+                    # M8 T1: byte span of the receiver TOKEN itself -- a bare
+                    # identifier spans whole; a dotted chain spans only its LAST
+                    # segment (mirrors ArgFact's own "attr" value_kind convention).
+                    # Any other receiver shape (subscript/call-expression result,
+                    # e.g. "get_routers()[0]") stays span-less -- not a resolvable
+                    # reference occurrence, honestly, not a guess.
+                    if obj.type == "identifier":
+                        receiver_start_byte, receiver_end_byte = obj.start_byte, obj.end_byte
+                    elif obj.type == "attribute":
+                        obj_last = obj.child_by_field_name("attribute")
+                        if obj_last is not None:
+                            receiver_start_byte = obj_last.start_byte
+                            receiver_end_byte = obj_last.end_byte
             if token is not None:
                 calls.append(CallFact(
                     callee_name=token.text.decode(),
@@ -610,6 +649,8 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
                     enclosing_def=parent_def,
                     args=_build_call_args(node.child_by_field_name("arguments")),
                     receiver_text=receiver_text,
+                    receiver_start_byte=receiver_start_byte,
+                    receiver_end_byte=receiver_end_byte,
                 ))
             # аргументы могут содержать вложенные вызовы/дефы — обходим дальше
 
@@ -648,6 +689,7 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
                             callee_name=callee_name,
                             call_args=_build_call_args(call_node.child_by_field_name("arguments")),
                             start_line=node.start_point[0] + 1,
+                            target_start_byte=left.start_byte,
                         ))
             # M7 T3 sanctioned additive extension: `self.<attr> = <expr>` -- see
             # SelfAttrFact's own docstring for the full rationale (http_client_ext's

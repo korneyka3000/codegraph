@@ -231,6 +231,52 @@ def test_receiver_text_single_identifier():
     assert call.receiver_text == "producer"
 
 
+# -- CallFact.receiver_start_byte/receiver_end_byte: M8 T1 sanctioned extension --
+#
+# Router-object symbol resolution (fastapi_ext's router_include claims, linking/
+# router_prefix.py) needs the RECEIVER's own byte span to run ctx.ref_symbol_lookup
+# on it (e.g. resolving "app" in `app.include_router(...)`) -- receiver_text alone
+# (a raw text copy) carries no position. Mirrors ArgFact's own "attr" value_kind
+# convention exactly: a single-identifier receiver spans the whole token; a dotted
+# receiver spans only its LAST segment (the actual object being referenced -- e.g.
+# `self._db` in `self._db.execute(...)` must resolve "_db", not "self").
+
+
+def test_receiver_start_byte_single_identifier():
+    facts, source = _fixture_facts("document_management/app/events/producer.py")
+    call = next(c for c in facts.calls if c.callee_name == "send")
+    assert call.receiver_start_byte is not None and call.receiver_end_byte is not None
+    assert source[call.receiver_start_byte:call.receiver_end_byte] == b"producer"
+
+
+def test_receiver_start_byte_multi_segment_attribute_is_last_segment_only():
+    facts, source = _fixture_facts("orders_api/app/db/outbox.py")
+    call = next(c for c in facts.calls if c.callee_name == "execute")
+    assert call.receiver_text == "self._db"
+    assert call.receiver_start_byte is not None and call.receiver_end_byte is not None
+    assert source[call.receiver_start_byte:call.receiver_end_byte] == b"_db"
+
+
+def test_receiver_start_byte_none_for_plain_identifier_call():
+    facts, _ = _fixture_facts("document_management/app/events/producer.py")
+    call = next(c for c in facts.calls if c.callee_name == "AIOKafkaProducer")
+    assert call.receiver_start_byte is None and call.receiver_end_byte is None
+
+
+def test_receiver_start_byte_none_for_non_identifier_non_attribute_receiver():
+    """A receiver that's neither a bare identifier nor an attribute chain (e.g. a
+    subscript/call-expression result) still gets receiver_text (raw text, as before)
+    but no resolvable byte span -- honestly "not a shape ctx.ref_symbol_lookup can be
+    pointed at", never a guess."""
+    src = b'''def f():
+    get_routers()[0].include_router(x)
+'''
+    facts = build_file_facts("m.py", src)
+    call = next(c for c in facts.calls if c.callee_name == "include_router")
+    assert call.receiver_text == "get_routers()[0]"
+    assert call.receiver_start_byte is None and call.receiver_end_byte is None
+
+
 # -- dict-literal ArgFact (key/value spans) --
 
 
@@ -343,6 +389,44 @@ def handler():
     facts = build_file_facts("x.py", src)
     targets = {a.target: a.callee_name for a in facts.assigns}
     assert targets == {"client": "make_client", "result": "process"}
+
+
+# -- AssignFact.target_start_byte: M8 T1 sanctioned additive extension --
+#
+# route_decl claims (fastapi_ext.py, linking/router_prefix.py) need the byte span of
+# an APIRouter/FastAPI assignment's OWN target (e.g. "router" in
+# `router = APIRouter(prefix="/x")`) to resolve it as a DEFINITION occurrence via
+# ctx.def_symbol_lookup -- a cross-file-stable identity `include_router(...)` calls
+# elsewhere can point back at via a REFERENCE occurrence (see resolvers/scip/
+# symbols.symbol_to_node_id: same descriptor-based id either way).
+
+
+def test_assign_fact_target_start_byte_appended_field_defaults_to_none():
+    """New LAST field with a default -- the old 4-positional-arg construction (the
+    field-order contract test above) keeps working unchanged."""
+    a = AssignFact("x", "Callee", [], 3)
+    assert a.target_start_byte is None
+    a2 = AssignFact("x", "Callee", [], 3, 7)
+    assert a2.target_start_byte == 7
+
+
+def test_assign_fact_target_start_byte_points_at_lhs_identifier():
+    src = b'''router = APIRouter(prefix="/orders")
+'''
+    facts = build_file_facts("m.py", src)
+    router_assign = next(a for a in facts.assigns if a.target == "router")
+    assert router_assign.target_start_byte == 0
+    end = router_assign.target_start_byte + len("router")
+    assert src[router_assign.target_start_byte:end] == b"router"
+
+
+def test_assign_fact_target_start_byte_function_level_assignment():
+    facts, source = _fixture_facts("document_management/app/events/producer.py")
+    by_target = {a.target: a for a in facts.assigns}
+    producer_ctor = by_target["_producer"]
+    assert producer_ctor.target_start_byte is not None
+    end = producer_ctor.target_start_byte + len("_producer")
+    assert source[producer_ctor.target_start_byte:end] == b"_producer"
 
 
 # -- ParamFact: typed_parameter / typed_default_parameter (Depends) with spans --

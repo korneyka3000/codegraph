@@ -27,11 +27,18 @@ Fixed pipeline order, each stage consuming the previous stage's output:
      into a route that no longer exists in source and keeping the stale Channel "alive"
      forever (empirically caught by this fix's own double-run regression test).
   3. temporal_start_mark claims -> CALLS edges (see `_apply_temporal_start_marks`).
-  4. `http_routes.link` -- claims -> CALLS_HTTP.
-  5. `segments.derive` -- PRODUCES/CONSUMES/CALLS_HTTP/HANDLES/CONTAINS -> NEXT_SEGMENT.
+  4. `router_prefix.link` -- route_decl/router_include claims (M8 T1, rerun-2 R4) ->
+     Channel(http_route) + HANDLES, composed across cross-file `include_router`
+     chains (see linking/router_prefix.py's own module docstring for the full
+     algorithm and honesty rule). Must run BEFORE http_routes.link (step 5): that
+     stage's own `_route_table` scan reads whatever Channel(http_route) nodes are
+     ALREADY staged, and this step is what stages them now -- fastapi_ext.py (S5)
+     no longer creates them directly.
+  5. `http_routes.link` -- claims -> CALLS_HTTP.
+  6. `segments.derive` -- PRODUCES/CONSUMES/CALLS_HTTP/HANDLES/CONTAINS -> NEXT_SEGMENT.
      Must run AFTER http_routes.link: one of its two pairing rules consumes CALLS_HTTP
      edges that only exist once http_routes.link has written them.
-  6. `processes.materialize` -- cfg.processes + TemporalWorkflow roles -> BusinessProcess
+  7. `processes.materialize` -- cfg.processes + TemporalWorkflow roles -> BusinessProcess
      + PART_OF_PROCESS. Must run LAST: its BFS trace walks NEXT_SEGMENT edges that only
      exist once segments.derive has written them.
 
@@ -48,6 +55,13 @@ module. http_routes.link separately reads the resulting unified Channel(http_rou
 table (see its own module docstring) -- that IS real linking work, just not "channel
 unification" in the sense of deduplicating near-identical nodes.
 
+M8 T1 (rerun-2 R4): http_route Channels themselves are no longer built by fastapi_ext.py
+in S5 at all -- `router_prefix.link` (step 4 above) builds them here in S7 instead, from
+route_decl/router_include claims, since a route's full cross-file `include_router`-chain
+identity can't be known from a single file. kafka_topic/event_type/temporal_signal
+Channels are UNAFFECTED (still built directly by kafka_ext/temporal_ext in S5) -- this
+determinism argument continues to hold for them unchanged.
+
 temporal_start_mark: see `_apply_temporal_start_marks` for the create-vs-update design
 and the resolution="dynamic"/confidence=0.9 decision.
 """
@@ -58,7 +72,7 @@ from codegraph.config.models import WorkspaceConfig
 from codegraph.core.schema import EdgeRec
 from codegraph.stores.staging import Staging
 
-from . import http_routes, processes, segments
+from . import http_routes, processes, router_prefix, segments
 
 _EXTRACTOR = "linking"
 _MARK_TYPE = "CALLS"
@@ -120,12 +134,17 @@ def link_workspace(cfg: WorkspaceConfig, staging: Staging) -> dict:
     """S7 entry point. staging-only (no FalkorDB access) -- callers don't need a
     store-unavailability guard around this call. Returns a JSON-serializable counters
     dict: {calls_http, calls_http_unresolved, next_segments, processes, marks,
-    channels_gc, part_of_process_ambiguous}. The last (M3 T2) is
-    processes.materialize's own `_entry_of`-climb ambiguity count, passed through
-    unchanged -- see linking/processes.py's module docstring for what it means."""
+    channels_gc, part_of_process_ambiguous, route_prefix_unresolved}. The
+    part_of_process_ambiguous key (M3 T2) is processes.materialize's own
+    `_entry_of`-climb ambiguity count, passed through unchanged -- see
+    linking/processes.py's module docstring for what it means. route_prefix_unresolved
+    (M8 T1, rerun-2 R4) is router_prefix.link's own honest-miss counter -- see
+    linking/router_prefix.py's own module docstring for the three failure shapes it
+    counts."""
     staging.clear_workspace_layer()
     channels_gc = staging.gc_orphan_channels()
     marks = _apply_temporal_start_marks(staging)
+    router_prefix_stats = router_prefix.link(staging)
     http_stats = http_routes.link(cfg, staging)
     segment_stats = segments.derive(staging)
     process_stats = processes.materialize(cfg, staging)
@@ -137,4 +156,5 @@ def link_workspace(cfg: WorkspaceConfig, staging: Staging) -> dict:
         "marks": marks,
         "channels_gc": channels_gc,
         "part_of_process_ambiguous": process_stats["part_of_process_ambiguous"],
+        "route_prefix_unresolved": router_prefix_stats["route_prefix_unresolved"],
     }

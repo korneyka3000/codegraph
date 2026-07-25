@@ -295,7 +295,14 @@ def print_report(report: dict, console: Console) -> None:
             f"(unresolved={linking.get('calls_http_unresolved', 0)}), "
             f"next_segments = {linking.get('next_segments', 0)}, "
             f"processes = {linking.get('processes', 0)}, "
-            f"channels_gc = {linking.get('channels_gc', 0)}"
+            f"channels_gc = {linking.get('channels_gc', 0)}, "
+            # M8 T1 (rerun-2 R4): router_prefix.link's own honest-miss counter --
+            # a route whose cross-file include_router chain didn't fully compose
+            # (unresolvable router_symbol, a cycle, or an unresolvable/ambiguous
+            # hop -- see linking/router_prefix.py's own docstring), so it fell back
+            # to its local-only template. Same "always present, 0 when nothing
+            # failed" convention as calls_http_unresolved just above.
+            f"route_prefix_unresolved = {linking.get('route_prefix_unresolved', 0)}"
         )
 
     # M3 T6 (additive, same "absent -> strict no-op" contract as linking above):

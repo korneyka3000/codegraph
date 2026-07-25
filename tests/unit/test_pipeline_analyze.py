@@ -191,16 +191,30 @@ def test_default_runner_is_constructed_when_none(tmp_path, monkeypatch):
     assert report["degraded"] is True
 
 
-# -- M2 T4: fastapi extractor wiring (active_idioms), degraded/fallback path --
+# -- M2 T4 / M8 T1: fastapi extractor wiring (active_idioms), degraded/fallback path --
 #
 # Exercised through the SAME degraded fallback path as the tests above (no real
-# scip-python): def_symbol_lookup is covered end-to-end (fallback.resolve_service lays
-# down a synthetic def for every DefFact, including first-party module-level
-# functions), so route/HANDLES/role wiring is provable here. DEPENDS_ON is NOT provable
-# here (see test below and fastapi_ext.py's module docstring for why) -- its full
-# resolution is proven at the extract_fastapi unit level instead
-# (test_fastapi_extractor.py, stubbed ref_symbol_lookup), matching the brief's own
-# "юнит: стаб; интеграцию покроет T9".
+# scip-python): def_symbol_lookup/ref_symbol_lookup are both covered by staging's own
+# real methods here (unlike test_fastapi_extractor.py's stubs) -- resolvers/fallback.py
+# lays down a synthetic def for every DefFact (class/function only -- see its own
+# module docstring), so role/node_props/route_decl-claim wiring is provable here.
+# DEPENDS_ON and router_symbol (M8 T1) are NOT provable here (see the tests below and
+# fastapi_ext.py's module docstring for why -- neither a param-default/annotation
+# expression NOR an assignment TARGET ever gets a ref/def laid down by the degraded
+# fallback resolver, only real SCIP resolves either) -- both are proven at the
+# extract_fastapi unit level instead (test_fastapi_extractor.py, stubbed lookups),
+# matching the brief's own "юнит: стаб; интеграцию покроет T9". Full end-to-end
+# cross-file router_symbol resolution against REAL scip-python is empirically confirmed
+# by decoding fixtures/.codegraph/scip's own orders-api index directly (see
+# fastapi_ext.py's module docstring) and exercised live by the M2/M6/M7 gates.
+#
+# M8 T1: analyze_service (S1-S6) alone no longer creates the Channel(http_route) node
+# or the HANDLES edge at all -- route/HANDLES identity now needs the FULL cross-file
+# `include_router` chain, which a single service's own S1-S6 pass can see (claims are
+# per-file) but cannot COMPOSE (that needs the whole workspace, S7). It stages
+# route_decl/router_include claims instead; linking/router_prefix.py (S7,
+# test_router_prefix.py) is what turns those into the Channel/HANDLES the OLD version
+# of this test suite asserted on directly here.
 
 ORDERS_FIXTURE = Path(__file__).parents[2] / "fixtures" / "services" / "orders_api"
 
@@ -217,9 +231,15 @@ def test_analyze_fastapi_inactive_by_default_no_route_roles_or_channels(tmp_path
     assert not any(n.roles for n in nodes)
     assert not any(n.kind == "Channel" for n in nodes)
     assert not any(e.type in ("HANDLES", "DEPENDS_ON") for e in st.iter_edges())
+    assert st.claims_for("route_decl", "orders-api") == []
+    assert st.claims_for("router_include", "orders-api") == []
 
 
-def test_analyze_fastapi_active_wires_route_roles_channels_and_handles(tmp_path):
+def test_analyze_fastapi_active_wires_route_roles_and_route_decl_claims(tmp_path):
+    """roles/node_props are file-local and UNCHANGED by M8 T1 -- still merged onto the
+    handler's own NodeRec directly here. What's NEW is route_decl claims replacing the
+    OLD direct Channel/HANDLES emission -- no Channel/HANDLES exists until S7
+    (router_prefix.link) actually runs, which this call alone never does."""
     svc = ServiceConfig(name="orders-api", path=ORDERS_FIXTURE)
     st = Staging(tmp_path / "s.db")
     analyze_service(
@@ -237,15 +257,32 @@ def test_analyze_fastapi_active_wires_route_roles_channels_and_handles(tmp_path)
     assert get_order.props["http_method"] == "GET"
     assert get_order.props["path_template"] == "/orders/{order_id}"
 
-    channel_ids = {n.id for n in st.iter_nodes() if n.kind == "Channel"}
-    assert channel_ids == {
-        "chan:http:orders-api:POST /orders",
-        "chan:http:orders-api:GET /orders/{order_id}",
-    }
+    # no Channel/HANDLES yet -- S7 (router_prefix.link) hasn't run at all.
+    assert not any(n.kind == "Channel" for n in st.iter_nodes())
+    assert not any(e.type == "HANDLES" for e in st.iter_edges())
 
-    handles = {e.src: e.dst for e in st.iter_edges() if e.type == "HANDLES"}
-    assert handles["chan:http:orders-api:POST /orders"] == create_order.id
-    assert handles["chan:http:orders-api:GET /orders/{order_id}"] == get_order.id
+    claims_by_shape = {
+        (c["verb"], c["prefix_local"], c["path"]): c
+        for c in st.claims_for("route_decl", "orders-api")
+    }
+    assert set(claims_by_shape) == {
+        ("POST", "/orders", ""), ("GET", "/orders", "/{order_id}"),
+    }
+    post_claim = claims_by_shape[("POST", "/orders", "")]
+    assert post_claim["handler_node_id"] == create_order.id
+    get_claim = claims_by_shape[("GET", "/orders", "/{order_id}")]
+    assert get_claim["handler_node_id"] == get_order.id
+    # degraded fallback never lays a def at an assignment TARGET at all (only at
+    # class/function defs -- resolvers/fallback.py) -- router_symbol stays honestly
+    # unresolved through this specific path, same documented-gap shape as DEPENDS_ON.
+    assert post_claim["router_symbol"] is None
+    assert get_claim["router_symbol"] is None
+    # analyze_service scans the WHOLE service, not just the routes file -- app/main.py's
+    # own `app.include_router(orders_router)` call produces a router_include claim too.
+    includes = st.claims_for("router_include", "orders-api")
+    assert len(includes) == 1
+    assert includes[0]["_relpath"] == "app/main.py"
+    assert includes[0]["prefix"] is None  # no prefix= kwarg on that real call site
 
 
 def test_analyze_fastapi_active_degraded_fallback_cannot_resolve_depends_on(tmp_path):
@@ -275,6 +312,8 @@ def test_analyze_non_fastapi_active_idiom_is_a_noop_for_fastapi_wiring(tmp_path)
     )
     assert not any(n.roles for n in st.iter_nodes())
     assert not any(n.kind == "Channel" for n in st.iter_nodes())
+    assert st.claims_for("route_decl", "orders-api") == []
+    assert st.claims_for("router_include", "orders-api") == []
 
 
 # -- M2 T5: kafka_ext/temporal_ext wiring (idioms param, active_idioms), degraded path --

@@ -512,6 +512,29 @@ def test_print_report_shows_linking_summary_when_present():
         assert value in text
 
 
+def test_print_report_shows_route_prefix_unresolved_on_linking_line():
+    """M8 T1 (rerun-2 R4): route_prefix_unresolved joins the linking summary line,
+    same "always present, 0-defaulted" convention as calls_http_unresolved."""
+    link_stats_with_route_prefix = {**LINK_STATS, "route_prefix_unresolved": 7}
+    report = build_report([SERVICE_OK], LOAD_STATS, link_stats_with_route_prefix)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+
+    assert "route_prefix_unresolved" in text
+    assert "7" in text
+
+
+def test_print_report_linking_line_defaults_route_prefix_unresolved_to_zero_when_absent():
+    """A link_stats dict predating M8 T1 (no route_prefix_unresolved key at all) must
+    not KeyError -- the line just shows 0."""
+    report = build_report([SERVICE_OK], LOAD_STATS, LINK_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise
+    text = console.export_text()
+    assert "route_prefix_unresolved = 0" in text
+
+
 def test_print_report_no_linking_line_when_absent():
     """Backward compatibility: a report built without link_stats (or hand-built without
     a "linking" key at all, as every pre-T7 report was) must not print anything new."""
