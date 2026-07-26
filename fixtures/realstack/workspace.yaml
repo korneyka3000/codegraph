@@ -103,5 +103,10 @@ services:
           topic: { attr: "self.config.topic" }
 builtin_idioms: [fastapi, aiokafka, faststream, confluent, temporal, aiohttp_client]
 processes:
+  # M8 T3: entrypoint selector updated for gateway's own restructured routing
+  # (app/routes/__init__.py's aggregator "/v1" + app/main.py's include-kwarg "/api"
+  # -> composed "/api/v1/submit") -- the pre-M8 selector no longer resolves any
+  # staged route once router_prefix.py (S7) builds the Channel(http_route) from the
+  # FULLY composed template instead of the bare local one.
   - name: "Document submission"
-    entrypoint: "gateway:POST /submit"
+    entrypoint: "gateway:POST /api/v1/submit"

@@ -18,6 +18,38 @@
 #
 # Каждая запись выведена ВРУЧНУЮ из fixtures/realstack/services/*/app/*.py +
 # workspace.yaml — см. комментарий у каждой группы для конкретного файла:строки.
+#
+# M8 (T3, rerun-2 R4/R5): АДДИТИВНОЕ расширение — САНКЦИОНИРОВАННЫЙ протокол
+# верифицированного дополнения (R4's own whole point: композиция префиксов через
+# include_router-цепочку — это ИЗМЕНЕНИЕ семантики HTTP-каналов gateway's routes,
+# санкция контроллера ЕСТЬ явно в task-3-брифе). Три изменения, каждое
+# задокументировано у своей группы ниже:
+#   1. gateway restructured: app/routes/__init__.py — новый аггрегатор
+#      `api = APIRouter(prefix="/v1")`, включает submit_router+ops_router (ни один
+#      без своего префикса); app/main.py — `app.include_router(api, prefix="/api")`.
+#      Ни один существующий CALLS/INVOKES_ACTIVITY/CALLS_HTTP/PRODUCES/CONSUMES
+#      кортеж НЕ сдвинут (все существующие символы/каналы этого файла — byte-same);
+#      worker's routing НЕ тронут (trivial-chain regression: composition сквозь
+#      пустой ancestor-prefix воспроизводит byte-same шаблон, как и раньше M8).
+#   2. НОВАЯ секция HANDLES (впервые в этом golden — тип не был в скоупе M6/M7-
+#      гейтов, но evalx.edges_eval уже поддерживает его нативно, см. её module
+#      docstring: staged-направление channel->handler нормализуется в тот же
+#      (type, handler_service, handler_symbol, chan_id) кортеж, что и golden
+#      src=handler/dst=channel здесь) — прямое, исчерпывающее (P=R=1.0) дока-
+#      зательство R4: ВСЕ семь реальных HTTP-роутов фикстуры (4 у gateway —
+#      теперь через НЕТРИВИАЛЬНУЮ multi-hop цепочку с ОБОИМИ фиксами R4 —
+#      include-kwarg-префикс И aggregator's own декларированный префикс — M8
+#      review Important-1; 3 у worker — тривиальный однофайловый случай без
+#      цепочки, byte-same, что и до M8) с их composed-каналами напрямую из
+#      router_prefix.py (S7), а не старой прямой S5-эмиссией fastapi_ext.py.
+#   3. НОВАЯ typed-signal PRODUCES запись (R5): DocActivities.publish_submitted_
+#      event шлёт `handle.signal(DocSubmissionWorkflow.doc_approved, ...)` —
+#      типизированная ссылка на ТОТ ЖЕ M7 T4 хендлер, резолвится через
+#      ref_symbol_lookup (temporal_ext.py M8 T2) + linking/signal_send.py →
+#      static/1.0, mechanism=temporal_signal — РЯДОМ с уже существующей
+#      строковой cross-service отправкой из worker's DocSubmittedConsumer
+#      (heuristic/0.6, не тронута) в тот же канал chan:temporal_signal:
+#      doc-approved — оба леga честно резолвлены, ни один не golden-fit.
 version: 1
 edges:
   # --- gap 3: workflow.start_workflow (route -> workflow) и
@@ -102,6 +134,19 @@ edges:
   - src: {service: gateway, symbol: app.workflows.submission.DocSubmissionWorkflow.doc_approved}
     type: CONSUMES
     dst: {channel: "chan:temporal_signal:doc-approved"}
+  # --- M8 T3 (rerun-2 R5) same-service TYPED signal pair: DocActivities.
+  # publish_submitted_event (app/activities/docs.py) does
+  # handle.signal(DocSubmissionWorkflow.doc_approved, doc_uid) -- a typed ref to
+  # the SAME M7 T4 handler above, resolved via ref_symbol_lookup (temporal_ext.py
+  # M8 T2) and linked (linking/signal_send.py) onto the identical
+  # chan:temporal_signal:doc-approved channel the CONSUMES entry above already
+  # targets -- static/1.0 (a resolved symbol reference is full ground truth,
+  # mirrors INVOKES_ACTIVITY). Two independent PRODUCES into one channel: this
+  # entry does NOT replace or shift the pre-existing string-based one above.
+  - src: {service: gateway, symbol: app.activities.docs.DocActivities.publish_submitted_event}
+    type: PRODUCES
+    dst: {channel: "chan:temporal_signal:doc-approved"}
+    mechanism: temporal_signal
   # --- M7 T3 (OPEN R1) env->service anchored CALLS_HTTP: StatusClient.fetch_status
   # (app/clients/status_client.py) — auto-anchor self.host = config.worker_url ->
   # field_by_name -> SERVICE_WORKER_URL -> env_values.yaml -> worker; уникальный
@@ -113,6 +158,50 @@ edges:
   - src: {service: gateway, symbol: app.clients.status_client.StatusClient.fetch_status}
     type: CALLS_HTTP
     dst: {channel: "chan:http:worker:GET /api/v1/status/{doc_uid}"}
+  # --- M8 T3 (rerun-2 R4) HANDLES: every real HTTP route in the fixture, keyed by
+  # its FULLY COMPOSED channel id (router_prefix.py, S7 -- fastapi_ext.py, S5, no
+  # longer builds these directly). golden src=handler/dst=channel is the format
+  # edges_eval already documents for HANDLES (its staged direction is reversed,
+  # channel->handler -- found_edges normalizes it to this same shape, see that
+  # module's docstring); P=R=1.0 here is therefore a DIRECT, exhaustive proof that
+  # composition produced the byte-exact channel id for every route, not merely
+  # that route_prefix_unresolved stayed 0 (which would only prove "SOME confident
+  # template was computed", not that it is the CORRECT one).
+  #   - gateway (app/routes/submit.py, app/routes/ops.py): NEITHER leaf router
+  #     declares its own prefix; app/routes/__init__.py's aggregator `api` DOES
+  #     ("/v1", a router_decl claim); app/main.py mounts `api` under the
+  #     include-kwarg prefix "/api" -- composed template = "/api" + "/v1" +
+  #     <local path>, exercising BOTH halves of the R4 fix (include-kwarg prefix
+  #     AND the aggregator's own separately-declared prefix, M8 review
+  #     Important-1) in one real, multi-hop, cross-file chain.
+  #   - worker (app/routes/documents.py): UNCHANGED trivial single-file, no-
+  #     prefix, no-chain case -- composed template equals today's LOCAL template
+  #     byte-for-byte (empty ancestor prefix), the regression pin proving the S5
+  #     -> S7 relocation of Channel/HANDLES construction didn't shift the common
+  #     case. Includes the funnel-negative route itself (misc_catch_all) -- it
+  #     legitimately HANDLES exist as a channel (the M7 gate's own vacuity guard
+  #     already relies on this), it must simply never receive a CALLS_HTTP edge.
+  - src: {service: gateway, symbol: app.routes.submit.submit_document}
+    type: HANDLES
+    dst: {channel: "chan:http:gateway:POST /api/v1/submit"}
+  - src: {service: gateway, symbol: app.routes.ops.submit_decision}
+    type: HANDLES
+    dst: {channel: "chan:http:gateway:POST /api/v1/documents/{doc_uid}/decision"}
+  - src: {service: gateway, symbol: app.routes.ops.replay_document}
+    type: HANDLES
+    dst: {channel: "chan:http:gateway:POST /api/v1/documents/{doc_uid}/replay"}
+  - src: {service: gateway, symbol: app.routes.ops.document_status}
+    type: HANDLES
+    dst: {channel: "chan:http:gateway:GET /api/v1/status/{doc_uid}"}
+  - src: {service: worker, symbol: app.routes.documents.get_document}
+    type: HANDLES
+    dst: {channel: "chan:http:worker:GET /documents/{doc_uid}"}
+  - src: {service: worker, symbol: app.routes.documents.get_document_status}
+    type: HANDLES
+    dst: {channel: "chan:http:worker:GET /api/v1/status/{doc_uid}"}
+  - src: {service: worker, symbol: app.routes.documents.misc_catch_all}
+    type: HANDLES
+    dst: {channel: "chan:http:worker:GET /{a}/{b}/{c}/misc"}
 # channels: block is documentation only (mirrors fixtures/golden/edges.yaml's own
 # convention) -- nothing in evalx reads it; the gate hardcodes both channel ids via
 # core.ids.chan_kafka/chan_event and checks the CONTAINS pair directly against staging.
@@ -124,3 +213,8 @@ channels:
   # audit/archive), the temporal signal (chan:temporal_signal:doc-approved), and the
   # two new worker http routes (GET /api/v1/status/{doc_uid}; the misc funnel route
   # exists as a Channel but must have ZERO CALLS_HTTP into it).
+  # M8: gateway's own four http_route channels are now composed with a real "/api/v1"
+  # prefix (see the HANDLES section above) instead of bare local paths; worker's own
+  # three channels are unchanged. The typed-signal PRODUCES entry above shares the
+  # SAME chan:temporal_signal:doc-approved channel the string-based one already used
+  # -- no new channel identity, two independent producers into it.

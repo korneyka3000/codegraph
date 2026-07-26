@@ -23,9 +23,21 @@
 # сегмент. Прежние три сегмента байт-в-байт нетронуты — расширение аддитивно;
 # M6-гейт читает этот же файл и остаётся зелёным, т.к. фикстура и golden выросли
 # согласованно (его count/set-сравнение теперь проверяет 4 сегмента).
+# M8 T3: entrypoint selector updated from "gateway:POST /submit" to
+# "gateway:POST /api/v1/submit" -- gateway's OWN restructured routing (composed via
+# a real cross-file include_router chain, R4) changes the route's full template; the
+# segments themselves are UNCHANGED (entry symbols are qualified names, not route
+# templates, and every via_channel here after segment 1 names a WORKER route, whose
+# routing is untouched -- see fixtures/realstack/golden/edges.yaml's own M8 header
+# for the full rationale). The new typed-signal producer (DocActivities.
+# publish_submitted_event, app/activities/docs.py) feeds into the SAME
+# chan:temporal_signal:doc-approved channel/entry segment 4 already names below --
+# verified via tests/eval/test_m8_gate.py's own direct segment-1-exit check
+# (_typed_signal_hop_diff), since this file's own set-of-triples comparison can't
+# distinguish "one producer" from "two producers into the identical channel".
 version: 1
 traces:
-  - entrypoint: "gateway:POST /submit"
+  - entrypoint: "gateway:POST /api/v1/submit"
     segments:
       - service: gateway
         entry: {symbol: app.routes.submit.submit_document}

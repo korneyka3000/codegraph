@@ -76,7 +76,12 @@ GOLDEN_TRACES = FIXTURES / "golden" / "traces.yaml"
 GATE_TYPES = ("INVOKES_ACTIVITY", "CALLS_HTTP", "CONSUMES", "PRODUCES")
 
 GRAPH_NAME = "__m6_gate__"
-ENTRYPOINT_SELECTOR = "gateway:POST /submit"
+# M8 T3 (honest pin update -- this gate shares fixtures/realstack with M8's own
+# gate): gateway's own route composes to "/api/v1/submit" now (a real cross-file
+# include_router chain, R4's realstack proof) -- the pre-M8 "gateway:POST /submit"
+# selector no longer resolves any staged route. Worker's own routes (the OTHER
+# three golden legs this gate pins) are untouched by the M8 restructuring.
+ENTRYPOINT_SELECTOR = "gateway:POST /api/v1/submit"
 
 TOPIC_CHANNEL = ids.chan_kafka("${self.config.topic}")
 EVENT_CHANNEL = ids.chan_event("DocSubmittedEvent")
