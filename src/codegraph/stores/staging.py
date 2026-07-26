@@ -587,11 +587,17 @@ class Staging:
         marks, http_routes.link, segments.derive, processes.materialize) -- see that
         function's own docstring for why this exact position is load-bearing, not just
         convenient: by the time clear_workspace_layer() has run, every REAL Channel
-        already has its S5-native edge (fastapi_ext's HANDLES, kafka_ext's
-        PRODUCES/CONSUMES/CONTAINS -- created in the SAME analyze_service batch as the
-        Channel itself, extractor != "linking", so untouched by clear_workspace_layer),
-        so a Channel with zero edges at this exact point can only be leftover data, not
-        legitimately in-progress. Running GC BEFORE http_routes.link matters: that stage
+        already has its S5-native edge (kafka_ext's PRODUCES/CONSUMES/CONTAINS --
+        created in the SAME analyze_service batch as the Channel itself, extractor !=
+        "linking", so untouched by clear_workspace_layer), so a Channel with zero
+        edges at this exact point can only be leftover data, not legitimately
+        in-progress. M8 EXCEPTION -- http_route channels: HANDLES emission moved to S7
+        (linking/router_prefix.py, extractor="linking"), so EVERY http_route Channel
+        is "orphaned" at this exact point on a re-link run and gets GC'd here, then
+        recreated with the identical deterministic id by router_prefix.link right
+        after -- routine and harmless (end state unchanged); this is why the
+        `channels_gc` report counter reads ~route-count on repeat runs instead of ~0.
+        Running GC BEFORE http_routes.link matters: that stage
         rebuilds its route table by scanning EVERY staged Channel(http_route) node,
         stale or not -- if a stale Channel were still present when it scans, a claim
         that happens to still target the old (renamed-away) pattern would silently

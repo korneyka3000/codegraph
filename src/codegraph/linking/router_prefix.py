@@ -62,10 +62,15 @@ route is counted in `route_prefix_unresolved`:
      forever).
   3. An UNRESOLVABLE or AMBIGUOUS hop partway up the chain: a router_include claim
      whose own parent_symbol is None (the file that includes this router couldn't
-     itself be identified), or two DISTINCT parents both naming the identical
-     child_symbol (a genuine include-graph ambiguity -- silently picking one would
-     repeat the exact "false match worse than absence" mistake M7 T3's own funnel fix
-     was written to prevent, just one layer up the stack).
+     itself be identified), or ANY second include claim naming the identical
+     child_symbol -- not just "two DISTINCT parents": a legal FastAPI double-mount
+     (`app.include_router(r, prefix="/v1")` + `...prefix="/v2")`, serving both
+     paths) and even byte-identical includes from two files trip this too. That is a
+     deliberate under-approximation (M8 final review, finding 3): multi-mount
+     support would need one composed template PER mount; until then every such
+     router falls to discard+counter -- fail-safe, never a wrong path (silently
+     picking one would repeat the exact "false match worse than absence" mistake M7
+     T3's own funnel fix was written to prevent, just one layer up the stack).
   4. (M8 review Important-1) A hop PARENT with NO router_decl claim for its symbol
      (its own declared prefix is simply unknown -- e.g. a factory-built router,
      `router = create_router()`, whose assignment matches no APIRouter/FastAPI
