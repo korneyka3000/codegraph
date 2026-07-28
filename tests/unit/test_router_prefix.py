@@ -89,7 +89,7 @@ def _router_decl_claim(
 ) -> None:
     """M8 review Important-1: one router_decl claim per `X = APIRouter(...)`/
     `X = FastAPI(...)` assignment -- the hop-parent own-prefix source
-    _resolve_prefix folds in at every mount (see module docstring)."""
+    _resolve_prefixes folds in at every mount (see module docstring)."""
     staging.add_claims(service, relpath, "router_decl", [{
         "router_symbol": router_symbol, "prefix_local": prefix_local,
     }])
@@ -458,18 +458,31 @@ def test_unresolvable_parent_partway_up_falls_back_and_counts(tmp_path):
     assert chan.id == "chan:http:worker:GET /steps/{id}"
 
 
-# -- ambiguous: two distinct parents both claim to include the same child ------------
+# -- M9 T3: two distinct parents both including the same child is a LEGITIMATE
+# double-mount now, not an ambiguity -- retires the M8 under-approximation this
+# exact scenario used to pin (shape 3: "ANY second include claim naming the
+# identical child_symbol", even two DISTINCT parents, used to be discarded
+# outright). See the dedicated "-- M9 T3: multi-mount --" section below for the
+# rest of the cross-product/dedup/cap scenarios. ---------------------------------
 
 
-def test_ambiguous_multiple_parents_for_same_child_falls_back_and_counts(tmp_path):
+def test_two_distinct_parents_for_same_child_is_legitimate_double_mount(tmp_path):
+    """Two distinct router/app OBJECTS independently including the SAME child
+    router is structurally no different from one object including it twice --
+    real FastAPI serves both mounts live -- so this now composes as an ordinary
+    2-way multi-mount, exactly like the same-parent-two-prefixes case, provided
+    each parent's own hop resolves (both have router_decl claims here). Before
+    this task, ANY second include claim naming ROUTER_A -- even from a totally
+    distinct parent -- immediately discarded the whole chain (honesty-rule shape
+    3); that under-approximation is what this test now proves lifted."""
     st = Staging(tmp_path / "s.db")
     st.upsert_nodes([_fn(HANDLER)])
+    other_parent = "sym:worker:`app.other`/router."
     _route_decl(
         st, "worker", "app/routes/steps/detail.py",
         router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
         prefix_local="",
     )
-    other_parent = "sym:worker:`app.other`/router."
     _router_include(
         st, "worker", "app/routes/steps/__init__.py",
         parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
@@ -478,12 +491,22 @@ def test_ambiguous_multiple_parents_for_same_child_falls_back_and_counts(tmp_pat
         st, "worker", "app/other.py",
         parent_symbol=other_parent, child_symbol=ROUTER_A, prefix="/other",
     )
+    _router_decl_claim(st, "worker", "app/routes/steps/__init__.py",
+                       router_symbol=APP, prefix_local="")
+    _router_decl_claim(st, "worker", "app/other.py",
+                       router_symbol=other_parent, prefix_local="")
 
     report = router_prefix.link(st)
 
-    assert report["route_prefix_unresolved"] == 1
-    chan = next(n for n in st.iter_nodes() if n.kind == "Channel")
-    assert chan.id == "chan:http:worker:GET /x"
+    assert report["route_prefix_unresolved"] == 0
+    chan_ids = {n.id for n in st.iter_nodes() if n.kind == "Channel"}
+    assert chan_ids == {
+        "chan:http:worker:GET /api/v1/x",
+        "chan:http:worker:GET /other/x",
+    }
+    handles = [e for e in st.iter_edges() if e.type == "HANDLES"]
+    assert len(handles) == 2
+    assert all(h.dst == HANDLER for h in handles)
 
 
 def test_unresolvable_child_symbol_include_claim_is_simply_unusable(tmp_path):
@@ -650,6 +673,9 @@ def test_composed_patch_lands_on_handler_node_props(tmp_path):
     node = next(n for n in st.iter_nodes() if n.id == HANDLER)
     assert node.props["path_template"] == "/api/v1/steps/{id}"
     assert node.props["http_method"] == "GET"
+    # M9 T3: single-mount chains never gain a path_templates key -- that key
+    # exists ONLY when a route composes to more than one live template.
+    assert "path_templates" not in node.props
 
 
 def test_trivial_chain_does_not_patch_handler_node_props(tmp_path, monkeypatch):
@@ -767,3 +793,310 @@ def test_stale_file_reanalyze_then_relink_recomposes_handler_node_props(tmp_path
     router_prefix.link(st)
     recomposed = next(n for n in st.iter_nodes() if n.id == HANDLER)
     assert recomposed.props["path_template"] == "/api/v1/steps/{id}"
+
+
+# -- M9 T3: multi-mount -- lifts the M8 under-approximation (honesty-rule shape
+# 3): a router legitimately included more than once (same parent + different
+# include-kwarg prefixes, OR distinct parents -- see the dedicated test above)
+# now composes ONE template PER mount instead of discarding the whole chain.
+# One route_decl x N resolved mounts -> N Channels + N HANDLES onto the SAME
+# handler (ids differ by template -- naturally distinct). --------------------
+
+
+def test_double_mount_composes_two_templates_two_channels_same_handler(tmp_path):
+    """THE brief's own literal scenario: `app.include_router(r, prefix="/v1")` +
+    `app.include_router(r, prefix="/legacy")` -- both paths are legitimately
+    LIVE per real FastAPI semantics (a common versioning idiom), not an
+    ambiguity to discard. Each mount composes independently via the SAME
+    per-mount order as any single-mount chain (include-kwarg prefix + leaf's
+    own prefix_local + path) -- prefix_local="/items" here proves the order
+    holds for BOTH alternatives, not just a trivial no-prefix case."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "worker", "app/routes/items.py",
+        router_symbol=ROUTER_A, verb="GET", path="/{item_id}", handler_node_id=HANDLER,
+        prefix_local="/items",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/v1",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/legacy",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    report = router_prefix.link(st)
+
+    assert report["route_prefix_unresolved"] == 0
+    chan_ids = {n.id for n in st.iter_nodes() if n.kind == "Channel"}
+    assert chan_ids == {
+        "chan:http:worker:GET /v1/items/{item_id}",
+        "chan:http:worker:GET /legacy/items/{item_id}",
+    }
+    handles = [e for e in st.iter_edges() if e.type == "HANDLES"]
+    assert len(handles) == 2
+    assert {(h.src, h.dst) for h in handles} == {
+        ("chan:http:worker:GET /v1/items/{item_id}", HANDLER),
+        ("chan:http:worker:GET /legacy/items/{item_id}", HANDLER),
+    }
+    assert all(h.resolution == "static" and h.confidence == 1.0 for h in handles)
+
+
+def test_byte_identical_duplicate_includes_dedup_to_one_mount(tmp_path):
+    """Two DIFFERENT files independently emit the exact same (parent, child,
+    prefix) `router_include` claim -- these must dedup to ONE mount, not a
+    phantom double-mount. Distinct from the claims-table PK (service, relpath,
+    kind, payload), which only dedups WITHIN one file: this dedup is
+    include-graph-level, across files, keyed on (parent, child, prefix)."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "worker", "app/routes/x.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
+    )
+    _router_include(
+        st, "worker", "app/main_reexport.py",  # different file, byte-identical mount
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    report = router_prefix.link(st)
+
+    assert report["route_prefix_unresolved"] == 0
+    chans = [n for n in st.iter_nodes() if n.kind == "Channel"]
+    assert len(chans) == 1
+    assert chans[0].id == "chan:http:worker:GET /api/v1/x"
+    handles = [e for e in st.iter_edges() if e.type == "HANDLES"]
+    assert len(handles) == 1
+
+
+def test_ancestor_double_mount_propagates_to_descendant_routes(tmp_path):
+    """The route's OWN router (A) has just ONE mount, into B; B ITSELF is what's
+    double-mounted (into APP, two distinct include-kwarg prefixes). The
+    multiplicity from higher up the chain still yields 2 templates for A's own
+    routes -- multi-mount is not limited to a route's immediate parent hop."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "worker", "app/routes/a.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/api/__init__.py",
+        parent_symbol=ROUTER_B, child_symbol=ROUTER_A, prefix=None,
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_B, prefix="/v1",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_B, prefix="/legacy",
+    )
+    _router_decl_claim(st, "worker", "app/api/__init__.py",
+                       router_symbol=ROUTER_B, prefix_local="")
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    report = router_prefix.link(st)
+
+    assert report["route_prefix_unresolved"] == 0
+    chan_ids = {n.id for n in st.iter_nodes() if n.kind == "Channel"}
+    assert chan_ids == {
+        "chan:http:worker:GET /v1/x",
+        "chan:http:worker:GET /legacy/x",
+    }
+
+
+def test_triple_nested_cross_product_of_two_double_mounts(tmp_path):
+    """A is double-mounted into B (2 distinct include-kwarg prefixes at that
+    hop) AND B is itself double-mounted into APP (2 distinct prefixes at THAT
+    hop) -- routes on A get the full 2x2=4 cross product, one template per
+    (A-mount, B-mount) combination."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "worker", "app/routes/a.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/api/__init__.py",
+        parent_symbol=ROUTER_B, child_symbol=ROUTER_A, prefix="/a1",
+    )
+    _router_include(
+        st, "worker", "app/api/__init__.py",
+        parent_symbol=ROUTER_B, child_symbol=ROUTER_A, prefix="/a2",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_B, prefix="/b1",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_B, prefix="/b2",
+    )
+    _router_decl_claim(st, "worker", "app/api/__init__.py",
+                       router_symbol=ROUTER_B, prefix_local="")
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    report = router_prefix.link(st)
+
+    assert report["route_prefix_unresolved"] == 0
+    chan_ids = {n.id for n in st.iter_nodes() if n.kind == "Channel"}
+    assert chan_ids == {
+        "chan:http:worker:GET /b1/a1/x",
+        "chan:http:worker:GET /b1/a2/x",
+        "chan:http:worker:GET /b2/a1/x",
+        "chan:http:worker:GET /b2/a2/x",
+    }
+    handles = [e for e in st.iter_edges() if e.type == "HANDLES"]
+    assert len(handles) == 4
+    assert all(h.dst == HANDLER for h in handles)
+
+
+def test_one_hop_failure_mount_does_not_poison_sibling_valid_mount(tmp_path):
+    """A router mounted twice: once through a parent with NO router_decl claim
+    (own prefix unknown -- an ordinary hop failure, shape 4), once through a
+    parent that resolves cleanly. Per-mount independence (the whole point of
+    lifting the M8 under-approximation): the failing mount contributes nothing,
+    the valid mount still composes -- ONE template survives, not a whole-route
+    discard, and it is NOT counted as unresolved (something real WAS resolved,
+    the honesty rule only fires when NOTHING resolves at all)."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    ghost_parent = "sym:worker:`app.ghost`/router."
+    _route_decl(
+        st, "worker", "app/routes/x.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/v1",
+    )
+    _router_include(
+        st, "worker", "app/ghost.py",
+        parent_symbol=ghost_parent, child_symbol=ROUTER_A, prefix="/legacy",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+    # NO router_decl claim for ghost_parent -- that mount's own prefix is unknown.
+
+    report = router_prefix.link(st)
+
+    assert report["route_prefix_unresolved"] == 0
+    chans = [n for n in st.iter_nodes() if n.kind == "Channel"]
+    assert len(chans) == 1
+    assert chans[0].id == "chan:http:worker:GET /v1/x"
+
+
+def test_multi_mount_cap_exceeded_discards_counts_and_logs(tmp_path, caplog):
+    """17 distinct mounts for one router_symbol -- one more than the module's
+    own sane cap (16, "a legit app won't 16-mount a router") -- is a runaway/
+    malformed include-graph guard, not a legitimate scenario: the WHOLE
+    composed prefix is discarded (never a truncated-but-silently-partial
+    16-of-17 set), falls back to the local template, counts in
+    route_prefix_unresolved same as any other honesty-rule failure, AND
+    (unlike the other discard shapes, which are unremarkable/expected) logs a
+    warning -- this one signals a suspiciously-shaped include graph worth a
+    human's attention, per the module's own OOM-guard rationale."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "worker", "app/routes/x.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    for i in range(17):
+        _router_include(
+            st, "worker", "app/main.py",
+            parent_symbol=APP, child_symbol=ROUTER_A, prefix=f"/v{i}",
+        )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    with caplog.at_level("WARNING"):
+        report = router_prefix.link(st)
+
+    assert report["route_prefix_unresolved"] == 1
+    chans = [n for n in st.iter_nodes() if n.kind == "Channel"]
+    assert len(chans) == 1  # local template only, no partial/truncated spray
+    assert chans[0].id == "chan:http:worker:GET /x"
+    assert len(caplog.records) == 1
+    assert caplog.records[0].name == "codegraph.linking.router_prefix"
+    assert caplog.records[0].levelname == "WARNING"
+
+
+# -- M9 T3 compose-back: multi-mount props get the FIRST template by
+# lexicographic sort as path_template, plus a path_templates list of ALL of
+# them -- but ONLY when there's more than one (single-mount stays exactly the
+# T2 shape, pinned above). --------------------------------------------------
+
+
+def test_compose_back_multi_mount_props_first_sorted_plus_full_list(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/x")])
+    _route_decl(
+        st, "worker", "app/routes/x.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/v1",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/legacy",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    router_prefix.link(st)
+
+    node = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert node.props["path_template"] == "/legacy/x"  # "/legacy" < "/v1" lexicographically
+    assert node.props["path_templates"] == ["/legacy/x", "/v1/x"]
+    assert node.props["http_method"] == "GET"
+
+
+def test_double_link_is_idempotent_for_multi_mount(tmp_path):
+    """Re-running link() over an unchanged multi-mount include graph converges
+    to the identical channel/HANDLES set -- no drift, no duplicate/ghost edges
+    (relies on upsert_edges' own INSERT-OR-REPLACE PK semantics, same as the
+    pre-existing single-mount idempotency pin)."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "worker", "app/routes/x.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/v1",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/legacy",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    router_prefix.link(st)
+    first_chans = {n.id for n in st.iter_nodes() if n.kind == "Channel"}
+    first_handles = {(e.src, e.dst) for e in st.iter_edges() if e.type == "HANDLES"}
+
+    router_prefix.link(st)
+    second_chans = {n.id for n in st.iter_nodes() if n.kind == "Channel"}
+    second_handles = {(e.src, e.dst) for e in st.iter_edges() if e.type == "HANDLES"}
+
+    expected_chans = {"chan:http:worker:GET /v1/x", "chan:http:worker:GET /legacy/x"}
+    assert first_chans == second_chans == expected_chans
+    assert first_handles == second_handles
+    assert len(second_handles) == 2
