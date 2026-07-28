@@ -15,6 +15,7 @@ from codegraph.mcp.schemas import (
     SearchCodeOutput,
     TraceExit,
     TraceProcessInput,
+    TraceProcessOutput,
     TraceStep,
 )
 
@@ -140,3 +141,24 @@ def test_trace_exit_channel_accepts_external_props_additively():
 def test_trace_exit_channel_without_external_props_still_validates_unchanged():
     exit_ = TraceExit(channel={"id": "chan:event_type:X"}, next_entry_ids=["e2"])
     assert "external" not in exit_.channel
+
+
+# -- M9 T1 review Important: TraceProcessOutput.external_exit_count -- the
+# machine-readable top-level boundary signal (same precedent as `truncated`: a
+# programmatic/MCP consumer reading confidence=1.0 alone would conclude "fully
+# traced" for a trace that actually stops at a workspace boundary). Additive:
+# defaults to 0, so a pre-M9 result dict without the key still validates.
+
+
+def test_trace_process_output_accepts_external_exit_count():
+    out = TraceProcessOutput(
+        segments=[], confidence=1.0, truncated=False, external_exit_count=3,
+    )
+    assert out.external_exit_count == 3
+
+
+def test_trace_process_output_external_exit_count_defaults_to_zero_when_absent():
+    """Additivity pin: the exact pre-M9 result shape (no external_exit_count key
+    at all) must keep validating -- the field defaults to 0, never required."""
+    out = TraceProcessOutput(segments=[], confidence=0.5, truncated=False)
+    assert out.external_exit_count == 0

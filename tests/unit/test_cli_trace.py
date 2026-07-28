@@ -246,6 +246,7 @@ _EXTERNAL_EXIT_RESULT = {
     ],
     "confidence": 1.0,
     "truncated": False,
+    "external_exit_count": 1,
 }
 
 
@@ -262,6 +263,32 @@ def test_trace_text_format_renders_external_exit_as_external_host(tmp_path, monk
     assert "POST/api/v1/users/legal-entities" in flat
     assert "externalapi-gateway.prod.svc.cluster.local" in flat
     assert "unresolved" not in result.output.lower()
+
+
+def test_trace_text_title_annotates_external_exit_count_when_nonzero(tmp_path, monkeypatch):
+    """M9 T1 review Important: the trace TITLE carries the boundary count too --
+    same "(...)"-annotation convention as (truncated) on the same line."""
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_EXTERNAL_EXIT_RESULT))
+
+    result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
+    assert result.exit_code == 0, result.output
+    flat = "".join(result.output.split())
+    assert "(1externalexits)" in flat
+
+
+def test_trace_text_title_has_no_external_annotation_when_count_zero_or_absent(
+    tmp_path, monkeypatch,
+):
+    """_SUCCESS_RESULT predates the field entirely (no external_exit_count key at
+    all) -- the title (and whole output) must stay byte-identical to before this
+    task; an explicit 0 is the same no-annotation case by the same falsy gate."""
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_SUCCESS_RESULT))
+
+    result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "external" not in result.output.lower()
 
 
 def test_trace_text_format_renders_plain_unresolved_exit_unchanged(tmp_path, monkeypatch):

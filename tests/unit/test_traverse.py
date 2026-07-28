@@ -299,6 +299,91 @@ def test_external_exit_hop_confidence_excluded_from_aggregate_stays_1_0():
     assert len(exits) == 1
     assert exits[0]["channel"]["external"] is True
     assert exits[0]["channel"]["external_host"] == "api-gateway.prod.svc.cluster.local"
+    # M9 T1 review Important: the machine-readable top-level signal -- a
+    # programmatic/MCP consumer reading confidence=1.0 alone would conclude
+    # "fully traced" for a trace that actually stops at a workspace boundary (a
+    # human sees the external leg in the render; the machine needs this count --
+    # same precedent as the `truncated` field, which exists for exactly this).
+    assert result["external_exit_count"] == 1
+
+
+def test_external_exclusion_preserves_min_over_remaining_edges():
+    """M9 T1 review Minor pin (3-way MIN): external/0.5 exit (excluded) + a real
+    INTERNAL heuristic/0.6 step (kept) + a static/1.0 step (kept) -> aggregate is
+    exactly 0.6 -- exclusion removes ONLY the external hop's contribution, never
+    disturbing the minimum over every remaining edge."""
+    store = FakeStore()
+    store.add_node("entry", service="a", kind="Function")
+    store.add_node("strong_step", service="a", kind="Function")
+    store.add_node("weak_step", service="a", kind="Function")
+    store.add_node(
+        "chan:http:?:GET /external",
+        kind="Channel", name="GET /external", channel_kind="http_route",
+        unresolved=True, external=True, external_host="api-gateway.prod.svc.cluster.local",
+    )
+    store.add_edge("entry", "CALLS", "strong_step", confidence=1.0, resolution="static")
+    store.add_edge("entry", "CALLS", "weak_step", confidence=0.6, resolution="heuristic")
+    store.add_edge(
+        "entry", "CALLS_HTTP", "chan:http:?:GET /external",
+        confidence=0.5, resolution="heuristic",
+    )
+
+    result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+
+    assert result["confidence"] == 0.6
+    assert result["external_exit_count"] == 1
+
+
+def test_external_exit_count_zero_for_fully_internal_trace():
+    """0 = полностью внутренний трейс -- the three-segment happy path (one event
+    channel + one RESOLVED http channel, both in-workspace) reports zero."""
+    store = _three_segment_store()
+    result = traverse.trace_process(store, "create_order", max_segments=12, min_confidence=0.3)
+    assert result["external_exit_count"] == 0
+
+
+def test_external_exit_count_zero_for_plain_unresolved_exit():
+    """A generic (non-external) unresolved dead-end exit does NOT count -- the
+    counter reports documented BOUNDARIES only, never plain modeling gaps."""
+    store = FakeStore()
+    store.add_node("entry", service="a", kind="Function")
+    store.add_node(
+        "chan:http:?:GET /unresolved",
+        kind="Channel", name="GET /unresolved", channel_kind="http_route", unresolved=True,
+    )
+    store.add_edge(
+        "entry", "CALLS_HTTP", "chan:http:?:GET /unresolved",
+        confidence=0.5, resolution="heuristic",
+    )
+
+    result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+    assert result["external_exit_count"] == 0
+
+
+def test_external_exit_count_sums_across_segments():
+    """Two segments, each with its own external exit -> count == 2 (a per-exit
+    counter over the WHOLE trace, not a per-segment or boolean signal)."""
+    store = FakeStore()
+    store.add_node("entryA", service="a", kind="Function")
+    store.add_node("entryB", service="b", kind="Function")
+    store.add_node("chan:event_type:E", kind="Channel", channel_kind="event_type")
+    store.add_node(
+        "chan:http:?:GET /ext-a", kind="Channel", channel_kind="http_route",
+        unresolved=True, external=True, external_host="gw-a.prod",
+    )
+    store.add_node(
+        "chan:http:?:GET /ext-b", kind="Channel", channel_kind="http_route",
+        unresolved=True, external=True, external_host="gw-b.prod",
+    )
+    store.add_edge("entryA", "CALLS_HTTP", "chan:http:?:GET /ext-a", confidence=0.5)
+    store.add_edge("entryA", "PRODUCES", "chan:event_type:E")
+    store.add_edge(
+        "entryA", "NEXT_SEGMENT", "entryB", via_channel_id="chan:event_type:E", derived=True
+    )
+    store.add_edge("entryB", "CALLS_HTTP", "chan:http:?:GET /ext-b", confidence=0.5)
+
+    result = traverse.trace_process(store, "entryA", max_segments=12, min_confidence=0.3)
+    assert result["external_exit_count"] == 2
 
 
 def test_non_external_exit_hop_confidence_still_counts_toward_aggregate():

@@ -179,6 +179,16 @@ class TraceProcessOutput(BaseModel):
     # -- см. query/traverse.py::trace_process докстринг за полной формулой до/после.
     confidence: float
     truncated: bool  # true если truncated у любого сегмента ИЛИ max_segments срезал список
+    # M9 T1 review Important: machine-readable спутник exclusion'а выше -- число
+    # exit-входов ВСЕЙ трассы с channel.external=True (0 = полностью внутренний
+    # трейс). Без него программный/MCP-потребитель, читающий confidence=1.0 с
+    # верха, заключил бы «fully traced» для трассы, упирающейся в границу
+    # воркспейса (человек видит external-леги в рендере, машина -- нет; прецедент
+    # -- поле `truncated`, существующее ровно для этого). Счётчик, не bool --
+    # строго богаче при том же falsy-прочтении. АДДИТИВНО: default 0, pre-M9
+    # result-dict без ключа валидируется как прежде (запинено в
+    # tests/unit/test_mcp_schemas.py).
+    external_exit_count: int = 0
 
 
 class FindPathsInput(BaseModel):

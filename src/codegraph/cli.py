@@ -654,6 +654,16 @@ def _trace_tree(result: dict) -> Tree:
     просто (edge_type, props, node, direction))."""
     conf = result.get("confidence", 1.0)
     title = f"trace (confidence={conf:.2f})"
+    # M9 T1 review Important: the boundary count sits next to the confidence it
+    # qualifies -- external exits are EXCLUDED from that number (see
+    # query/traverse.py::trace_process's formula), so a reader of
+    # "confidence=1.00" must see, on the SAME line, whether the trace stops at
+    # workspace boundaries. .get()-defaulted: a pre-M9 result dict (older
+    # callers/tests) carries no key at all -- same falsy no-annotation gate as
+    # (truncated) just below.
+    external_exits = result.get("external_exit_count", 0)
+    if external_exits:
+        title += f" ({external_exits} external exits)"
     if result.get("truncated"):
         title += " [yellow](truncated)[/]"
     root = Tree(title)

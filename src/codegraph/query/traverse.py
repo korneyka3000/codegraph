@@ -354,6 +354,19 @@ def trace_process(
     (cli.py's `_trace_tree`/`_trace_mermaid`, "-> external <host>") at its own
     honest heuristic/0.5, it simply no longer poisons the AGGREGATE.
 
+    external_exit_count (M9 T1 review Important): the machine-readable companion
+    to the exclusion above -- the number of exit entries across the WHOLE trace
+    whose channel is flagged `external=True` (0 = fully internal trace). Without
+    it, a programmatic/MCP consumer reading confidence=1.0 off the top would
+    conclude "fully traced" for a trace that actually stops at a workspace
+    boundary -- a human sees the external legs in the rendered exits, a machine
+    needs a top-level signal (exactly the precedent the `truncated` field set).
+    A count rather than a bool: strictly richer, same falsy "nothing to flag"
+    reading. Counted per exit ENTRY (a channel appearing as an exit of two
+    different segments counts twice -- matches what the rendered trace shows),
+    and only for exits that made it into the output segments (a boundary beyond
+    the max_segments cap is `truncated`'s concern, not this counter's).
+
     compact (M5 T5, default True): post-process each segment's steps through
     _compact_steps above -- collapses long boring runs (see its own docstring),
     a no-op for any segment at or under _COMPACT_STEP_GATE steps. compact=False
@@ -367,6 +380,7 @@ def trace_process(
     visited_entries = {entrypoint_id}
     queue = [entrypoint_id]
     truncated = False
+    external_exit_count = 0
 
     while queue and len(segments) < max_segments:
         entry_id = queue.pop(0)
@@ -393,6 +407,11 @@ def trace_process(
             truncated = True
 
         for exit_ in walked["exits"]:
+            # M9 T1 review Important: count external-boundary exits (per exit
+            # entry, over the whole trace) -- the data is already collected (the
+            # channel node dict rides in every exit), this is pure bookkeeping.
+            if (exit_.get("channel") or {}).get("external"):
+                external_exit_count += 1
             for next_id in exit_["next_entry_ids"]:
                 if next_id not in visited_entries:
                     visited_entries.add(next_id)
@@ -402,7 +421,12 @@ def trace_process(
         truncated = True
 
     confidence = min(all_confidences) if all_confidences else 1.0
-    return {"segments": segments, "confidence": confidence, "truncated": truncated}
+    return {
+        "segments": segments,
+        "confidence": confidence,
+        "truncated": truncated,
+        "external_exit_count": external_exit_count,
+    }
 
 
 def _reconstruct_path(visited: dict[str, tuple], to_id: str) -> list[dict]:

@@ -457,6 +457,28 @@ def test_env_map_hostname_not_a_workspace_service_is_external_tier(tmp_path):
     assert edge.resolution == "heuristic" and edge.confidence == 0.5
 
 
+def test_env_known_value_not_url_shaped_is_unmapped_not_external(tmp_path):
+    """M9 T1 review Minor pin (link()-level -- complements test_env_map.py's own
+    build-level non-URL cases): env_sources HAS an entry for the claim's env name,
+    but its value doesn't parse as a URL with a hostname (plain text here; the
+    scheme-less host:port quirk is the same non-case, see env_map.py) -- there is
+    no REAL hostname to name a boundary with, so this must land in the generic
+    UNMAPPED bucket (calls_http_unresolved), NEVER the external tier."""
+    helm = tmp_path / "values.yaml"
+    helm.write_text("SOME_URL: just-a-plain-string\n")
+    st = Staging(tmp_path / "s.db")
+    _claim(st, "caller", "a.py", "sym:caller:f", "GET", "/x", base_url_env="SOME_URL")
+
+    cfg = _cfg(_svc("service-a"), env_sources=[helm])
+    stats = http_routes.link(cfg, st)
+
+    assert stats == {"calls_http": 1, "calls_http_unresolved": 1, "calls_http_external": 0}
+    chan = next(n for n in st.iter_nodes() if n.kind == "Channel")
+    assert chan.props.get("config_ref") == "SOME_URL"
+    assert "external" not in chan.props
+    assert "external_host" not in chan.props
+
+
 def test_anchored_via_env_map_wins_over_external_even_though_hostname_also_present(
     tmp_path,
 ):
