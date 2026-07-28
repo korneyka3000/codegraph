@@ -1,6 +1,7 @@
 from temporalio import activity
 from temporalio.client import Client
 
+from app.clients.audit_client import AuditClient
 from app.clients.doc_client import DocClient
 from app.services.publisher import KYCEventPublisher
 
@@ -9,6 +10,9 @@ class DocActivities:
     def __init__(self) -> None:
         self._doc_client = DocClient(host="http://worker")
         self._publisher = KYCEventPublisher()
+        # M9 T1 realstack leg: external HTTP target (audit.ext.prod.env, no
+        # workspace service) -- see app/clients/audit_client.py's own docstring.
+        self._audit_client = AuditClient(host="http://audit-external")
 
     @activity.defn
     async def fetch_document_content(self, doc_uid: str) -> dict:
@@ -19,6 +23,11 @@ class DocActivities:
     async def publish_submitted_event(self, doc_uid: str, topic_name: str) -> None:
         # Gap 5: reaches the producer wrapper (KYCEventPublisher.publish).
         await self._publisher.publish(doc_uid, topic_name, doc_uid)
+        # M9 T1 realstack leg: external HTTP target -- reachable from THIS trace's
+        # own entrypoint (submit_document -> DocSubmissionWorkflow.run -> HERE via
+        # INVOKES_ACTIVITY), so the entry's own trace segment gains a new exit into
+        # the external channel (see app/clients/audit_client.py's own docstring).
+        await self._audit_client.submit_audit_event(doc_uid)
         # M8 T3 (rerun-2 R5 realstack leg): same-service TYPED signal send -- a typed
         # ref to the M7 T4 signal handler (DocSubmissionWorkflow.doc_approved),
         # resolved via ref_symbol_lookup at extraction time (temporal_ext.py's M8 T2

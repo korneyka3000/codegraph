@@ -35,6 +35,22 @@
 # verified via tests/eval/test_m8_gate.py's own direct segment-1-exit check
 # (_typed_signal_hop_diff), since this file's own set-of-triples comparison can't
 # distinguish "one producer" from "two producers into the identical channel".
+#
+# M9 (task-5): DocActivities.publish_submitted_event (segment 1's own entry chain,
+# via INVOKES_ACTIVITY from DocSubmissionWorkflow.run) gains a NEW CALLS_HTTP exit
+# into the external channel chan:http:?:POST /audit/events (AuditClient.
+# submit_audit_event, M9 T1 realstack leg) -- but this does NOT add a fifth
+# segment below: an external channel has no in-workspace consumer/HANDLES by
+# construction (linking/segments.py's own NEXT_SEGMENT derivation has nothing to
+# pair it with), so it is a true dead-end exit, same shape as the funnel/misc route
+# already documented as reachable-by-nobody. The segment SET this file enumerates
+# is therefore UNCHANGED -- tests/eval/test_m9_gate.py's own DIRECT check
+# (_external_exit_hop_diff, mirroring _typed_signal_hop_diff's own precedent)
+# inspects segment 1's `exits` list for this new channel instead, since a
+# set-of-triples comparison alone can't see an exit that resolves to zero next
+# entries. worker's admin_ping double-mount (M9 T3) is untouched by this trace
+# entirely -- no client anywhere in the fixture calls it (see golden/edges.yaml's
+# own M9 header).
 version: 1
 traces:
   - entrypoint: "gateway:POST /api/v1/submit"

@@ -81,6 +81,17 @@ services:
           route_from: { decorator: "path_template", arg: 0 }
           call: "driver.fetch_content"
           verb_from: { request_ctor: "Request|ProxyRequest", enum: "Method" }
+        # M9 T1 realstack leg: same decorator-SDK convention as doc-client-
+        # decorator-sdk, base_url anchored directly (like WORKER_URL there) --
+        # except SERVICE_AUDIT_URL resolves to a REAL hostname that names NO
+        # workspace service (env_values.yaml) -> tier-2a "external" split.
+        - name: audit-client-decorator-sdk
+          file_glob: "**/clients/audit_client.py"
+          class_glob: "*Client"
+          base_url: { env: SERVICE_AUDIT_URL }
+          route_from: { decorator: "path_template", arg: 0 }
+          call: "driver.fetch_content"
+          verb_from: { request_ctor: "Request", enum: "Method" }
   - name: worker
     path: ./services/worker
     http: { base_url_env: WORKER_URL }

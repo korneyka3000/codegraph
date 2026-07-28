@@ -19,6 +19,22 @@
 # Каждая запись выведена ВРУЧНУЮ из fixtures/realstack/services/*/app/*.py +
 # workspace.yaml — см. комментарий у каждой группы для конкретного файла:строки.
 #
+# M9 (task-5, realstack legs): АДДИТИВНОЕ расширение, той же протокол ("verified
+# addition", M1b/M2 precedent) -- два новых сечения, каждое задокументировано у
+# своей группы ниже:
+#   1. external CALLS_HTTP (T1): AuditClient.submit_audit_event (app/clients/
+#      audit_client.py) — env-anchored (SERVICE_AUDIT_URL) на РЕАЛЬНЫЙ hostname
+#      (audit.ext.prod.env), не именующий НИ ОДНОГО workspace-сервиса —
+#      linking/http_routes.py's tier-2a "external" split даёт синтетический канал
+#      (owner="?" в id, НЕ ломает форму) с props external=true/external_host,
+#      calls_http_external=1 (гейт пинит через `.get()`, счётчик отдельно, не
+#      ломает существующие точные dict-сравнения — таковых на link_stats нет).
+#   2. multi-mount HANDLES (T3): worker's admin_ping (app/routes/admin.py) —
+#      РОВНО двойной mount (`app.include_router(r, prefix="/v1")` +
+#      `prefix="/legacy"`, брифом же и заданный) — ДВА канала, ДВА HANDLES на тот
+#      же хендлер; изолирован от всей остальной фикстуры (ни один клиент его не
+#      вызывает) — ноль сдвига в CALLS_HTTP/trace.
+#
 # M8 (T3, rerun-2 R4/R5): АДДИТИВНОЕ расширение — САНКЦИОНИРОВАННЫЙ протокол
 # верифицированного дополнения (R4's own whole point: композиция префиксов через
 # include_router-цепочку — это ИЗМЕНЕНИЕ семантики HTTP-каналов gateway's routes,
@@ -202,6 +218,30 @@ edges:
   - src: {service: worker, symbol: app.routes.documents.misc_catch_all}
     type: HANDLES
     dst: {channel: "chan:http:worker:GET /{a}/{b}/{c}/misc"}
+  # --- M9 T3 (task-5) multi-mount: admin_ping (app/routes/admin.py) is mounted
+  # TWICE from app/main.py (prefix="/v1" AND prefix="/legacy") -- both are
+  # legitimately live per real FastAPI semantics, so BOTH channels get a HANDLES
+  # onto the SAME handler (linking/router_prefix.py's own per-mount composition,
+  # M9 T3). Isolated route -- no client anywhere in the fixture calls it.
+  - src: {service: worker, symbol: app.routes.admin.admin_ping}
+    type: HANDLES
+    dst: {channel: "chan:http:worker:GET /v1/ping"}
+  - src: {service: worker, symbol: app.routes.admin.admin_ping}
+    type: HANDLES
+    dst: {channel: "chan:http:worker:GET /legacy/ping"}
+  # --- M9 T1 (task-5) external CALLS_HTTP: AuditClient.submit_audit_event
+  # (app/clients/audit_client.py) -- anchored via SERVICE_AUDIT_URL (env_values.
+  # yaml), a REAL hostname (audit.ext.prod.env) naming NO workspace service.
+  # linking/http_routes.py's tier-2a "external" split: still an unresolved
+  # synthetic owner="?" channel (id form UNCHANGED, heuristic/0.5 -- "no unearned
+  # confidence"), but props additively carry external=true/external_host, and
+  # link_workspace's own calls_http_external counter (NOT calls_http_unresolved)
+  # counts it -- pinned directly by the gate, not by this file's format (which
+  # carries no props/confidence field at all, same convention as every other
+  # entry here).
+  - src: {service: gateway, symbol: app.clients.audit_client.AuditClient.submit_audit_event}
+    type: CALLS_HTTP
+    dst: {channel: "chan:http:?:POST /audit/events"}
 # channels: block is documentation only (mirrors fixtures/golden/edges.yaml's own
 # convention) -- nothing in evalx reads it; the gate hardcodes both channel ids via
 # core.ids.chan_kafka/chan_event and checks the CONTAINS pair directly against staging.
@@ -218,3 +258,7 @@ channels:
   # three channels are unchanged. The typed-signal PRODUCES entry above shares the
   # SAME chan:temporal_signal:doc-approved channel the string-based one already used
   # -- no new channel identity, two independent producers into it.
+  # M9 (task-5): TWO new worker channels (admin_ping's double-mount, /v1/ping +
+  # /legacy/ping) and ONE new synthetic external channel (chan:http:?:POST
+  # /audit/events, AuditClient.submit_audit_event) -- see the HANDLES/CALLS_HTTP
+  # sections above.
