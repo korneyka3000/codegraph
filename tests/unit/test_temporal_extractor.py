@@ -545,6 +545,50 @@ def test_child_workflow_variants_produce_start_mark_claim(callee):
     assert not any(e.type == "INVOKES_ACTIVITY" for e in result.edges)
 
 
+# -- M9 T4 (backlog M6-carry, progress.md ledger M6-T1 entry: "client.execute_workflow
+# вне пилотных находок -- сознательно вне скоупа") --
+#
+# `client.execute_workflow(fn_ref, ...)` is the CLIENT-side spelling that starts a
+# workflow and synchronously awaits its result (Temporal's own sugar for
+# start_workflow + handle.result()) -- deliberately left OUT of M6 T1's own
+# frozenset widening above, since that task's own pilot evidence (camunda-gateway)
+# never exercised it. Carried unaddressed through M7/M8 backlog notes, closed here:
+# same any-receiver + arg0-resolution + claim-only (never a direct edge) contract
+# as every other _START_WORKFLOW_CALLEES member -- mirrors
+# test_child_workflow_variants_produce_start_mark_claim's own per-name coverage
+# pattern (a dedicated test rather than folded into that parametrize: this name's
+# provenance is a deliberately-deferred backlog item, not part of that test's own
+# pilot-driven GAPS §4 evidence).
+
+
+def test_execute_workflow_client_side_spelling_produces_start_mark_claim():
+    """M9 backlog closeout (M6-carry): `client.execute_workflow(WF.run, ...)` must
+    produce the identical temporal_start_mark claim shape as `start_workflow`."""
+    src = b'''from app.workflows.child import ChildWF
+
+
+async def run_it(client):
+    await client.execute_workflow(ChildWF.run, {})
+'''
+    target_sym = "scip-python python svc 0.0 `app.workflows.child`/ChildWF#run()."
+    target_id = "sym:svc:`app.workflows.child`/ChildWF#run()."
+
+    def ref_lookup(rp, sb):
+        return target_sym
+
+    ctx, node_ids, consts = _load("m.py", "svc", src, ref_symbol_lookup=ref_lookup)
+    result = extract_temporal(ctx, node_ids, consts)
+
+    assert len(result.claims) == 1
+    claim = result.claims[0]
+    assert claim["src_id"] == node_ids[_def(ctx, "run_it").index]
+    assert claim["dst_id"] == target_id
+    assert result.stats["start_workflow_resolved"] == 1
+    # execute_workflow is claim-only, same as every _START_WORKFLOW_CALLEES member --
+    # never a direct edge (INVOKES_ACTIVITY is the only edge-producing matcher here).
+    assert not any(e.type == "INVOKES_ACTIVITY" for e in result.edges)
+
+
 # =========================================================================================
 # M7 T4 (OPEN R3): temporal signals as first-class channels.
 #

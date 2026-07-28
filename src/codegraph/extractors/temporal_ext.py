@@ -43,6 +43,16 @@ frozenset of Temporal's own SDK vocabulary for that operation --
 `_START_WORKFLOW_CALLEES` (receiver check unchanged too -- still no check at all, any
 receiver). No other line in either matcher function changed.
 
+M9 T4 (backlog M6-carry, progress.md ledger M6-T1 entry: "client.execute_workflow
+вне пилотных находок -- сознательно вне скоупа"): `client.execute_workflow(fn_ref,
+...)` -- the CLIENT-side spelling that starts a workflow and synchronously awaits
+its result (Temporal's own sugar for `start_workflow` + `handle.result()`) -- is
+added to `_START_WORKFLOW_CALLEES` here, closing the one name M6 T1 deliberately
+left out of its own pilot-scoped widening (that pilot's evidence never exercised
+it). Same any-receiver, claim-only (never a direct edge) contract as every other
+member of the set -- no new branch/guard needed, since the set was already
+receiver-agnostic by design.
+
 Design decision on the temporal_start_mark claim (brief's explicit "реши и
 задокументируй"): `dst_id` is resolved NOW, at extraction time, via
 ctx.ref_symbol_lookup on arg0's own last-segment span (`KycWorkflow.run` -> the "run"
@@ -415,10 +425,15 @@ _ACTIVITY_INVOKE_CALLEES = frozenset({
 
 # M6 T1 (pilot GAPS §4): every Temporal SDK spelling of "start a (child) workflow" --
 # receiver stays unchecked (ANY receiver, unchanged -- see module docstring).
+# M9 T4 (backlog M6-carry): "execute_workflow" added -- the CLIENT-side synchronous
+# spelling, consciously deferred by M6 T1's own pilot-scoped widening (see module
+# docstring's M9 T4 note) -- same any-receiver/claim-only contract as every other
+# member here.
 _START_WORKFLOW_CALLEES = frozenset({
     "start_workflow",
     "start_child_workflow",
     "execute_child_workflow",
+    "execute_workflow",
 })
 
 

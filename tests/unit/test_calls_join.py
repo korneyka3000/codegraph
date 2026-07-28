@@ -1,4 +1,6 @@
+from codegraph.extractors.base import FileContext
 from codegraph.extractors.calls import build_calls
+from codegraph.extractors.python_core import extract as extract_python_core
 from codegraph.parsing.facts import build_file_facts
 from codegraph.resolvers.base import DefRow, RefRow
 from codegraph.resolvers.fallback import resolve_service
@@ -205,3 +207,104 @@ def test_degraded_fallback_path_all_refs_have_defs_join_unchanged(tmp_path):
     assert stats.calls_unresolved == 1  # unknown_dyn -- unresolved даже эвристикой
     edges = [e for e in st.iter_edges() if e.type == "CALLS"]
     assert len(edges) == 1 and edges[0].resolution == "heuristic"
+
+
+# ============================================================================
+# M9 T4 (backlog M5-carry, progress.md ledger M5-T3 entry: "ревьюер live-walked
+# CALLS-interplay [no dangling; dst→первая ветка]"): T1×T3 seam -- a CALLS edge
+# resolving into an M5 T3 id-collision family (see test_python_core_extractor.py's
+# own "M5 T3" section and extractors/python_core.py::extract's KNOWN LIMITATION
+# comment on `def_ids`, also README "Ограничения") must land on the FIRST
+# (unsuffixed) branch's node id and never dangle.
+#
+# Root cause, walked here end-to-end at the CALLS-join layer rather than just the
+# node-emission layer those other two places already pin: build_calls' own dst
+# computation (`symbol_to_node_id` applied directly to the matched ref's symbol,
+# see calls.py) NEVER consults `ids.disambiguate` -- that ordinal-suffixing only
+# ever happens inside python_core.extract()'s own per-file seen-set loop. So when
+# scip's control-flow-insensitive symbol table resolves BOTH branches of a
+# same-named if/else def to ONE symbol (mirrors
+# test_colliding_def_ids_get_ordinal_suffix_scip_path's own scenario, one layer
+# up), every caller's CALLS edge computes that SAME raw (pre-suffix) id as its
+# dst -- which is, by construction, exactly the id extract() assigns to the FIRST
+# occurrence, unsuffixed (occurrence 1 is never passed through disambiguate; only
+# occurrence 2+ is) -- so the edge is guaranteed to land on a REAL staged node,
+# never dangling, but always the first branch specifically (branch-2+ is
+# CALLS-unreachable, per the documented limitation).
+# ============================================================================
+
+_COLLISION_CALLS_RELPATH = "app/flags.py"
+_COLLISION_CALLS_SRC = b'''FLAG = "a"
+
+if FLAG == "a":
+    def handler():
+        pass
+else:
+    def handler():
+        pass
+
+
+def caller():
+    handler()
+'''
+_COLLISION_CALLS_SYM = "scip-python python svc 0.1 `app.flags`/handler()."
+
+
+def test_calls_edge_into_id_collision_family_lands_on_first_branch_never_dangles(tmp_path):
+    """Both if/else `handler` defs resolve, via def_symbol_lookup, to the SAME scip
+    symbol (scip's own control-flow-insensitive table) -- python_core.extract()
+    disambiguates them into TWO distinct node ids (unsuffixed for the 1st
+    occurrence, `~2` for the 2nd, in file-appearance order), but a real caller
+    elsewhere's CALLS edge must resolve its dst to the FIRST branch's id only, and
+    that id must be a node extract() actually staged -- never a dangling
+    reference."""
+    facts = build_file_facts(_COLLISION_CALLS_RELPATH, _COLLISION_CALLS_SRC)
+    handler_defs = [d for d in facts.defs if d.name == "handler"]
+    assert len(handler_defs) == 2
+    handler_spans = {d.name_start_byte for d in handler_defs}
+
+    def def_symbol_lookup(rp, sb):
+        return _COLLISION_CALLS_SYM if sb in handler_spans else None
+
+    core_ctx = FileContext(
+        service="svc", relpath=_COLLISION_CALLS_RELPATH, source=_COLLISION_CALLS_SRC,
+        facts=facts, def_symbol_lookup=def_symbol_lookup, module_exists=lambda d: False,
+    )
+    core_res = extract_python_core(core_ctx)
+    first_branch_id = "sym:svc:`app.flags`/handler()."
+    second_branch_id = "sym:svc:`app.flags`/handler().~2"
+    staged_ids = {n.id for n in core_res.nodes}
+    # sanity: extract() really did stage BOTH (disambiguated) branches as real
+    # nodes -- this test would be meaningless against a fixture that silently
+    # dropped one of them (the exact M5 T3 bug this mechanism prevents).
+    assert {first_branch_id, second_branch_id} <= staged_ids
+
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    st.upsert_nodes(core_res.nodes)
+    st.add_defs("svc", [
+        DefRow(_COLLISION_CALLS_RELPATH, _COLLISION_CALLS_SYM,
+               d.name_start_byte, d.name_end_byte, d.start_line)
+        for d in handler_defs
+    ])
+    call = next(c for c in facts.calls if c.callee_name == "handler")
+    st.add_refs("svc", [RefRow(
+        _COLLISION_CALLS_RELPATH, _COLLISION_CALLS_SYM,
+        call.callee_start_byte, call.callee_end_byte, call.start_line, 0,
+    )])
+
+    stats = build_calls(
+        "svc", st, {_COLLISION_CALLS_RELPATH: facts}, def_symbol_lookup,
+        def_symbols=st.def_symbols("svc"),
+    )
+    assert stats.calls_joined == 1
+    edges = [e for e in st.iter_edges() if e.type == "CALLS"]
+    assert len(edges) == 1
+    e = edges[0]
+    assert e.src == "sym:svc:`app.flags`/caller()."
+    assert e.dst == first_branch_id
+    assert e.dst != second_branch_id
+    # never dangling: the edge's dst is a node id that was ACTUALLY staged -- not
+    # just a member of def_symbols (a symbol-string set); this checks the disjoint
+    # NODE id-space extract() itself populated above.
+    assert e.dst in staged_ids
