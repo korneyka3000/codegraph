@@ -99,6 +99,17 @@ def _fn(id_: str) -> NodeRec:
     return NodeRec(id=id_, kind="Function", service="svc", name="h", qualified_name="q.h")
 
 
+def _handler_node(id_: str, *, path_template: str, http_method: str = "GET") -> NodeRec:
+    """M9 T2: a RouteHandler-shaped NodeRec carrying the S5-staged LOCAL
+    path_template/http_method props `extractors/fastapi_ext.py` would have set
+    (see its own docstring) -- the compose-back patch's own precondition."""
+    return NodeRec(
+        id=id_, kind="Function", service="svc", name="h", qualified_name="q.h",
+        roles=("RouteHandler",),
+        props={"http_method": http_method, "path_template": path_template},
+    )
+
+
 ROUTER_A = "sym:svc:`app.routes.steps.detail`/router."
 ROUTER_B = "sym:svc:`app.routes.steps`/router."
 APP = "sym:svc:`app.main`/app."
@@ -608,3 +619,151 @@ def test_negative_pin_without_composition_client_claim_is_unresolved_not_tail_ma
     assert http_stats == {"calls_http": 1, "calls_http_unresolved": 1, "calls_http_external": 0}
     calls_http = next(e for e in st.iter_edges() if e.type == "CALLS_HTTP")
     assert calls_http.resolution == "heuristic" and calls_http.confidence == 0.5
+
+
+# -- M9 T2: compose-back -- the handler node's OWN path_template prop (staged
+# LOCAL-only by fastapi_ext.py in S5) gets patched to the S7-composed template,
+# via staging.update_node_props, so cards/get_source/retrieval consumers that read
+# the handler node directly see the real, composed path -- not just the Channel. --
+
+
+def test_composed_patch_lands_on_handler_node_props(tmp_path):
+    """Non-trivial chain (2-level, brief's own literal scenario): the handler
+    node's own path_template prop must end up equal to the COMPOSED template, not
+    the local-only one S5 originally staged it with. Other pre-existing keys
+    (http_method) survive the shallow merge untouched."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/steps/{id}")])
+    _route_decl(
+        st, "worker", "app/routes/steps.py",
+        router_symbol=ROUTER_A, verb="GET", path="/steps/{id}", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    router_prefix.link(st)
+
+    node = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert node.props["path_template"] == "/api/v1/steps/{id}"
+    assert node.props["http_method"] == "GET"
+
+
+def test_trivial_chain_does_not_patch_handler_node_props(tmp_path, monkeypatch):
+    """No cross-file include chain (chain_prefix == "", the genuine-root case) ->
+    the composed template is byte-identical to the local one already staged -- the
+    compose-back patch must not even ATTEMPT a write (staging.update_node_props
+    itself is never called), not merely "write the same value harmlessly". This is
+    the explicit "avoid no-op writes" case from router_prefix.link's own
+    docstring: every M2/M6/M7 fixture route composes through exactly this path."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/orders", http_method="POST")])
+    _route_decl(
+        st, "orders-api", "app/routes/orders.py",
+        router_symbol=ROUTER_A, verb="POST", path="", handler_node_id=HANDLER,
+        prefix_local="/orders",
+    )
+    calls: list[tuple] = []
+    original = st.update_node_props
+    monkeypatch.setattr(
+        st, "update_node_props",
+        lambda *a, **k: (calls.append((a, k)), original(*a, **k))[1],
+    )
+
+    router_prefix.link(st)
+
+    assert calls == []
+    node = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert node.props == {"http_method": "POST", "path_template": "/orders"}
+
+
+def test_unresolvable_router_symbol_does_not_patch_handler_node_props(tmp_path, monkeypatch):
+    """The OTHER template==local_template case: an unresolvable router_symbol
+    falls back to the local template too (honesty rule, route_prefix_unresolved
+    counted) -- also must not attempt a patch."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/orders", http_method="POST")])
+    _route_decl(
+        st, "orders-api", "app/routes/orders.py",
+        router_symbol=None, verb="POST", path="", handler_node_id=HANDLER,
+        prefix_local="/orders",
+    )
+    calls: list[tuple] = []
+    original = st.update_node_props
+    monkeypatch.setattr(
+        st, "update_node_props",
+        lambda *a, **k: (calls.append((a, k)), original(*a, **k))[1],
+    )
+
+    router_prefix.link(st)
+
+    assert calls == []
+    node = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert node.props["path_template"] == "/orders"
+
+
+def test_double_link_is_idempotent_for_handler_node_props(tmp_path):
+    """double link() run -> same result (INSERT OR REPLACE / shallow-merge
+    semantics: re-applying the identical composed value a second time converges,
+    never drifts)."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/steps/{id}")])
+    _route_decl(
+        st, "worker", "app/routes/steps.py",
+        router_symbol=ROUTER_A, verb="GET", path="/steps/{id}", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    router_prefix.link(st)
+    first = next(n for n in st.iter_nodes() if n.id == HANDLER).props
+    router_prefix.link(st)
+    second = next(n for n in st.iter_nodes() if n.id == HANDLER).props
+
+    assert first == second == {"http_method": "GET", "path_template": "/api/v1/steps/{id}"}
+
+
+def test_stale_file_reanalyze_then_relink_recomposes_handler_node_props(tmp_path):
+    """Incremental coherence (M9 plan): the S7 patch happens on EVERY link() run,
+    identically in full and incremental (S7 always runs in full) -- but the
+    handler node itself belongs to its ORIGIN service and gets fully re-emitted by
+    S5 (fastapi_ext.py) with the LOCAL-only value whenever ITS OWN file goes stale,
+    via upsert_nodes' INSERT OR REPLACE (which wipes any earlier S7 patch's props
+    entirely -- it replaces the whole row, not a merge). Staging-level simulation
+    of the full sequence: patch -> simulated stale re-analyze (S5 re-stages LOCAL)
+    -> re-link -> composed again, byte-identical to the first time."""
+    st = Staging(tmp_path / "s.db")
+    local_node = _handler_node(HANDLER, path_template="/steps/{id}")
+    st.upsert_nodes([local_node])
+    _route_decl(
+        st, "worker", "app/routes/steps.py",
+        router_symbol=ROUTER_A, verb="GET", path="/steps/{id}", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    router_prefix.link(st)
+    patched = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert patched.props["path_template"] == "/api/v1/steps/{id}"
+
+    # Simulated stale-file re-analyze: S5's fastapi_ext always re-emits the SAME
+    # LOCAL-only NodeRec (unaware of any S7 patch); upsert_nodes' INSERT OR REPLACE
+    # wipes the earlier composed value wholesale.
+    st.upsert_nodes([local_node])
+    reset = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert reset.props["path_template"] == "/steps/{id}"  # sanity: really reset
+
+    router_prefix.link(st)
+    recomposed = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert recomposed.props["path_template"] == "/api/v1/steps/{id}"

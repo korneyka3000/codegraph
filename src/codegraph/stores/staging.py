@@ -699,6 +699,43 @@ class Staging:
         self._db.commit()
         return True
 
+    def update_node_props(self, node_id: str, merge: dict) -> bool:
+        """M9 T2: json-merge поверх props ОДНОГО узла (id) -- shallow `{**old,
+        **merge}`, merge побеждает при коллизии ключей. No-op (возвращает False),
+        если узла с таким id нет вовсе; True при успешном обновлении.
+
+        Mirrors `update_edge_props` above (same shallow-merge-then-UPDATE shape,
+        same missing-key False/present-key True contract), but SIMPLER: `nodes.id`
+        is a genuine single-column PRIMARY KEY (see `_DDL`'s `CREATE TABLE nodes`),
+        unlike edges' composite (src, dst, type, via_channel, origin_service) key --
+        a `WHERE id=?` can only ever match zero or one row, so there is no
+        via_channel/origin_service-style multi-row ambiguity to guard against here,
+        and therefore no NEXT_SEGMENT-like type restriction either (update_edge_props'
+        own guard exists ONLY because its bare (src,dst,type) key can legitimately
+        span more than one physical row -- see that method's own docstring; that
+        premise simply doesn't apply to a PRIMARY KEY lookup).
+
+        Sole real caller (as of M9 T2): `linking/router_prefix.py`'s `link()`,
+        compose-back patching a RouteHandler node's own `path_template` prop (staged
+        LOCAL-only by `extractors/fastapi_ext.py` in S5) to the S7-composed,
+        cross-file template -- see that module's own docstring for the full
+        "only if it differs" call-site logic (this method itself has no opinion on
+        that; it always writes when the node exists, exactly like `update_edge_props`
+        always does)."""
+        row = self._db.execute(
+            "SELECT props FROM nodes WHERE id=?", (node_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        props = json.loads(row[0])
+        props.update(merge)
+        self._db.execute(
+            "UPDATE nodes SET props=? WHERE id=?",
+            (json.dumps(props), node_id),
+        )
+        self._db.commit()
+        return True
+
     def add_claims(self, service: str, relpath: str, kind: str, payloads: list[dict]) -> None:
         """Claims -- staging-only находки экстракторов (M2 S5), ещё не узлы/рёбра
         графа (напр. "этот файл содержит kafka-producer вызов с topic=X") --

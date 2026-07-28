@@ -387,6 +387,40 @@ def test_produces_dedups_same_channel_reached_twice(tmp_path):
     assert _graph_line_of(header) == "graph: produces E"
 
 
+def test_header_unaffected_by_handler_own_path_template_prop(tmp_path):
+    """M9 T2 verification pin: linking/router_prefix.py's compose-back patch
+    writes the S7-composed template onto a RouteHandler node's OWN path_template
+    prop -- this proves that write can NEVER change that node's own retrieval
+    header. The header's "handles" clause already reads the (independently
+    composed) served path via the CHANNEL node's own `.name`
+    ("<METHOD> <template>", make_channel_node) -- never the handler's own props
+    (only `docstring`/`signature` are ever read off a node's props anywhere in
+    this module, see `_doc_line`/`_parent_line`). Proven directly, not just
+    argued: re-rendering after changing the handler's OWN path_template prop to
+    an arbitrary DIFFERENT value (standing in for the M9 T2 patch) produces a
+    byte-identical header -- so the patch can never invalidate a chunk's
+    context_header/input_hash and force a spurious re-embed."""
+    st = Staging(tmp_path / "s.db")
+    sym = "fn"
+    handler = _node(
+        sym, "Function", qualified_name="app.m.f", roles=("RouteHandler",),
+        props={"http_method": "GET", "path_template": "/local/{id}"},
+    )
+    chan = make_channel_node("http_route", method="GET", template="/api/v1/local/{id}")
+    st.upsert_nodes([handler, chan])
+    st.upsert_edges([_edge(chan.id, sym, "HANDLES")])
+    st.upsert_chunks("svc", "app/m.py", [_chunk("fn#c0", sym)])
+
+    header_before = augment.build_header(st, _chunk_row(st, "svc", sym))
+    assert "handles GET /api/v1/local/{id}" in header_before
+
+    ok = st.update_node_props(sym, {"path_template": "/something/else/{id}"})
+    assert ok is True
+    header_after = augment.build_header(st, _chunk_row(st, "svc", sym))
+
+    assert header_after == header_before
+
+
 # ======================================================================================
 # -- children aggregation --
 # ======================================================================================

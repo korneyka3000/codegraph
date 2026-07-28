@@ -910,6 +910,49 @@ def test_update_edge_props_updates_every_row_of_the_group_across_origins(tmp_pat
     assert by_from["b"] == {"from": "b", "mechanism": "temporal_start"}
 
 
+# -- M9 T2: update_node_props (compose-back full path_template onto the handler
+# node's own props -- linking/router_prefix.py's new caller, see its own docstring).
+# Mirrors update_edge_props' shallow-merge style above, but simpler: nodes.id is a
+# genuine single-row PRIMARY KEY (see stores/staging.py's _DDL) -- no via_channel/
+# origin_service-style multi-row ambiguity to guard against, so no NEXT_SEGMENT-like
+# type restriction is needed either.
+
+
+def test_update_node_props_merges_and_overwrites(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    n = NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", name="f",
+                qualified_name="m.f", props={"http_method": "GET", "path_template": "/x"})
+    st.upsert_nodes([n])
+    ok = st.update_node_props(n.id, {"path_template": "/api/v1/x", "new_key": "v"})
+    assert ok is True
+    updated = next(iter(st.iter_nodes()))
+    assert updated.props == {
+        "http_method": "GET", "path_template": "/api/v1/x", "new_key": "v",
+    }
+
+
+def test_update_node_props_returns_false_when_node_missing(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    ok = st.update_node_props("sym:a:nonexistent", {"k": "v"})
+    assert ok is False
+
+
+def test_update_node_props_does_not_touch_unrelated_node(tmp_path):
+    """PK-scoped write -- merging one node's props must never leak onto a sibling
+    row, even one staged in the SAME upsert_nodes call."""
+    st = Staging(tmp_path / "s.db")
+    a = NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", name="f",
+                qualified_name="m.f", props={"path_template": "/x"})
+    b = NodeRec(id="sym:a:`m`/g().", kind="Function", service="a", name="g",
+                qualified_name="m.g", props={"path_template": "/y"})
+    st.upsert_nodes([a, b])
+    ok = st.update_node_props(a.id, {"path_template": "/api/v1/x"})
+    assert ok is True
+    by_id = {n.id: n.props for n in st.iter_nodes()}
+    assert by_id[a.id]["path_template"] == "/api/v1/x"
+    assert by_id[b.id]["path_template"] == "/y"  # untouched
+
+
 # -- M3 T3: chunks (chunking.splitter.ChunkRec staged for T4/T6) --
 
 

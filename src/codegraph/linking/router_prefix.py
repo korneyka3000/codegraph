@@ -112,7 +112,51 @@ HANDLES/CALLS_HTTP tuple.
 
 Wired into `linking.workspace.link_workspace`, BEFORE `http_routes.link` (that stage's
 own `_route_table` scan reads whatever Channel(http_route) nodes are ALREADY staged --
-this module is what stages them now, where fastapi_ext.py used to)."""
+this module is what stages them now, where fastapi_ext.py used to).
+
+M9 T2 (rerun-3 backlog): COMPOSE-BACK -- the handler's OWN node also gets patched, not
+just the Channel. Before this task, a handler's `path_template`/`http_method` node
+props (staged LOCAL-only by fastapi_ext.py in S5, see that module's own docstring) were
+NEVER updated once the composed, cross-file identity became known here in S7 -- a route
+handler's own card/`get_source`/any other direct consumer of the handler NODE (as
+opposed to its Channel) kept showing the local-only fragment (e.g. `/steps/{id}`) even
+though the REAL served path (`/api/v1/steps/{id}`) had been sitting on the Channel the
+whole time. `link()` now calls `staging.update_node_props(handler_node_id,
+{"path_template": template})` for every `route_decl` claim whose composed `template`
+differs from the LOCAL-only one (`_template(prefix_local, path)` -- the exact value
+fastapi_ext.py already staged the node with) -- comparing against a FRESH recomputation
+of the local template from the claim's own `prefix_local`/`path` fields, never a read of
+the node's CURRENTLY staged props (`link()` stays a pure claims-in transformation, no
+extra node read added). This one comparison naturally covers both zero-patch cases at
+once, with no separate branch: the TRIVIAL case (`chain_prefix == ""`) and the
+UNRESOLVED/honesty-rule-failure case (`chain_prefix is None`) both set
+`template = _template(prefix_local, path)` verbatim -- i.e. exactly `local_template` --
+so the comparison is trivially false and no write is even attempted (the brief's own
+"avoid no-op writes" requirement; every M2/M6/M7 fixture route takes this no-patch path).
+
+Idempotent by construction (`staging.update_node_props`'s own shallow-merge-then-UPDATE,
+mirroring `update_edge_props`'s INSERT-OR-REPLACE-adjacent semantics): a second `link()`
+call over unchanged claims recomputes the identical `template`/`local_template` pair and
+either re-applies the same value (chain case) or again skips the write (trivial/
+unresolved case) -- the end state never drifts. Incremental coherence: S7 (this module)
+always runs in FULL on every `codegraph index` invocation, full or `--incremental` alike
+(see `linking/workspace.py`'s own docstring) -- but the handler NODE itself belongs to
+its origin service's S5/S6 layer, so whenever that service re-analyzes its OWN stale
+file, `pipeline/analyze.py`'s `upsert_nodes` (INSERT OR REPLACE, keyed on node id)
+re-stages the handler with the LOCAL-only value again, wholesale, wiping any earlier S7
+patch's props entirely; the very next `link_workspace` call (which always follows a
+stale re-analyze in the SAME `codegraph index` run) re-composes and re-patches right
+after, so the node's props are never observably out of sync with the Channel's across
+one full pipeline run.
+
+Retrieval headers (`chunking/augment.py`) are UNAFFECTED by this patch: verified by
+reading `_render_header`/`_symbol_line`/`_graph_line` -- none of them ever consult a
+RouteHandler node's OWN `path_template`/`http_method` props (only `docstring`/
+`signature`, for the doc/parent lines). The header's `graph:` line's own `handles`
+clause already reads the COMPOSED path today, independently of this patch -- via the
+Channel node's `.name` (`"<METHOD> <template>"`, `make_channel_node`), which `link()`
+has built from the fully-composed `template` since M8 T1, long before this task. So this
+patch changes NO chunk's `context_header`/`input_hash` -- no spurious re-embed."""
 
 from __future__ import annotations
 
@@ -250,11 +294,14 @@ def _resolve_prefix(
 def link(staging: Staging) -> dict:
     """S7 entry point (called from linking.workspace.link_workspace, BEFORE
     http_routes.link). staging-only (no FalkorDB access), mirrors http_routes.link's
-    own signature shape minus the (unneeded here) WorkspaceConfig parameter -- no
-    env/service-registry concerns, purely a claims -> graph -> Channel/HANDLES
-    composition. Returns {"route_prefix_unresolved": <count>} -- the number of
-    route_decl claims whose composition fell back to the local-only template (see
-    module docstring's honesty rule for the four failure shapes this counts)."""
+    own signature shape minus the (unneeded here) WorkspaceConfig parameter -- claims
+    -> graph -> Channel/HANDLES composition, PLUS (M9 T2) a compose-back patch onto
+    each handler node's own path_template prop when the composed template differs
+    from the local-only one already staged there (see module docstring's own "M9 T2"
+    section for the full design/idempotency/incremental-coherence argument). Returns
+    {"route_prefix_unresolved": <count>} -- the number of route_decl claims whose
+    composition fell back to the local-only template (see module docstring's honesty
+    rule for the four failure shapes this counts)."""
     graph = _build_include_graph(staging)
     own_prefix = _build_own_prefix_map(staging)
     memo: dict[str, str | None] = {}
@@ -267,16 +314,27 @@ def link(staging: Staging) -> dict:
         prefix_local = claim["prefix_local"]
         path = claim["path"]
         router_symbol = claim.get("router_symbol")
+        handler_node_id = claim["handler_node_id"]
 
         chain_prefix = (
             _resolve_prefix(router_symbol, graph, own_prefix, memo, set())
             if router_symbol is not None else None
         )
+        local_template = _template(prefix_local, path)
         if chain_prefix is None:
-            template = _template(prefix_local, path)
+            template = local_template
             unresolved += 1
         else:
             template = _template(chain_prefix + prefix_local, path)
+
+        # M9 T2: compose-back -- patch the HANDLER node's own path_template prop to
+        # match, but only when it would actually change (avoid no-op writes; see
+        # module docstring's own "M9 T2" section). Both zero-patch cases above
+        # (chain_prefix is None, and the trivial chain_prefix == "" root case) set
+        # template = local_template verbatim -- this one comparison catches both,
+        # no separate branch needed.
+        if template != local_template:
+            staging.update_node_props(handler_node_id, {"path_template": template})
 
         method = claim["verb"]
         chan = make_channel_node(
@@ -285,7 +343,7 @@ def link(staging: Staging) -> dict:
         )
         channels[chan.id] = chan
         edges.append(EdgeRec(
-            src=chan.id, dst=claim["handler_node_id"], type="HANDLES",
+            src=chan.id, dst=handler_node_id, type="HANDLES",
             resolution=_RESOLUTION, confidence=_CONFIDENCE, extractor=_EXTRACTOR,
             # M8 review Important-2: evidence restored from the claim itself --
             # evidence_file from claims_for's injected _relpath, evidence_line from
