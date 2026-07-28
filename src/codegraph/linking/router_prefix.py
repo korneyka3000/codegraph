@@ -236,6 +236,27 @@ OWN router_symbol ends up with zero surviving alternatives (or is None, or
 overflows the cap) still counts, exactly the honesty-rule discipline this module
 has always applied, now evaluated over a set instead of a scalar.
 
+TRACKED ASSUMPTION (M9 T3 review item 3 -- honest caveat, not a fix): the
+cross-product treats every mount of a router as serving that router's FULL route
+set -- i.e. it assumes all mounts of a common ancestor see the IDENTICAL
+descendant-route snapshot. Real FastAPI's `include_router` is an EAGER SNAPSHOT:
+it copies the child's routes at the moment of the call, so a route registered (or
+a deeper include performed) AFTER an earlier mount is NOT served under that
+earlier mount -- and claims, being per-file and execution-order-blind, cannot see
+registration/include interleaving at all. Under such interleaving this module can
+compose a template real FastAPI never serves -- the FIRST place in this module
+where a FALSE POSITIVE (a confidently-wrong path, not just a miss) is structurally
+possible. Single-mount composition shares the same order-blindness in principle
+(a decorator AFTER the include), but multi-mount is where two LIVE mounts can
+legitimately hold two DIFFERENT snapshots of one router, so the divergence becomes
+observable as an extra, unserved template rather than degenerate code. Accepted
+rather than guarded: idiomatic FastAPI builds a router completely before mounting
+it (module-level decorators run at import time; includes run during app assembly,
+strictly after), so interleaving is vanishingly rare, and modeling it would
+require execution-ORDER claims -- a different claim mechanism entirely, not an
+incremental fix here. Tracked in the same honesty spirit as the former shape-3
+under-approximation note this task replaced.
+
 Compose-back (M9 T2) generalizes from a single `path_template` overwrite to: the
 FIRST template by lexicographic sort becomes `path_template` (a card/get_source/
 any other single-value consumer needs SOME canonical value, and lexicographic order
@@ -249,6 +270,29 @@ write anything at all continues to cover every zero-write case uniformly (trivia
 root, unresolved router_symbol, total per-mount failure, AND cap overflow alike --
 all four set `templates = [local_template]` verbatim) -- no new branching needed,
 consistent with T2's own "avoid no-op writes" requirement.
+
+Stale-key removal (M9 T3 review item 1): the single-template write passes
+`remove=("path_templates",)` to `staging.update_node_props` -- when a double-mount
+collapses back to ONE mount in source, the very next link re-patches
+`path_template` by shallow merge, but merge alone can never DELETE the now-dead
+`path_templates` list, and the handler's OWN file never went stale in that edit,
+so S5 never re-stages the node clean either: without the remove, the dead path
+survived on the node forever, flatly contradicting this module's own no-drift
+claims (the review reproduced it; pinned by the module's remount-removal repro
+test). Removing an absent key is a documented silent no-op
+(`Staging.update_node_props`'s own semantics: remove applies to the OLD props
+first, merge lands after and wins on overlap), so the remove is passed
+unconditionally on every single-template patch, including a first-ever one.
+RESIDUAL, tracked (T2-era direction, one step beyond this fix's write-branch
+scope): when a chain dissolves ENTIRELY (every mount removed -- the router is a
+trivial root again) while the handler's file stays untouched, `templates ==
+[local_template]` puts the route on the NO-write path -- per T2's own accepted
+"avoid no-op writes" + pure-claims-in design -- so previously composed
+`path_template`/`path_templates` values persist on the node until the handler's
+own file next re-analyzes (S5 re-stages it LOCAL-only, then re-link converges) or
+any chain reappears. Closing that would take an unconditional per-route write or
+a node-props read inside `link()`, both explicitly rejected trade-offs in T2's
+accepted design -- flagged honestly here rather than silently inherited.
 
 Cross-product explosion guard (`_MAX_TEMPLATES = 16`, `_OVERFLOW` sentinel): a
 route_decl's own live-template count is bounded above by its router_symbol's own
@@ -571,12 +615,24 @@ def link(staging: Staging) -> dict:
         # module docstring's own "M9 T2" section). Every fallback branch above sets
         # templates = [local_template] verbatim -- this one comparison catches ALL
         # of them (trivial root, unresolved router_symbol, total per-mount failure,
-        # and cap overflow alike), no separate branch needed.
+        # and cap overflow alike), no separate branch needed. The single-template
+        # write actively REMOVES any stale path_templates key (M9 T3 review item 1:
+        # a double-mount collapsing back to one mount re-patches path_template via
+        # shallow merge, but merge alone can never delete the now-dead list, and
+        # the handler's own file never went stale, so S5 never wipes it either --
+        # without remove= the dead path lived on the node forever); removing an
+        # absent key is a documented silent no-op, so the unconditional remove
+        # costs nothing on first-ever patches.
         if templates != [local_template]:
-            patch: dict[str, object] = {"path_template": templates[0]}
             if len(templates) > 1:
-                patch["path_templates"] = templates
-            staging.update_node_props(handler_node_id, patch)
+                staging.update_node_props(handler_node_id, {
+                    "path_template": templates[0], "path_templates": templates,
+                })
+            else:
+                staging.update_node_props(
+                    handler_node_id, {"path_template": templates[0]},
+                    remove=("path_templates",),
+                )
 
         for template in templates:
             chan = make_channel_node(

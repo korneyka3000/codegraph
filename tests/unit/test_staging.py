@@ -953,6 +953,58 @@ def test_update_node_props_does_not_touch_unrelated_node(tmp_path):
     assert by_id[b.id]["path_template"] == "/y"  # untouched
 
 
+# -- M9 T3 review fix: update_node_props' `remove` kwarg -- top-level key deletion
+# in the SAME UPDATE as the merge. Shallow-merge alone can never retire a key, so a
+# caller whose prop legitimately DISAPPEARS between runs (router_prefix's
+# path_templates when a double-mount collapses back to one) needs this or the dead
+# value persists forever.
+
+
+def test_update_node_props_remove_deletes_key_in_same_update(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    n = NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", name="f",
+                qualified_name="m.f",
+                props={"http_method": "GET", "path_template": "/legacy/x",
+                       "path_templates": ["/legacy/x", "/v1/x"]})
+    st.upsert_nodes([n])
+    ok = st.update_node_props(
+        n.id, {"path_template": "/v1/x"}, remove=("path_templates",),
+    )
+    assert ok is True
+    updated = next(iter(st.iter_nodes()))
+    assert updated.props == {"http_method": "GET", "path_template": "/v1/x"}
+
+
+def test_update_node_props_remove_absent_key_is_a_silent_noop(tmp_path):
+    """Removing a key the node never had must not error and must not block the
+    merge -- the router_prefix caller passes remove=("path_templates",)
+    unconditionally on every single-template patch, including first-ever patches
+    where the key was never written."""
+    st = Staging(tmp_path / "s.db")
+    n = NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", name="f",
+                qualified_name="m.f", props={"path_template": "/x"})
+    st.upsert_nodes([n])
+    ok = st.update_node_props(n.id, {"path_template": "/v1/x"}, remove=("ghost",))
+    assert ok is True
+    updated = next(iter(st.iter_nodes()))
+    assert updated.props == {"path_template": "/v1/x"}
+
+
+def test_update_node_props_merge_wins_over_remove_on_overlap(tmp_path):
+    """Documented semantics pin: removal applies to the OLD props only, then merge
+    lands -- a key named in BOTH ends up with the merge's value, never deleted (a
+    caller explicitly providing a value clearly wants it present; remove exists
+    for stale-key cleanup)."""
+    st = Staging(tmp_path / "s.db")
+    n = NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", name="f",
+                qualified_name="m.f", props={"k": "old"})
+    st.upsert_nodes([n])
+    ok = st.update_node_props(n.id, {"k": "new"}, remove=("k",))
+    assert ok is True
+    updated = next(iter(st.iter_nodes()))
+    assert updated.props == {"k": "new"}
+
+
 # -- M3 T3: chunks (chunking.splitter.ChunkRec staged for T4/T6) --
 
 

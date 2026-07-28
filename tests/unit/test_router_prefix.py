@@ -4,34 +4,42 @@ per-file `route_decl`/`router_include`/`router_decl` claims fastapi_ext.py now e
 instead of directly building Channel(http_route)/HANDLES itself (see that module's own
 docstring for the full "why" -- a single file can never see the whole chain).
 
-Algorithm (`link`): build a `child_symbol -> (parent_symbol, prefix)` graph from every
-staged `router_include` claim, plus a `router_symbol -> own declared prefix` map from
-every `router_decl` claim (M8 review Important-1). For each `route_decl` claim, DFS
-from its own `router_symbol` up the graph to a root, composing at each mount
-[include-kwarg prefix] + [mounted router's own declared prefix] in root-to-leaf order,
-then + prefix_local + path. The order is REAL FastAPI semantics, verified empirically
-against fastapi 0.140.0 (see linking/router_prefix.py's own docstring for the raw
-OpenAPI-schema proof): `app.include_router(B, prefix="/ia")` where
-`B = APIRouter(prefix="/pb")` and `B.include_router(A, prefix="/ib")` with
-`A = APIRouter(prefix="/pa")` + route "/x" serves `/ia/pb/ib/pa/x`.
+Algorithm (`link`): build a `child_symbol -> LIST of (parent_symbol, prefix)` mounts
+graph from every staged `router_include` claim (M9 T3: one entry per DISTINCT mount;
+byte-identical (parent, child, prefix) duplicates -- even from two different files --
+dedup to one), plus a `router_symbol -> own declared prefix` map from every
+`router_decl` claim (M8 review Important-1). For each `route_decl` claim, walk UP
+the graph from its own `router_symbol` to every reachable root, composing at each
+mount [include-kwarg prefix] + [mounted router's own declared prefix] in
+root-to-leaf order, then + prefix_local + path -- ONE template per surviving mount
+chain (M9 T3: a router mounted N times, or sitting below an ancestor mounted N
+times, yields N templates -> N Channels + N HANDLES onto the SAME handler,
+cross-producting through every multi-mounted hop; a single-mount chain degenerates
+to the old scalar behavior byte-for-byte). The per-mount order is REAL FastAPI
+semantics, verified empirically against fastapi 0.140.0 (see
+linking/router_prefix.py's own docstring for the raw OpenAPI-schema proof):
+`app.include_router(B, prefix="/ia")` where `B = APIRouter(prefix="/pb")` and
+`B.include_router(A, prefix="/ib")` with `A = APIRouter(prefix="/pa")` + route
+"/x" serves `/ia/pb/ib/pa/x`.
 
-HONESTY RULE (no guessing, ever -- mirrors http_routes.py's own "NO static/1.0 without
-anchor" binding constraint): FOUR distinct failure shapes ALL collapse to the SAME
-outcome -- the composed template is DISCARDED entirely, falling back to
-`prefix_local + path` alone (byte-identical to today's pre-M8 `_template` output),
-and the route is counted in `route_prefix_unresolved`:
-  1. `router_symbol` itself is None (unresolvable at extraction time -- no SCIP, or a
-     genuine miss).
-  2. A CYCLE in the include graph (A includes B, B includes A).
-  3. An UNRESOLVABLE or AMBIGUOUS hop partway up the chain (a router_include claim
-     whose own parent_symbol is None, or two DISTINCT parents both naming the same
-     child_symbol -- a real config ambiguity, never silently picked).
-  4. (M8 review Important-1) A hop PARENT with NO router_decl claim (its own declared
-     prefix is unknown -- e.g. a factory-built router), or with CONFLICTING
-     router_decl claims (two different prefix_local values for one symbol) -- an
-     intermediate aggregator's own `APIRouter(prefix="/v2")` is part of the real
-     path, so composing WITHOUT knowing it would mint a confident-but-INCOMPLETE
-     template, the exact funnel-class silent-wrong M7 exists to prevent.
+HONESTY RULE (no guessing, ever -- mirrors http_routes.py's own "NO static/1.0
+without anchor" binding constraint), M9 T3 shape -- failures are per-MOUNT: a mount
+whose own chain hits a CYCLE, an unresolvable parent (parent_symbol None), or a
+parent with a MISSING/CONFLICTING router_decl (own declared prefix unknown -- M8
+review Important-1: an intermediate aggregator's own `APIRouter(prefix="/v2")` is
+part of the real path, so composing without knowing it would mint a
+confident-but-INCOMPLETE template) contributes nothing, WITHOUT poisoning sibling
+mounts of the same child. The composed prefix is discarded ENTIRELY (fallback to
+`prefix_local + path` alone, byte-identical to the pre-M8 `_template` output, +
+`route_prefix_unresolved`) ONLY when nothing survives at all: `router_symbol`
+itself None (unresolvable at extraction time), zero surviving mounts, or the
+>_MAX_TEMPLATES(16)-alternative cap (runaway/malformed include graph -- the one
+discard shape that ALSO logs a WARNING; never a truncated-but-partial subset).
+Multi-mount itself is NOT a failure anymore -- M9 T3 lifted M8's deliberate
+under-approximation that discarded on ANY second include claim naming one child:
+two DISTINCT parents, or one parent under two prefixes, are legitimate live mounts
+(real FastAPI serves both), each composed independently. `_AMBIGUOUS` survives
+only for genuinely conflicting router_decl prefix_local values of one symbol.
 
 The TRIVIAL case -- no `router_include` claim anywhere names this router_symbol as a
 child at all (a genuine root: same-file `APIRouter(prefix=...)`, no cross-file
@@ -1100,3 +1108,86 @@ def test_double_link_is_idempotent_for_multi_mount(tmp_path):
     assert first_chans == second_chans == expected_chans
     assert first_handles == second_handles
     assert len(second_handles) == 2
+
+
+def test_multi_mount_cap_boundary_exactly_16_composes_all(tmp_path, caplog):
+    """Boundary companion to the 17-mount overflow test: EXACTLY _MAX_TEMPLATES
+    (16) distinct mounts is still a legitimate (if extreme) multi-mount -- all 16
+    templates compose, nothing is discarded, the counter stays 0, and no warning
+    is logged. Pins the cap's comparison as strictly-greater-than (an off-by-one
+    to >= would silently discard a legal 16-mount)."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_fn(HANDLER)])
+    _route_decl(
+        st, "worker", "app/routes/x.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    for i in range(16):
+        _router_include(
+            st, "worker", "app/main.py",
+            parent_symbol=APP, child_symbol=ROUTER_A, prefix=f"/m{i:02d}",
+        )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    with caplog.at_level("WARNING"):
+        report = router_prefix.link(st)
+
+    assert report["route_prefix_unresolved"] == 0
+    chan_ids = {n.id for n in st.iter_nodes() if n.kind == "Channel"}
+    assert chan_ids == {f"chan:http:worker:GET /m{i:02d}/x" for i in range(16)}
+    assert len([e for e in st.iter_edges() if e.type == "HANDLES"]) == 16
+    assert caplog.records == []
+
+
+def test_remount_removal_purges_stale_path_templates_key(tmp_path):
+    """THE review repro (M9 T3 review item 1): double-mount -> link (props gain
+    path_template + path_templates) -> one mount is DELETED from source; the
+    mount's own file re-analyzes (delete_file_layer wipes its claims, the
+    surviving ones re-stage -- the real incremental primitive pipeline/analyze.py
+    uses) while the HANDLER's file stays untouched (its node keeps the previously
+    patched props) -> re-link. The re-link composes a single template again;
+    shallow-merge alone would overwrite path_template but leave the now-dead
+    path_templates list on the node FOREVER (the handler file never goes stale,
+    so S5 never wipes it either) -- the `remove` kwarg is what actively deletes
+    it in the same UPDATE. End state must be byte-identical to a node that was
+    only ever single-mounted: fresh path_template, NO path_templates key. (The
+    old /legacy CHANNEL's retirement is clear_workspace_layer + gc_orphan_
+    channels' job in the real link_workspace sequence -- covered by the M8-era
+    GC tests, deliberately not re-asserted here.)"""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/x")])
+    _route_decl(
+        st, "worker", "app/routes/x.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/v1",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/legacy",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    router_prefix.link(st)
+    patched = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert patched.props["path_templates"] == ["/legacy/x", "/v1/x"]  # sanity
+
+    # Simulated stale re-analyze of app/main.py with the /legacy mount deleted:
+    # wipe that file's claims wholesale, re-stage the surviving ones -- exactly
+    # what pipeline/analyze.py's incremental branch does to a stale file.
+    st.delete_file_layer("worker", {"app/main.py"}, drop_calls_evidence=set())
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/v1",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    router_prefix.link(st)
+
+    node = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert node.props["path_template"] == "/v1/x"
+    assert "path_templates" not in node.props

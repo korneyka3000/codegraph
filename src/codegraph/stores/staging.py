@@ -699,10 +699,26 @@ class Staging:
         self._db.commit()
         return True
 
-    def update_node_props(self, node_id: str, merge: dict) -> bool:
+    def update_node_props(
+        self, node_id: str, merge: dict, *, remove: tuple[str, ...] = (),
+    ) -> bool:
         """M9 T2: json-merge поверх props ОДНОГО узла (id) -- shallow `{**old,
         **merge}`, merge побеждает при коллизии ключей. No-op (возвращает False),
         если узла с таким id нет вовсе; True при успешном обновлении.
+
+        M9 T3 review fix: `remove` -- top-level ключи, УДАЛЯЕМЫЕ тем же самым
+        UPDATE, что и merge (не вторым вызовом): shallow-merge сам по себе не
+        способен снять ключ никогда, а у вызывателя бывает prop, легитимно
+        ИСЧЕЗНУВШИЙ между прогонами (router_prefix'ов `path_templates`, когда
+        double-mount схлопывается обратно в один mount -- без remove мёртвый
+        список жил бы на узле вечно, см. репро-тест). Семантика, ровно в этом
+        порядке: (1) remove применяется к СТАРЫМ props (отсутствующий ключ --
+        тихий no-op, не ошибка: вызыватель передаёт remove безусловно, включая
+        самый первый патч, когда ключа ещё не было); (2) merge ложится поверх --
+        ключ, названный И в merge, И в remove, получает значение из merge, а не
+        удаляется (явно переданное значение всегда побеждает; remove существует
+        для чистки устаревших ключей, не для отмены merge). Оба правила
+        запинены тестами.
 
         Mirrors `update_edge_props` above (same shallow-merge-then-UPDATE shape,
         same missing-key False/present-key True contract), but SIMPLER: `nodes.id`
@@ -713,21 +729,26 @@ class Staging:
         and therefore no NEXT_SEGMENT-like type restriction either (update_edge_props'
         own guard exists ONLY because its bare (src,dst,type) key can legitimately
         span more than one physical row -- see that method's own docstring; that
-        premise simply doesn't apply to a PRIMARY KEY lookup).
+        premise simply doesn't apply to a PRIMARY KEY lookup). `update_edge_props`
+        itself has no `remove` counterpart -- its only caller (temporal-start marks)
+        never retires a key; add one there if that ever changes, don't overload this
+        method's node-scoped contract.
 
-        Sole real caller (as of M9 T2): `linking/router_prefix.py`'s `link()`,
-        compose-back patching a RouteHandler node's own `path_template` prop (staged
-        LOCAL-only by `extractors/fastapi_ext.py` in S5) to the S7-composed,
-        cross-file template -- see that module's own docstring for the full
-        "only if it differs" call-site logic (this method itself has no opinion on
-        that; it always writes when the node exists, exactly like `update_edge_props`
-        always does)."""
+        Sole real caller (as of M9 T2/T3): `linking/router_prefix.py`'s `link()`,
+        compose-back patching a RouteHandler node's own `path_template` (+
+        `path_templates`) props (staged LOCAL-only by `extractors/fastapi_ext.py`
+        in S5) to the S7-composed, cross-file template(s) -- see that module's own
+        docstring for the full "only if it differs" call-site logic (this method
+        itself has no opinion on that; it always writes when the node exists,
+        exactly like `update_edge_props` always does)."""
         row = self._db.execute(
             "SELECT props FROM nodes WHERE id=?", (node_id,)
         ).fetchone()
         if row is None:
             return False
         props = json.loads(row[0])
+        for key in remove:
+            props.pop(key, None)
         props.update(merge)
         self._db.execute(
             "UPDATE nodes SET props=? WHERE id=?",
