@@ -221,6 +221,190 @@ def test_trace_mermaid_escapes_quotes_and_pipes_in_labels(tmp_path, monkeypatch)
     assert 'Order|Created"x' not in result.output  # no raw pipe/quote in the edge label
 
 
+# -- M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): external
+# exits ("channel VERB /path -> external <host>") -- text + mermaid, both renderers.
+
+_EXTERNAL_EXIT_RESULT = {
+    "segments": [
+        {
+            "service": "orders-api",
+            "entry": {"id": "e1", "name": "create_order"},
+            "steps": [],
+            "exits": [
+                {
+                    "channel": {
+                        "id": "chan:http:?:POST /api/v1/users/legal-entities",
+                        "name": "POST /api/v1/users/legal-entities",
+                        "external": True,
+                        "external_host": "api-gateway.prod.svc.cluster.local",
+                    },
+                    "next_entry_ids": [],
+                },
+            ],
+            "truncated": False,
+        },
+    ],
+    "confidence": 1.0,
+    "truncated": False,
+}
+
+
+def test_trace_text_format_renders_external_exit_as_external_host(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_EXTERNAL_EXIT_RESULT))
+
+    result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
+    assert result.exit_code == 0, result.output
+    # whitespace-stripped (see tests/eval/test_m2_gate.py's own _cli_output_flat):
+    # rich's Tree wraps long unbroken tokens under CliRunner's narrow non-tty width,
+    # which can otherwise split "external api-gateway...local" across two lines.
+    flat = "".join(result.output.split())
+    assert "POST/api/v1/users/legal-entities" in flat
+    assert "externalapi-gateway.prod.svc.cluster.local" in flat
+    assert "unresolved" not in result.output.lower()
+
+
+def test_trace_text_format_renders_plain_unresolved_exit_unchanged(tmp_path, monkeypatch):
+    """Regression pin: a dead-end exit with NO external flag still renders the
+    pre-existing "unresolved" fallback text, byte-identical to before this task."""
+    plain_unresolved_result = {
+        "segments": [
+            {
+                "service": "orders-api",
+                "entry": {"id": "e1", "name": "create_order"},
+                "steps": [],
+                "exits": [{"channel": {"id": "c1", "name": "GET /nowhere"}, "next_entry_ids": []}],
+                "truncated": False,
+            },
+        ],
+        "confidence": 0.5,
+        "truncated": False,
+    }
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr(
+        "codegraph.cli.GraphQuery", _fake_graph_query(plain_unresolved_result)
+    )
+
+    result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "channel GET /nowhere -> unresolved" in result.output
+
+
+def test_trace_text_format_prefers_resolved_next_ids_over_external_flag(tmp_path, monkeypatch):
+    """Defensive edge case: a channel that's BOTH flagged external AND (however
+    unexpectedly) has a resolved next_entry_ids shows the REAL resolved
+    destination -- "external <host>" is only ever the fallback label for a
+    dead-end exit, never shown when a real next hop is known."""
+    result_dict = {
+        "segments": [
+            {
+                "service": "orders-api",
+                "entry": {"id": "e1", "name": "create_order"},
+                "steps": [],
+                "exits": [
+                    {
+                        "channel": {
+                            "id": "c1", "name": "X", "external": True, "external_host": "h",
+                        },
+                        "next_entry_ids": ["e2"],
+                    },
+                ],
+                "truncated": False,
+            },
+            {
+                "service": "b", "entry": {"id": "e2", "name": "handler"},
+                "steps": [], "exits": [], "truncated": False,
+            },
+        ],
+        "confidence": 1.0,
+        "truncated": False,
+    }
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(result_dict))
+
+    result = runner.invoke(app, ["trace", "orders-api:POST /orders", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "e2" in result.output
+    assert "external" not in result.output.lower()
+
+
+def test_trace_mermaid_format_renders_external_exit_leaf_node(tmp_path, monkeypatch):
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(_EXTERNAL_EXIT_RESULT))
+
+    result = runner.invoke(
+        app, ["trace", "orders-api:POST /orders", str(root), "--format", "mermaid"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "flowchart TD" in result.output
+    assert 'external api-gateway.prod.svc.cluster.local"]' in result.output
+    assert "S0 -->|POST /api/v1/users/legal-entities|" in result.output
+
+
+def test_trace_mermaid_no_external_leaf_for_plain_unresolved_exit(tmp_path, monkeypatch):
+    """Regression pin: mermaid draws NO arrow/node at all for a plain (non-
+    external) dead-end exit -- unchanged pre-existing behavior (see
+    _trace_mermaid's own module docstring: dangling/unresolved next hops are
+    silently dropped, not drawn as a leaf)."""
+    plain_unresolved_result = {
+        "segments": [
+            {
+                "service": "orders-api",
+                "entry": {"id": "e1", "name": "create_order"},
+                "steps": [],
+                "exits": [{"channel": {"id": "c1", "name": "GET /nowhere"}, "next_entry_ids": []}],
+                "truncated": False,
+            },
+        ],
+        "confidence": 0.5,
+        "truncated": False,
+    }
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr(
+        "codegraph.cli.GraphQuery", _fake_graph_query(plain_unresolved_result)
+    )
+
+    result = runner.invoke(
+        app, ["trace", "orders-api:POST /orders", str(root), "--format", "mermaid"]
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.count('S0["') == 1  # only the segment node, no extra leaf
+    assert "-->" not in result.output
+
+
+def test_trace_mermaid_escapes_quotes_in_external_host_label(tmp_path, monkeypatch):
+    crafted = {
+        "segments": [
+            {
+                "service": "orders-api",
+                "entry": {"id": "e1", "name": "create_order"},
+                "steps": [],
+                "exits": [
+                    {
+                        "channel": {
+                            "id": "c1", "name": 'X"y',
+                            "external": True, "external_host": 'weird"host',
+                        },
+                        "next_entry_ids": [],
+                    },
+                ],
+                "truncated": False,
+            },
+        ],
+        "confidence": 1.0,
+        "truncated": False,
+    }
+    root = _write_workspace(tmp_path)
+    monkeypatch.setattr("codegraph.cli.GraphQuery", _fake_graph_query(crafted))
+
+    result = runner.invoke(
+        app, ["trace", "orders-api:POST /orders", str(root), "--format", "mermaid"]
+    )
+    assert result.exit_code == 0, result.output
+    assert 'weird"host' not in result.output
+    assert "weird'host" in result.output
+
+
 # -- M5 T5: compact rendering (collapsed marker steps) + --full CLI flag --
 
 _COLLAPSED_RESULT = {

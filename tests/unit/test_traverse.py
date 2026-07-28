@@ -266,6 +266,84 @@ def test_min_confidence_filters_next_segment_transition():
     assert result["segments"][0]["exits"][0]["next_entry_ids"] == []
 
 
+# -- M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): external
+# exit-hops (CALLS_HTTP/PRODUCES into a channel flagged external=True -- a
+# documented boundary outside the workspace, see linking/http_routes.py) are
+# EXCLUDED from the trace/segment aggregate confidence floor -- honest knowledge
+# of a boundary must not drag a trace down the same way a genuine modeling gap
+# does, even though the EDGE itself still (honestly) carries heuristic/0.5.
+
+
+def test_external_exit_hop_confidence_excluded_from_aggregate_stays_1_0():
+    """A trace whose ONLY weak link is an external exit keeps confidence 1.0."""
+    store = FakeStore()
+    store.add_node("entry", service="a", kind="Function")
+    store.add_node("strong_step", service="a", kind="Function")
+    store.add_node(
+        "chan:http:?:GET /external",
+        kind="Channel", name="GET /external", channel_kind="http_route",
+        unresolved=True, external=True, external_host="api-gateway.prod.svc.cluster.local",
+    )
+    store.add_edge("entry", "CALLS", "strong_step", confidence=1.0, resolution="static")
+    store.add_edge(
+        "entry", "CALLS_HTTP", "chan:http:?:GET /external",
+        confidence=0.5, resolution="heuristic",
+    )
+
+    result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+
+    assert result["confidence"] == 1.0
+    # the external exit itself is still present in the trace, at its own honest
+    # heuristic/0.5 edge confidence -- EXCLUDED from the aggregate, never hidden.
+    exits = result["segments"][0]["exits"]
+    assert len(exits) == 1
+    assert exits[0]["channel"]["external"] is True
+    assert exits[0]["channel"]["external_host"] == "api-gateway.prod.svc.cluster.local"
+
+
+def test_non_external_exit_hop_confidence_still_counts_toward_aggregate():
+    """Contrast case: a plain (non-external) low-confidence exit -- e.g. the
+    pre-existing generic-unresolved heuristic/0.5 HTTP channel -- still drags the
+    trace's aggregate confidence down exactly as before this task; only
+    external=True exits are excluded."""
+    store = FakeStore()
+    store.add_node("entry", service="a", kind="Function")
+    store.add_node("strong_step", service="a", kind="Function")
+    store.add_node(
+        "chan:http:?:GET /unresolved",
+        kind="Channel", name="GET /unresolved", channel_kind="http_route", unresolved=True,
+    )
+    store.add_edge("entry", "CALLS", "strong_step", confidence=1.0, resolution="static")
+    store.add_edge(
+        "entry", "CALLS_HTTP", "chan:http:?:GET /unresolved",
+        confidence=0.5, resolution="heuristic",
+    )
+
+    result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+
+    assert result["confidence"] == 0.5
+
+
+def test_external_exit_with_no_other_edges_at_all_is_the_trivial_1_0_case():
+    """A degenerate single-hop trace (no steps, ONE external exit): all_confidences
+    ends up empty after exclusion -- falls to the SAME "no edges to doubt" 1.0
+    default `trace_process` already uses for a truly edge-less trace."""
+    store = FakeStore()
+    store.add_node("entry", service="a", kind="Function")
+    store.add_node(
+        "chan:http:?:GET /external",
+        kind="Channel", name="GET /external", channel_kind="http_route",
+        unresolved=True, external=True, external_host="api-gateway.prod.svc.cluster.local",
+    )
+    store.add_edge(
+        "entry", "CALLS_HTTP", "chan:http:?:GET /external",
+        confidence=0.5, resolution="heuristic",
+    )
+
+    result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+    assert result["confidence"] == 1.0
+
+
 # -- max_segments truncation --
 
 

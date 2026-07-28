@@ -149,7 +149,15 @@ class TraceExit(BaseModel):
     """Выход сегмента через канал (PRODUCES/CALLS_HTTP): next_entry_ids -- entry-id
     следующих сегментов, восстановленные через NEXT_SEGMENT+via_channel_id
     (см. query/traverse.py модульный докстринг); пустой список -- канал без
-    резолвленного потребителя (dead end), не ошибка."""
+    резолвленного потребителя (dead end), не ошибка.
+
+    M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): `channel` is a
+    plain, untyped dict (whatever the graph node's own properties are), not a
+    nested pydantic model -- linking/http_routes.py's tier-2a `external`/
+    `external_host` props therefore already validate here with NO schema change at
+    all, additively, alongside every other Channel prop (owner_service, config_ref,
+    unresolved, ...) this field has always carried verbatim. See
+    tests/unit/test_mcp_schemas.py for a pinned proof."""
 
     channel: dict
     next_entry_ids: list[str]
@@ -166,7 +174,10 @@ class TraceSegment(BaseModel):
 
 class TraceProcessOutput(BaseModel):
     segments: list[TraceSegment]
-    confidence: float  # min по всем пройденным рёбрам (шаги + переходы); 1.0 если рёбер нет
+    # min по всем пройденным рёбрам (шаги + переходы); 1.0 если рёбер нет. M9 T1:
+    # exit-хопы в channel.external=True (см. TraceExit) ИСКЛЮЧЕНЫ из этого минимума
+    # -- см. query/traverse.py::trace_process докстринг за полной формулой до/после.
+    confidence: float
     truncated: bool  # true если truncated у любого сегмента ИЛИ max_segments срезал список
 
 

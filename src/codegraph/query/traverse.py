@@ -84,7 +84,21 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
     bookkeeping alongside the two places that already record this information
     (`steps.append`/`exit_producers.setdefault`), consumed by `_compact_steps`
     post-processing in `trace_process` below. Nothing about the walk itself
-    (order, cycle/depth/branch handling) changes."""
+    (order, cycle/depth/branch handling) changes.
+
+    M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): `confidences`
+    (returned, folded into `trace_process`'s own aggregate -- see that function's
+    docstring for the before/after formula) collects EVERY walked hop's confidence
+    EXCEPT an exit-hop (CALLS_HTTP/PRODUCES) into a channel node whose own props
+    carry `external=True` (linking/http_routes.py's tier 2a: a REAL, known hostname
+    outside the workspace). The edge itself still carries its own honest
+    heuristic/0.5 -- only its CONTRIBUTION to this trace's aggregate floor is
+    excluded, so a documented boundary never reads as equivalent to an unmodeled
+    gap. The excluded edge is otherwise treated identically to any other exit
+    (still recorded in `exit_channel_nodes`/`exit_producers`/`exit_producer_ids`,
+    still subject to the SAME `min_confidence` presence filter via `_sorted_hops`
+    above -- exclusion is from the AGGREGATE only, never from the walk or the
+    rendered trace itself)."""
     steps: list[dict] = []
     step_parents: list[str] = []
     confidences: list[float] = []
@@ -122,10 +136,21 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
         for edge_type, edge_props, neighbor, _hop_direction in hops:
             neighbor_id = neighbor.get("id")
             confidence = edge_props.get("confidence")
-            if confidence is not None:
+            is_exit = edge_type in _EXIT_EDGE_TYPES
+            # M9 T1: an exit-hop into a channel flagged external=True (linking/
+            # http_routes.py's tier 2a -- a REAL, known hostname outside the
+            # workspace, see that module's docstring) is honest KNOWLEDGE of a
+            # boundary, not modeling uncertainty -- its own edge confidence stays
+            # exactly as recorded (heuristic/0.5, "no unearned confidence") but is
+            # EXCLUDED from this trace's aggregate confidence floor below, so it
+            # never drags an otherwise-fully-resolved trace down to 0.5. Every
+            # OTHER edge (steps, non-external exits, NEXT_SEGMENT transitions in
+            # _resolve_exits below) is unaffected.
+            is_external_exit = is_exit and bool(neighbor.get("external"))
+            if confidence is not None and not is_external_exit:
                 confidences.append(confidence)
 
-            if edge_type in _EXIT_EDGE_TYPES:
+            if is_exit:
                 if neighbor_id is not None:
                     exit_channel_nodes[neighbor_id] = neighbor
                     exit_producers.setdefault(neighbor_id, set()).add(node_id)
@@ -306,10 +331,28 @@ def trace_process(
     BFS: visited_entries prevents both re-visiting a segment and infinite process
     cycles (segment N's exit looping back to an earlier entry); max_segments caps
     the OUTPUT list (truncated=True if more entries were pending once the cap
-    hit). Aggregate confidence is the minimum confidence over every edge actually
-    walked (steps + NEXT_SEGMENT transitions) -- a chain is only as trustworthy as
-    its weakest link; 1.0 if the trace contains no edges at all (single node, no
-    steps/exits -- nothing to doubt).
+    hit).
+
+    Aggregate confidence formula -- BEFORE M9 T1: the minimum confidence over
+    every edge actually walked (steps + exit-hops + NEXT_SEGMENT transitions) -- a
+    chain is only as trustworthy as its weakest link; 1.0 if the trace contains no
+    edges at all (single node, no steps/exits -- nothing to doubt). AFTER M9 T1
+    (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): IDENTICAL minimum-
+    over-walked-edges formula, EXCEPT an exit-hop (CALLS_HTTP/PRODUCES) into a
+    channel flagged `external=True` (linking/http_routes.py's tier 2a -- a real,
+    known hostname genuinely outside the workspace) no longer contributes its own
+    confidence to this minimum at all -- see `_walk_segment`'s own docstring for
+    exactly where that exclusion happens. Rationale: "env known, hostname outside
+    the workspace" is HONEST KNOWLEDGE of a boundary, not the same kind of
+    uncertainty a genuinely-unmodeled miss represents -- before this change, a
+    single external HTTP call anywhere in an otherwise fully-resolved (static/1.0)
+    trace dragged the WHOLE trace's reported confidence down to 0.5, which read as
+    "this trace is unreliable" when in fact every RESOLVED hop was exactly as
+    trustworthy as ever (see that report's own §3 disclaimer, the motivating case
+    for this task). A trace whose ONLY weak link is an external exit now reports
+    confidence 1.0 -- the excluded edge is still rendered in the trace output
+    (cli.py's `_trace_tree`/`_trace_mermaid`, "-> external <host>") at its own
+    honest heuristic/0.5, it simply no longer poisons the AGGREGATE.
 
     compact (M5 T5, default True): post-process each segment's steps through
     _compact_steps above -- collapses long boring runs (see its own docstring),

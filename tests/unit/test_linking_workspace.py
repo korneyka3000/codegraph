@@ -297,6 +297,31 @@ def test_link_workspace_composes_router_prefix_before_http_routes_link(tmp_path)
     assert calls_http.dst == "chan:http:worker:GET /api/v1/steps/{id}"
 
 
+def test_link_workspace_propagates_calls_http_external_count(tmp_path):
+    """M9 T1: link_workspace's own returned dict must surface http_routes.link's
+    tier-2a ("external") counter, not just calls_http/calls_http_unresolved -- same
+    "propagates unchanged" contract as part_of_process_ambiguous below."""
+    st = Staging(tmp_path / "s.db")
+    st.add_claims("caller", "app/client.py", "http_call", [{
+        "src_id": "sym:caller:client", "verb": "GET", "path_template": "/x",
+        "base_url_env": "GATEWAY_URL", "resolution_hint": "static", "evidence_line": 3,
+    }])
+    helm = tmp_path / "values.yaml"
+    helm.write_text('GATEWAY_URL: "http://api-gateway.prod.svc.cluster.local"\n')
+    cfg = WorkspaceConfig(
+        graph_name="g", services=[ServiceConfig(name="svc", path=__file__)],
+        env_sources=[helm],
+    )
+
+    report = link_workspace(cfg, st)
+
+    assert report["calls_http_external"] == 1
+    assert report["calls_http_unresolved"] == 0
+    calls_http = next(e for e in st.iter_edges() if e.type == "CALLS_HTTP")
+    assert calls_http.resolution == "heuristic" and calls_http.confidence == 0.5
+    assert calls_http.dst == "chan:http:?:GET /x"
+
+
 def test_link_workspace_returns_all_expected_counter_keys(tmp_path):
     st = Staging(tmp_path / "s.db")
     report = link_workspace(_cfg(), st)
@@ -310,6 +335,9 @@ def test_link_workspace_returns_all_expected_counter_keys(tmp_path):
         # M8 T2 (rerun-2 R5): linking.signal_send.link's own honest-miss counter --
         # see linking/signal_send.py's own docstring.
         "signal_send_unlinked",
+        # M9 T1: http_routes.link's own tier-2a ("external") honest-miss counter --
+        # see linking/http_routes.py's own module docstring.
+        "calls_http_external",
     }
 
 

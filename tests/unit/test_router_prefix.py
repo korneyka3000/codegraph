@@ -579,7 +579,7 @@ def test_composed_route_resolves_client_claim_to_static_calls_http(tmp_path):
     router_prefix.link(st)
     http_stats = http_routes.link(_cfg(), st)
 
-    assert http_stats == {"calls_http": 1, "calls_http_unresolved": 0}
+    assert http_stats == {"calls_http": 1, "calls_http_unresolved": 0, "calls_http_external": 0}
     calls_http = next(e for e in st.iter_edges() if e.type == "CALLS_HTTP")
     assert calls_http.resolution == "static" and calls_http.confidence == 1.0
     assert calls_http.dst == "chan:http:worker:GET /api/v1/steps/{step_uid}"
@@ -605,6 +605,6 @@ def test_negative_pin_without_composition_client_claim_is_unresolved_not_tail_ma
     router_prefix.link(st)
     http_stats = http_routes.link(_cfg(), st)
 
-    assert http_stats == {"calls_http": 1, "calls_http_unresolved": 1}
+    assert http_stats == {"calls_http": 1, "calls_http_unresolved": 1, "calls_http_external": 0}
     calls_http = next(e for e in st.iter_edges() if e.type == "CALLS_HTTP")
     assert calls_http.resolution == "heuristic" and calls_http.confidence == 0.5

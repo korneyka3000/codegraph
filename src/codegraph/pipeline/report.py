@@ -292,7 +292,13 @@ def print_report(report: dict, console: Console) -> None:
     if linking:
         console.print(
             f"linking: channels calls_http = {linking.get('calls_http', 0)} "
-            f"(unresolved={linking.get('calls_http_unresolved', 0)}), "
+            # M9 T1: calls_http_external joins the SAME parenthetical as
+            # calls_http_unresolved (both are http_routes.link's own honest-miss
+            # counters -- external is a real, known hostname outside the
+            # workspace, unresolved is a genuinely unmodeled miss) -- same
+            # "always present, 0-defaulted" convention as every other field here.
+            f"(unresolved={linking.get('calls_http_unresolved', 0)}, "
+            f"external={linking.get('calls_http_external', 0)}), "
             f"next_segments = {linking.get('next_segments', 0)}, "
             f"processes = {linking.get('processes', 0)}, "
             f"channels_gc = {linking.get('channels_gc', 0)}, "

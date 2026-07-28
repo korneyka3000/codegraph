@@ -45,6 +45,23 @@ completed, so an uncaught parse error here would lose the whole index run at its
 last stage over one bad optional-input file. This also keeps the function safely
 callable from unit tests (and any future in-memory caller) that construct a
 `WorkspaceConfig` directly, bypassing `config/loader.py`'s own validation entirely.
+
+M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3, "внешний (api-gateway),
+честно не заякорен"): `build_env_hostname_map` -- the SAME env_sources data, harvested
+WITHOUT filtering to hostnames that happen to name a workspace service. Feeds
+linking/http_routes.py's tier-2 split: a claim whose base_url_env resolves to a
+hostname THROUGH THIS MAP, but whose hostname names no workspace service, is HONEST
+KNOWLEDGE of a boundary ("external") -- worth distinguishing from an env name this
+harvest has NOTHING for at all (unmodeled -- the pre-existing "unmapped" tier, left
+unchanged). Deliberately a SEPARATE small function with its OWN file-read loop rather
+than a shared refactor of `build_env_service_map`'s (this module's own precedent for
+"two small, obviously-correct functions over one more-parameterized one for a
+marginal DRY gain" -- see linking/http_routes.py's module docstring's structurally
+similar "deliberately dropped" note on `calls_http_ambiguous`): `linking/http_routes.
+py`'s `link()` calls both once per index run, so each env_sources file is read+parsed
+twice per run, and a malformed file is warned about (at most) twice rather than once
+-- a cosmetic, not correctness, cost, and not observable by any caller that isn't
+literally counting log lines.
 """
 
 from __future__ import annotations
@@ -78,13 +95,25 @@ def _walk_strings(node: object) -> list[tuple[str, str]]:
     return out
 
 
+def _hostname(value: str) -> str | None:
+    """Full hostname of a URL-shaped string (e.g. "api-gateway.prod.svc.cluster.
+    local"), or None when `value` doesn't parse as a URL with a network location at
+    all (a non-URL string -- plain text, a scheme-less `host:port` where the text
+    before ":" reads as a URL *scheme* rather than a host -- is honestly ignored,
+    never guessed at). `urlparse(...).hostname` is already lowercased and
+    port-stripped by the stdlib itself, so no extra cleanup is needed here.
+    Feeds BOTH `_hostname_label` (below, the pre-existing first-DNS-label reduction
+    `build_env_service_map` matches against `service_names`) and
+    `build_env_hostname_map` (M9 T1, the FULL-hostname harvest -- see its own
+    docstring)."""
+    return urlparse(value).hostname
+
+
 def _hostname_label(value: str) -> str | None:
-    """First DNS label of a URL-shaped string's hostname, or None when `value`
-    doesn't parse as a URL with a network location at all (a non-URL string is
-    honestly ignored for service-mapping, never guessed at -- see module
-    docstring). `urlparse(...).hostname` is already lowercased and port-stripped
-    by the stdlib itself, so no extra cleanup is needed here for either."""
-    hostname = urlparse(value).hostname
+    """First DNS label of `_hostname`'s result, or None -- see that function's own
+    docstring for the exact non-cases. Unchanged behavior/callers from before M9 T1;
+    just factored to share the single urlparse call with `build_env_hostname_map`."""
+    hostname = _hostname(value)
     return hostname.split(".")[0] if hostname else None
 
 
@@ -112,4 +141,33 @@ def build_env_service_map(env_sources: list[Path], service_names: set[str]) -> d
             label = _hostname_label(value)
             if label is not None and label in service_names:
                 result[key] = label
+    return result
+
+
+def build_env_hostname_map(env_sources: list[Path]) -> dict[str, str]:
+    """M9 T1: env-var-name -> FULL hostname (e.g. "api-gateway.prod.svc.cluster.
+    local"), for EVERY (key, URL-value) pair found across all `env_sources` files
+    that parses as a URL with a hostname at ALL -- UNLIKE `build_env_service_map`
+    above, this does NOT filter down to hostnames that happen to name a configured
+    workspace service; every URL-shaped env value is harvested here, service or not
+    (see module docstring for the full "external vs. unmapped" tier split this
+    feeds in linking/http_routes.py).
+
+    Same file-read semantics as `build_env_service_map` (list order, last-file-wins
+    on key collision, missing file silently skipped, malformed YAML skipped with a
+    `logger.warning`) -- see module docstring for why this is a deliberately
+    SEPARATE loop rather than a shared refactor of that function's own."""
+    result: dict[str, str] = {}
+    for path in env_sources:
+        if not path.is_file():
+            continue
+        try:
+            data = yaml.safe_load(path.read_text()) or {}
+        except yaml.YAMLError as e:
+            logger.warning("env_sources: skipping malformed YAML %s: %s", path, e)
+            continue
+        for key, value in _walk_strings(data):
+            hostname = _hostname(value)
+            if hostname is not None:
+                result[key] = hostname
     return result

@@ -13,6 +13,7 @@ from codegraph.mcp.schemas import (
     Hop,
     SearchCodeInput,
     SearchCodeOutput,
+    TraceExit,
     TraceProcessInput,
     TraceStep,
 )
@@ -114,3 +115,28 @@ def test_trace_process_input_compact_defaults_true():
 
 def test_trace_process_input_compact_can_be_set_false():
     assert TraceProcessInput(entrypoint_id="e1", compact=False).compact is False
+
+
+# -- M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): TraceExit's
+# `channel` field is a plain dict (no nested Channel model) -- additive external/
+# external_host props (linking/http_routes.py's tier 2a) validate exactly like ANY
+# other property already living there (owner_service, config_ref, ...), no schema
+# change needed. Pinned here anyway -- same "prove additivity, don't just assert"
+# precedent as the M5 T5 collapsed-marker tests above.
+
+
+def test_trace_exit_channel_accepts_external_props_additively():
+    exit_ = TraceExit(
+        channel={
+            "id": "chan:http:?:GET /x", "external": True,
+            "external_host": "api-gateway.prod.svc.cluster.local",
+        },
+        next_entry_ids=[],
+    )
+    assert exit_.channel["external"] is True
+    assert exit_.channel["external_host"] == "api-gateway.prod.svc.cluster.local"
+
+
+def test_trace_exit_channel_without_external_props_still_validates_unchanged():
+    exit_ = TraceExit(channel={"id": "chan:event_type:X"}, next_entry_ids=["e2"])
+    assert "external" not in exit_.channel

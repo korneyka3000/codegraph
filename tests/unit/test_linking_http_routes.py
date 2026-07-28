@@ -98,7 +98,7 @@ def test_static_claim_matches_exact_route_conf_1_0(tmp_path):
     assert e.extractor == "linking"
     assert e.evidence_file == "app/clients/document_management_client.py"
     assert e.evidence_line == 1
-    assert stats == {"calls_http": 1, "calls_http_unresolved": 0}
+    assert stats == {"calls_http": 1, "calls_http_unresolved": 0, "calls_http_external": 0}
 
 
 # -- segment matching: wildcard is ROUTE-SIDE ONLY (M7 T3) --
@@ -267,10 +267,15 @@ def test_base_url_env_unmapped_is_unresolved_with_config_ref(tmp_path):
 
     cfg = _cfg(_svc("service-a", "A_URL"))
     stats = http_routes.link(cfg, st)
-    assert stats["calls_http_unresolved"] == 1
+    assert stats == {"calls_http": 1, "calls_http_unresolved": 1, "calls_http_external": 0}
 
     unresolved_chan = next(n for n in st.iter_nodes() if n.kind == "Channel" and n.id != chan.id)
     assert unresolved_chan.props.get("config_ref") == "OTHER_URL"
+    # M9 T1: "OTHER_URL" isn't in env_sources at all (empty here) -- NOT the same as
+    # a hostname that fails to match a workspace service (that's the "external" tier
+    # below) -- no external prop at all on this genuinely-unmapped channel.
+    assert "external" not in unresolved_chan.props
+    assert "external_host" not in unresolved_chan.props
     edge = next(e for e in st.iter_edges() if e.type == "CALLS_HTTP")
     assert edge.dst == unresolved_chan.id
 
@@ -390,15 +395,19 @@ def test_malformed_env_sources_file_does_not_crash_link(tmp_path):
     cfg = _cfg(_svc("service-b", "B_URL"), env_sources=[bad])
     stats = http_routes.link(cfg, st)
 
-    assert stats == {"calls_http": 1, "calls_http_unresolved": 0}
+    assert stats == {"calls_http": 1, "calls_http_unresolved": 0, "calls_http_external": 0}
     edges = [e for e in st.iter_edges() if e.type == "CALLS_HTTP"]
     assert len(edges) == 1 and edges[0].dst == chan.id
     assert edges[0].resolution == "static" and edges[0].confidence == 1.0
 
 
 def test_env_map_hostname_label_not_a_workspace_service_falls_to_unmapped(tmp_path):
-    """env_map resolves a hostname label, but the label ISN'T any configured
-    workspace service name -- tier 2 (unmapped), not a silent guess."""
+    """PRE-M9 T1 this was tier 2 (unmapped); M9 T1 splits it into the NEW
+    "external" tier instead (see test_env_map_hostname_not_a_workspace_service_is_
+    external below, and the module docstring's updated tier list) -- a hostname
+    env_map DOES know, that simply names no workspace service, is now honest
+    knowledge of a boundary, not an unmodeled miss. This test's name/docstring is
+    kept (not deleted) specifically to make that inversion visible in history."""
     helm = tmp_path / "values.yaml"
     helm.write_text('SOME_URL: "http://not-a-real-service.ns.svc.cluster.local"\n')
     st = Staging(tmp_path / "s.db")
@@ -409,9 +418,99 @@ def test_env_map_hostname_label_not_a_workspace_service_falls_to_unmapped(tmp_pa
     cfg = _cfg(_svc("service-a"), env_sources=[helm])
     stats = http_routes.link(cfg, st)
 
-    assert stats["calls_http_unresolved"] == 1
+    assert stats == {"calls_http": 1, "calls_http_unresolved": 0, "calls_http_external": 1}
     unresolved_chan = next(n for n in st.iter_nodes() if n.kind == "Channel" and n.id != chan.id)
     assert unresolved_chan.props.get("config_ref") == "SOME_URL"
+
+
+# -- M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): tier-2 split --
+# env known AND env_sources HAS a hostname for it, but that hostname names no
+# workspace service -- "external" (honest boundary knowledge), counted separately
+# from the plain "unmapped" tier (env_sources has NOTHING usable for the env at all).
+# Channel id form, resolution, and confidence are ALL unchanged from plain unmapped
+# -- only props (`external`, `external_host`) and the counter differ.
+
+
+def test_env_map_hostname_not_a_workspace_service_is_external_tier(tmp_path):
+    helm = tmp_path / "values.yaml"
+    helm.write_text('SOME_URL: "http://api-gateway.prod.svc.cluster.local"\n')
+    st = Staging(tmp_path / "s.db")
+    chan = _route_channel("service-a", "GET", "/x")
+    st.upsert_nodes([chan])
+    _claim(st, "caller", "a.py", "sym:caller:f", "GET", "/x", base_url_env="SOME_URL")
+
+    cfg = _cfg(_svc("service-a"), env_sources=[helm])
+    stats = http_routes.link(cfg, st)
+
+    assert stats == {"calls_http": 1, "calls_http_unresolved": 0, "calls_http_external": 1}
+    ext_chan = next(n for n in st.iter_nodes() if n.kind == "Channel" and n.id != chan.id)
+    assert ext_chan.id == "chan:http:?:GET /x"  # id form UNCHANGED (owner=None -> "?")
+    assert ext_chan.props.get("config_ref") == "SOME_URL"
+    assert ext_chan.props.get("external") is True
+    assert ext_chan.props.get("external_host") == "api-gateway.prod.svc.cluster.local"
+    assert ext_chan.props.get("unresolved") is True
+
+    edge = next(e for e in st.iter_edges() if e.type == "CALLS_HTTP")
+    assert edge.dst == ext_chan.id
+    # "no unearned confidence" -- IDENTICAL to the plain unmapped tier, M9 T1's
+    # binding constraint (the trace-level payoff is in query/traverse.py instead).
+    assert edge.resolution == "heuristic" and edge.confidence == 0.5
+
+
+def test_anchored_via_env_map_wins_over_external_even_though_hostname_also_present(
+    tmp_path,
+):
+    """Tier ordering pin: a hostname that DOES match a workspace service resolves
+    anchored (tier 1b) and never reaches the external tier at all -- even though
+    build_env_hostname_map's own raw harvest technically "has" this exact hostname
+    too (build_env_service_map -- tried first -- already claims it)."""
+    helm = tmp_path / "values.yaml"
+    helm.write_text('SERVICE_WORKER_URL: "http://worker.kyc.svc.cluster.local:9000"\n')
+    st = Staging(tmp_path / "s.db")
+    chan = _route_channel("worker", "GET", "/x")
+    st.upsert_nodes([chan])
+    _claim(st, "caller", "a.py", "sym:caller:f", "GET", "/x", base_url_env="SERVICE_WORKER_URL")
+
+    cfg = _cfg(_svc("worker"), env_sources=[helm])
+    stats = http_routes.link(cfg, st)
+
+    assert stats == {"calls_http": 1, "calls_http_unresolved": 0, "calls_http_external": 0}
+    edges = [e for e in st.iter_edges() if e.type == "CALLS_HTTP"]
+    assert edges[0].dst == chan.id and edges[0].resolution == "static"
+
+
+def test_calls_http_total_counts_resolved_unresolved_and_external(tmp_path):
+    helm = tmp_path / "values.yaml"
+    helm.write_text('GATEWAY_URL: "http://api-gateway.prod.svc.cluster.local"\n')
+    st = Staging(tmp_path / "s.db")
+    chan = _route_channel("svc", "GET", "/ok")
+    st.upsert_nodes([chan])
+    _claim(st, "a", "a.py", "sym:a:f", "GET", "/ok")
+    _claim(st, "b", "b.py", "sym:b:g", "GET", "/missing")
+    _claim(st, "c", "c.py", "sym:c:h", "GET", "/gw", base_url_env="GATEWAY_URL")
+
+    stats = http_routes.link(_cfg(_svc("svc"), env_sources=[helm]), st)
+    assert stats == {"calls_http": 3, "calls_http_unresolved": 1, "calls_http_external": 1}
+
+
+def test_malformed_env_sources_file_does_not_crash_link_and_external_claim_still_resolves(
+    tmp_path,
+):
+    """Same crash-safety pin as test_malformed_env_sources_file_does_not_crash_link
+    above, exercising the NEW build_env_hostname_map read too (M9 T1 -- link() now
+    calls both env_map builders once each): a malformed file must not prevent an
+    unrelated, otherwise-external claim from resolving correctly."""
+    bad = tmp_path / "bad-values.yaml"
+    bad.write_text("SERVICE_X_URL: {{ .Values.host }}\n")
+    good = tmp_path / "good-values.yaml"
+    good.write_text('GATEWAY_URL: "http://api-gateway.prod.svc.cluster.local"\n')
+    st = Staging(tmp_path / "s.db")
+    _claim(st, "caller", "a.py", "sym:caller:f", "GET", "/x", base_url_env="GATEWAY_URL")
+
+    cfg = _cfg(env_sources=[bad, good])
+    stats = http_routes.link(cfg, st)
+
+    assert stats == {"calls_http": 1, "calls_http_unresolved": 0, "calls_http_external": 1}
 
 
 # -- unresolved fallback --
@@ -423,7 +522,7 @@ def test_unresolved_creates_owner_unknown_channel_and_low_confidence_edge(tmp_pa
 
     stats = http_routes.link(_cfg(), st)
 
-    assert stats == {"calls_http": 1, "calls_http_unresolved": 1}
+    assert stats == {"calls_http": 1, "calls_http_unresolved": 1, "calls_http_external": 0}
     chans = [n for n in st.iter_nodes() if n.kind == "Channel"]
     assert len(chans) == 1
     chan = chans[0]
@@ -458,7 +557,7 @@ def test_unresolved_channel_id_is_deterministic_and_deduplicates_across_claims(t
 def test_no_claims_returns_zero_counts_and_writes_nothing(tmp_path):
     st = Staging(tmp_path / "s.db")
     stats = http_routes.link(_cfg(), st)
-    assert stats == {"calls_http": 0, "calls_http_unresolved": 0}
+    assert stats == {"calls_http": 0, "calls_http_unresolved": 0, "calls_http_external": 0}
     assert list(st.iter_nodes()) == []
     assert list(st.iter_edges()) == []
 
@@ -471,4 +570,4 @@ def test_calls_http_total_counts_both_resolved_and_unresolved(tmp_path):
     _claim(st, "b", "b.py", "sym:b:g", "GET", "/missing")
 
     stats = http_routes.link(_cfg(_svc("svc")), st)
-    assert stats == {"calls_http": 2, "calls_http_unresolved": 1}
+    assert stats == {"calls_http": 2, "calls_http_unresolved": 1, "calls_http_external": 0}

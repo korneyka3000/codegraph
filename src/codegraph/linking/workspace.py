@@ -147,8 +147,8 @@ def _apply_temporal_start_marks(staging: Staging) -> int:
 def link_workspace(cfg: WorkspaceConfig, staging: Staging) -> dict:
     """S7 entry point. staging-only (no FalkorDB access) -- callers don't need a
     store-unavailability guard around this call. Returns a JSON-serializable counters
-    dict: {calls_http, calls_http_unresolved, next_segments, processes, marks,
-    channels_gc, part_of_process_ambiguous, route_prefix_unresolved,
+    dict: {calls_http, calls_http_unresolved, calls_http_external, next_segments,
+    processes, marks, channels_gc, part_of_process_ambiguous, route_prefix_unresolved,
     signal_send_unlinked}. The part_of_process_ambiguous key (M3 T2) is
     processes.materialize's own `_entry_of`-climb ambiguity count, passed through
     unchanged -- see linking/processes.py's module docstring for what it means.
@@ -158,7 +158,11 @@ def link_workspace(cfg: WorkspaceConfig, staging: Staging) -> dict:
     linking.signal_send.link's own honest-miss counter -- a temporal_signal_send
     claim whose method_symbol resolved at extraction time but names no method with a
     live CONSUMES edge into a temporal_signal channel at link time -- see
-    linking/signal_send.py's own module docstring."""
+    linking/signal_send.py's own module docstring. calls_http_external (M9 T1) is
+    http_routes.link's own tier-2a honest-miss counter -- an http_call claim whose
+    base_url_env resolves (via env_sources) to a REAL hostname outside the
+    workspace, distinct from calls_http_unresolved's genuinely-unmodeled misses --
+    see linking/http_routes.py's own module docstring for the full tier split."""
     staging.clear_workspace_layer()
     channels_gc = staging.gc_orphan_channels()
     marks = _apply_temporal_start_marks(staging)
@@ -170,6 +174,7 @@ def link_workspace(cfg: WorkspaceConfig, staging: Staging) -> dict:
     return {
         "calls_http": http_stats["calls_http"],
         "calls_http_unresolved": http_stats["calls_http_unresolved"],
+        "calls_http_external": http_stats["calls_http_external"],
         "next_segments": segment_stats["next_segments"],
         "processes": process_stats["processes"],
         "marks": marks,

@@ -558,6 +558,32 @@ def test_print_report_linking_line_defaults_signal_send_unlinked_to_zero_when_ab
     assert "signal_send_unlinked = 0" in text
 
 
+# -- M9 T1: print_report calls_http_external on the linking summary line -- same
+# "always present, 0-defaulted" convention as route_prefix_unresolved/
+# signal_send_unlinked above, but nested in the SAME parenthetical as
+# calls_http_unresolved (both are http_routes.link's own honest-miss counters).
+
+
+def test_print_report_shows_calls_http_external_on_linking_line():
+    link_stats_with_external = {**LINK_STATS, "calls_http_external": 9}
+    report = build_report([SERVICE_OK], LOAD_STATS, link_stats_with_external)
+    console = Console(record=True, width=200)
+    print_report(report, console)
+    text = console.export_text()
+
+    assert "external=9" in text
+
+
+def test_print_report_linking_line_defaults_calls_http_external_to_zero_when_absent():
+    """A link_stats dict predating M9 T1 (no calls_http_external key at all) must
+    not KeyError -- the line just shows external=0."""
+    report = build_report([SERVICE_OK], LOAD_STATS, LINK_STATS)
+    console = Console(record=True, width=200)
+    print_report(report, console)  # must not raise
+    text = console.export_text()
+    assert "external=0" in text
+
+
 def test_print_report_no_linking_line_when_absent():
     """Backward compatibility: a report built without link_stats (or hand-built without
     a "linking" key at all, as every pre-T7 report was) must not print anything new."""

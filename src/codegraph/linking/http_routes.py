@@ -8,6 +8,18 @@ M7 T3 (OPEN R1 -- docs/superpowers/reports/2026-07-23-pilot-rerun-open-gaps.md):
 binding changes over the M2 design below, both load-bearing enough to warrant their own
 account up front.
 
+M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): a THIRD binding change,
+additive on top of both of the above -- the "ENV KNOWN, UNMAPPED" tier below splits into
+an "external" sub-tier (a real, known hostname outside the workspace -- honest boundary
+knowledge, counted via its own `calls_http_external`) and the unchanged plain "unmapped"
+sub-tier (env_sources has nothing at all for this env). Unresolved claims still fall
+back to a synthetic owner="?" Channel + low-confidence (heuristic/0.5) CALLS_HTTP so no
+claim is silently dropped -- the split changes WHICH counter + which extra props a given
+miss carries, never the id form or the edge's own resolution/confidence. See "ANCHORING
+TIERS" tier 2 below for the full split, and query/traverse.py's own module docstring for
+the trace-level payoff (external exit-hops don't drag down a trace's aggregate
+confidence the way a genuine modeling gap does).
+
 STRICT FORM (`_templates_match`): the `{param}` wildcard is now ROUTE-SIDE ONLY. A
 route's own `{param}` segment still matches ANY claim segment (a client hardcoding
 `/orders/42` against route `/orders/{order_id}` is exactly as valid a match as before),
@@ -47,12 +59,37 @@ tiers, evaluated per claim by `_target`:
      exactly like zero matches -- silently picking one would repeat the funnel bug's
      own mistake at a narrower scale.
   2. ENV KNOWN, UNMAPPED -- claim.base_url_env is set but NEITHER source above can name
-     a service for it (genuinely external, or simply not modeled in this workspace).
-     Unconditionally unresolved, no matching attempted at all: a coincidental path-
-     shape match against an unrelated MODELED service would be actively wrong, not
-     merely uncertain, so this tier never even reaches `_candidates`. The synthetic
-     Channel additionally carries `config_ref=<env name>` (doctor/graph-inspection
-     visibility -- same convention kafka_ext.py's own config_ref channels already use).
+     a service for it. M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3,
+     "внешний (api-gateway), честно не заякорен") splits this tier in two, using
+     linking/env_map.py's `build_env_hostname_map` -- the SAME env_sources data,
+     harvested WITHOUT filtering to workspace-service-matching hostnames (see that
+     function's own docstring):
+       2a. EXTERNAL -- env_sources HAS a URL-shaped value for this env name (a real,
+           known hostname), it just doesn't match any workspace service's own name.
+           This is HONEST KNOWLEDGE of a boundary (a real hostname, e.g.
+           "api-gateway.prod.svc.cluster.local", genuinely outside this workspace's
+           service set) -- not modeling uncertainty, and the pilot's own dominant
+           unresolved shape. Still unconditionally unresolved, no matching attempted
+           (same reasoning as 2b: a coincidental path-shape match against an
+           unrelated MODELED service would be actively wrong): the synthetic Channel
+           carries `external=True` + `external_host=<hostname>` ADDITIVELY alongside
+           the pre-existing `unresolved=True` + `config_ref=<env name>` -- id form
+           UNCHANGED (owner=None -> "?", see `_route_table`'s own owner-is-None skip:
+           an external target is still not a real in-workspace route future claims
+           should match against). Counted separately, in `calls_http_external`, NOT
+           `calls_http_unresolved` -- see `link`'s own docstring. Resolution/
+           confidence stay heuristic/0.5 -- IDENTICAL to 2b, "no unearned confidence"
+           (this module's binding constraint, unchanged by the split); what changes
+           is how a TRACE reads this edge afterward -- see query/traverse.py's own
+           updated aggregate-confidence docstring for the compensating mechanism
+           (external exit-hops are excluded from the trace-confidence floor, never
+           given a higher number here).
+       2b. UNMAPPED -- env_sources has NOTHING usable for this env name at all
+           (absent entirely, a non-string value, or a string that doesn't parse as a
+           URL with a hostname -- see env_map.py's own docstring for the exact
+           non-cases). Unchanged from the pre-M9 design: unconditionally unresolved,
+           `config_ref=<env name>` only (no `external`/`external_host` props at
+           all), counted in `calls_http_unresolved`.
   3. UNANCHORED -- claim.base_url_env is None, no target-service evidence at all.
      Matched against EVERY service's routes (no narrowing, same as the M2 design); a
      UNIQUE form-match -> resolution="heuristic", confidence=0.7 (never "static",
@@ -101,7 +138,7 @@ from typing import NamedTuple
 
 from codegraph.config.models import WorkspaceConfig
 from codegraph.core.schema import EdgeRec, NodeRec, make_channel_node
-from codegraph.linking.env_map import build_env_service_map
+from codegraph.linking.env_map import build_env_hostname_map, build_env_service_map
 from codegraph.stores.staging import Staging
 
 _EXTRACTOR = "linking"
@@ -169,20 +206,25 @@ def _registry_services(cfg: WorkspaceConfig, base_url_env: str) -> set[str]:
 
 
 class _Target(NamedTuple):
-    """One claim's resolved target-service anchor -- see module docstring's three
-    tiers. `kind`: "anchored" (`allowed` is a non-empty frozenset -- narrow + a
-    unique match is static/1.0), "unmapped" (env known, no service found for it --
-    unconditionally unresolved with config_ref=env_name, `allowed` unused), or
-    "unanchored" (no env at all -- `allowed` is None, meaning "every service", a
-    unique match is heuristic/0.7)."""
+    """One claim's resolved target-service anchor -- see module docstring's tiers.
+    `kind`: "anchored" (`allowed` is a non-empty frozenset -- narrow + a unique
+    match is static/1.0), "external" (M9 T1 -- env known, env_sources names a REAL
+    hostname for it, but that hostname is no workspace service -- `allowed` unused,
+    `external_host` carries the hostname text for the synthetic channel's own
+    props), "unmapped" (env known, no hostname derivable for it at all --
+    unconditionally unresolved with config_ref=env_name, `allowed`/`external_host`
+    both unused), or "unanchored" (no env at all -- `allowed` is None, meaning
+    "every service", a unique match is heuristic/0.7)."""
 
-    kind: str  # "anchored" | "unmapped" | "unanchored"
+    kind: str  # "anchored" | "external" | "unmapped" | "unanchored"
     allowed: frozenset[str] | None
     env_name: str | None
+    external_host: str | None = None
 
 
 def _target(
     claim: dict, cfg: WorkspaceConfig, env_service_map: dict[str, str],
+    env_hostname_map: dict[str, str],
 ) -> _Target:
     env_name = claim.get("base_url_env")
     if env_name is None:
@@ -193,6 +235,15 @@ def _target(
     mapped = env_service_map.get(env_name)
     if mapped is not None and any(svc.name == mapped for svc in cfg.services):
         return _Target("anchored", frozenset({mapped}), env_name)
+    # M9 T1: env_service_map (built from the SAME env_sources data, see link()
+    # below) already failed to name a service for env_name above -- if
+    # env_hostname_map (the UNFILTERED raw harvest) still has a hostname for it,
+    # that hostname's own first DNS label structurally can't match a workspace
+    # service (build_env_service_map would have found it too, by construction) --
+    # so reaching here with a hit means "external", never a redundant re-check.
+    hostname = env_hostname_map.get(env_name)
+    if hostname is not None:
+        return _Target("external", None, env_name, hostname)
     return _Target("unmapped", None, env_name)
 
 
@@ -222,9 +273,20 @@ def _resolved_edge(claim: dict, route: _Route, anchored: bool) -> EdgeRec:
 
 
 def _unresolved_channel_and_edge(
-    claim: dict, config_ref: str | None = None,
+    claim: dict, config_ref: str | None = None, external_host: str | None = None,
 ) -> tuple[NodeRec, EdgeRec]:
+    """Shared by BOTH the plain-unmapped (tier 2b) and external (tier 2a, M9 T1)
+    fallbacks, and the zero/multi-candidate ambiguous case below -- all four honest
+    misses need the IDENTICAL id form / resolution / confidence / extractor /
+    evidence shape, differing only in which extra props ride along. `external_host`
+    (only ever passed together with `config_ref=<the SAME env name>`, from tier 2a)
+    additively sets `external=True` + `external_host=<hostname>` on the synthetic
+    channel -- see module docstring's tier 2a for the full reasoning; id form,
+    resolution, confidence are UNCHANGED regardless of whether it's passed."""
     extra: dict[str, object] = {"config_ref": config_ref} if config_ref is not None else {}
+    if external_host is not None:
+        extra["external"] = True
+        extra["external_host"] = external_host
     chan = make_channel_node(
         "http_route", method=claim["verb"], template=claim["path_template"],
         http_method=claim["verb"], path_template=claim["path_template"], unresolved=True,
@@ -242,20 +304,36 @@ def _unresolved_channel_and_edge(
 def link(cfg: WorkspaceConfig, staging: Staging) -> dict:
     routes = _route_table(staging)
     claims = staging.claims_for("http_call")
-    # Built ONCE per link() call (S7 runs this once per `codegraph index`) -- see
-    # env_map.py's own docstring for the harvest contract.
+    # Built ONCE EACH per link() call (S7 runs this once per `codegraph index`) --
+    # see env_map.py's own docstring for the harvest contract of both. M9 T1:
+    # env_hostname_map is the ADDITIVE raw harvest (unfiltered by service_names)
+    # tier 2a needs to tell "external" (a real, known hostname) apart from tier 2b
+    # "unmapped" (env_sources has nothing at all) -- see module docstring.
     env_service_map = build_env_service_map(
         cfg.env_sources, {svc.name for svc in cfg.services},
     )
+    env_hostname_map = build_env_hostname_map(cfg.env_sources)
 
     edges: list[EdgeRec] = []
     unresolved_channels: dict[str, NodeRec] = {}  # id -> node, dedup within this call
     unresolved = 0
+    external = 0
 
     for claim in claims:
-        target = _target(claim, cfg, env_service_map)
+        target = _target(claim, cfg, env_service_map, env_hostname_map)
+        if target.kind == "external":
+            # Tier 2a (M9 T1): a real, known hostname outside the workspace -- no
+            # matching attempted (same reasoning as 2b), but the channel additively
+            # names WHY it's unresolved -- see module docstring.
+            chan, edge = _unresolved_channel_and_edge(
+                claim, config_ref=target.env_name, external_host=target.external_host,
+            )
+            unresolved_channels[chan.id] = chan
+            edges.append(edge)
+            external += 1
+            continue
         if target.kind == "unmapped":
-            # Tier 2: no matching attempted at all -- see module docstring.
+            # Tier 2b: no matching attempted at all -- see module docstring.
             chan, edge = _unresolved_channel_and_edge(claim, config_ref=target.env_name)
             unresolved_channels[chan.id] = chan
             edges.append(edge)
@@ -280,4 +358,11 @@ def link(cfg: WorkspaceConfig, staging: Staging) -> dict:
     if edges:
         staging.upsert_edges(edges)
 
-    return {"calls_http": len(edges), "calls_http_unresolved": unresolved}
+    return {
+        "calls_http": len(edges),
+        "calls_http_unresolved": unresolved,
+        # M9 T1: tier 2a's own separate counter -- NEVER folded into
+        # calls_http_unresolved (see module docstring's tier 2a paragraph for why
+        # these two honest-miss shapes must not be conflated).
+        "calls_http_external": external,
+    }
