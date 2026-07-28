@@ -44,6 +44,7 @@ import pytest
 from codegraph.config.models import HttpExposure, ServiceConfig, WorkspaceConfig
 from codegraph.core.schema import make_channel_node
 from codegraph.linking import http_routes
+from codegraph.query import traverse
 from codegraph.stores.staging import Staging
 
 
@@ -593,3 +594,162 @@ def test_calls_http_total_counts_both_resolved_and_unresolved(tmp_path):
 
     stats = http_routes.link(_cfg(_svc("svc")), st)
     assert stats == {"calls_http": 2, "calls_http_unresolved": 1, "calls_http_external": 0}
+
+
+# -- M9 final review Important-1: shared unresolved-channel id collision -- two+
+# claims that share (verb, path_template) collapse onto ONE synthetic channel id
+# (see linking/http_routes.py's own "On NO match" docstring paragraph) even when
+# they come from DIFFERENT tiers (external/unmapped/ambiguous); a plain last-
+# write-wins on the whole node used to let external/external_host leak onto, or
+# vanish from, that shared node depending on claims_for's own (service, relpath,
+# payload_json) order. `_reconcile_shared_channel_external_props` (linking/
+# http_routes.py) now merges FAIL-CLOSED: external/external_host survive ONLY
+# when EVERY contributing claim was external AND named the SAME host. Claim order
+# is controlled via relpath ("a_first.py" sorts before "b_second.py" in
+# claims_for's own (service, relpath, payload_json) ordering -- the same trick
+# the M9 final review's own probe2 uses) rather than left to chance. --
+
+_COLLISION_VERB = "POST"
+_COLLISION_TEMPLATE = "/events"
+_GW_HOST = "api-gateway.prod.svc.cluster.local"
+
+
+class _MiniTraceStore:
+    """Minimal get_nodes/neighbors duck-type -- query.traverse's own store
+    contract -- ported in miniature from test_traverse.py's own FakeStore (this
+    codebase's established self-contained-test-module convention; see e.g.
+    tests/eval/test_m9_gate.py's own docstring on porting, not importing, test
+    helpers across modules). Scoped to exactly what the pins below need: one
+    entry node, ONE CALLS_HTTP edge into a REAL http_routes.link()-produced
+    channel (props/edge taken from actual staging output below, never
+    fabricated)."""
+
+    def __init__(self, entry_id: str, channel: dict, edge_props: dict) -> None:
+        self._entry_id = entry_id
+        self._channel = channel
+        self._edge_props = edge_props
+
+    def get_nodes(self, ids):
+        nodes = {
+            self._entry_id: {"id": self._entry_id, "service": "caller"},
+            self._channel["id"]: self._channel,
+        }
+        return [nodes[i] for i in ids if i in nodes]
+
+    def neighbors(self, node_id, edge_types, direction, limit):
+        if node_id != self._entry_id or direction not in ("out", "both"):
+            return []
+        if edge_types and "CALLS_HTTP" not in edge_types:
+            return []
+        return [("CALLS_HTTP", dict(self._edge_props), self._channel, "out")]
+
+
+def _only_channel(st: Staging) -> object:
+    chans = [n for n in st.iter_nodes() if n.kind == "Channel"]
+    assert len(chans) == 1, f"expected exactly one shared channel, got {chans}"
+    return chans[0]
+
+
+@pytest.mark.parametrize(
+    "order", ["external-then-unmapped", "unmapped-then-external"],
+)
+def test_collision_external_unmapped_order_independent_strip_and_no_exclusion(tmp_path, order):
+    """(a)/(b): an external (tier 2a) and an unmapped (tier 2b) claim share the
+    SAME (verb, path_template) -> SAME synthetic channel id, in BOTH claims_for
+    orders. Pins two things per order: (1) the shared node carries NEITHER
+    `external` NOR `external_host` (the fail-closed strip, order-independent --
+    the direct fix for the RED probe2 order-dependence), and (2) a trace walking
+    the external claim's own edge into that now-honest node does NOT exclude the
+    exit from the aggregate confidence floor (query/traverse.py's
+    `is_external_exit` reads the NEIGHBOR node's own `external` prop -- absent
+    here, so the edge's real heuristic/0.5 correctly counts, matching the
+    "counters stay per-claim, only NODE props degrade" rule -- an unearned
+    exclusion here would be exactly the confidence-floor violation the review
+    flagged)."""
+    helm = tmp_path / "values.yaml"
+    helm.write_text(f'GW_URL: "http://{_GW_HOST}"\n')
+    st = Staging(tmp_path / "s.db")
+    ext_src, unm_src = "sym:caller:ext", "sym:caller:unm"
+    ext_relpath, unm_relpath = (
+        ("a_first.py", "b_second.py") if order == "external-then-unmapped"
+        else ("b_second.py", "a_first.py")
+    )
+    _claim(st, "caller", ext_relpath, ext_src, _COLLISION_VERB, _COLLISION_TEMPLATE,
+           base_url_env="GW_URL")
+    _claim(st, "caller", unm_relpath, unm_src, _COLLISION_VERB, _COLLISION_TEMPLATE,
+           base_url_env="MYSTERY_URL")
+
+    cfg = _cfg(_svc("svc"), env_sources=[helm])
+    stats = http_routes.link(cfg, st)
+
+    assert stats == {"calls_http": 2, "calls_http_unresolved": 1, "calls_http_external": 1}
+    chan = _only_channel(st)
+    assert "external" not in chan.props
+    assert "external_host" not in chan.props
+
+    edge = next(
+        e for e in st.iter_edges()
+        if e.type == "CALLS_HTTP" and e.src == ext_src and e.dst == chan.id
+    )
+    assert edge.resolution == "heuristic" and edge.confidence == 0.5  # honest, unchanged
+
+    store = _MiniTraceStore(
+        ext_src, {"id": chan.id, **chan.props},
+        {"confidence": edge.confidence, "resolution": edge.resolution},
+    )
+    result = traverse.trace_process(store, ext_src, max_segments=12, min_confidence=0.3)
+    # NOT excluded: would read 1.0 (the "no edges to doubt" trivial default) had
+    # the stale external=True wrongly survived the merge and excluded this hop.
+    assert result["confidence"] == 0.5
+    assert result["external_exit_count"] == 0
+
+
+def test_collision_two_external_different_hosts_strips_props(tmp_path):
+    """(c): two external (tier 2a) claims share (verb, path_template) but resolve
+    to DIFFERENT real hostnames -- host disagreement disqualifies external props
+    on the shared node exactly like an outright non-external sibling does (never
+    "keep whichever claim happened to write last")."""
+    helm = tmp_path / "values.yaml"
+    helm.write_text(
+        f'GW_URL: "http://{_GW_HOST}"\n'
+        'OTHER_URL: "http://billing.ext.prod.env"\n'
+    )
+    st = Staging(tmp_path / "s.db")
+    _claim(st, "caller", "a_first.py", "sym:caller:a", _COLLISION_VERB, _COLLISION_TEMPLATE,
+           base_url_env="GW_URL")
+    _claim(st, "caller", "b_second.py", "sym:caller:b", _COLLISION_VERB, _COLLISION_TEMPLATE,
+           base_url_env="OTHER_URL")
+
+    cfg = _cfg(_svc("svc"), env_sources=[helm])
+    stats = http_routes.link(cfg, st)
+
+    assert stats == {"calls_http": 2, "calls_http_unresolved": 0, "calls_http_external": 2}
+    chan = _only_channel(st)
+    assert "external" not in chan.props
+    assert "external_host" not in chan.props
+
+
+def test_collision_two_external_same_host_keeps_props(tmp_path):
+    """(d): two DIFFERENT env names that both resolve to the IDENTICAL real
+    hostname (a plausible alias/legacy-env-name shape) -- unlike (c), every
+    contributing claim agrees, so the merge KEEPS external/external_host on the
+    shared node (the positive case: the fail-closed rule must not over-strip when
+    the claims genuinely agree)."""
+    helm = tmp_path / "values.yaml"
+    helm.write_text(
+        f'GW_URL: "http://{_GW_HOST}"\n'
+        f'GW_URL_ALIAS: "http://{_GW_HOST}"\n'
+    )
+    st = Staging(tmp_path / "s.db")
+    _claim(st, "caller", "a_first.py", "sym:caller:a", _COLLISION_VERB, _COLLISION_TEMPLATE,
+           base_url_env="GW_URL")
+    _claim(st, "caller", "b_second.py", "sym:caller:b", _COLLISION_VERB, _COLLISION_TEMPLATE,
+           base_url_env="GW_URL_ALIAS")
+
+    cfg = _cfg(_svc("svc"), env_sources=[helm])
+    stats = http_routes.link(cfg, st)
+
+    assert stats == {"calls_http": 2, "calls_http_unresolved": 0, "calls_http_external": 2}
+    chan = _only_channel(st)
+    assert chan.props.get("external") is True
+    assert chan.props.get("external_host") == _GW_HOST

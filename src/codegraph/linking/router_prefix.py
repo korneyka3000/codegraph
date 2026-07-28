@@ -283,16 +283,47 @@ test). Removing an absent key is a documented silent no-op
 (`Staging.update_node_props`'s own semantics: remove applies to the OLD props
 first, merge lands after and wins on overlap), so the remove is passed
 unconditionally on every single-template patch, including a first-ever one.
-RESIDUAL, tracked (T2-era direction, one step beyond this fix's write-branch
-scope): when a chain dissolves ENTIRELY (every mount removed -- the router is a
-trivial root again) while the handler's file stays untouched, `templates ==
-[local_template]` puts the route on the NO-write path -- per T2's own accepted
-"avoid no-op writes" + pure-claims-in design -- so previously composed
-`path_template`/`path_templates` values persist on the node until the handler's
-own file next re-analyzes (S5 re-stages it LOCAL-only, then re-link converges) or
-any chain reappears. Closing that would take an unconditional per-route write or
-a node-props read inside `link()`, both explicitly rejected trade-offs in T2's
-accepted design -- flagged honestly here rather than silently inherited.
+RESIDUAL, tracked -- HONESTY UPGRADE (M9 final review Important-2, .superpowers/sdd/
+m9-final-fix-report.md): the note above previously undersold this gap by saying
+composed values merely "persist" -- stated EXPLICITLY, what actually happens is a
+violation of this project's own M4 "supreme" dump-equivalence invariant (an
+`--incremental` run must reach the byte-identical staging/graph state a fresh FULL
+reindex of the identical final tree would) for one specific edit shape: full-chain
+DISSOLUTION under `--incremental` -- every mount of a router removed (both
+`include_router` calls deleted from main.py, say) so the router reverts to a
+trivial root, while the HANDLER's own file is untouched (never goes stale, so S5
+never re-stages it LOCAL-only) -- leaves the handler node's `path_template`/
+`path_templates` props stuck at their last-composed, now-INCORRECT value, because
+`templates == [local_template]` puts this route back on the NO-write path above
+even though the composed value that used to be correct no longer applies.
+Reproduced directly by the M9 final review's probe1 (dissolve every mount via
+`staging.delete_file_layer` on the router-owning file alone, re-stage its
+surviving `router_decl`, re-link -- the handler node's props then diverge from a
+FRESH second `Staging` built from the identical final claim set, which never
+composed a prefix in the first place and so never had one to leave behind). A FULL
+reindex heals it (S5 unconditionally re-stages EVERY file LOCAL-only regardless of
+staleness, the handler's own file included; S7 then relinks over the current,
+now-mount-free claim set and correctly finds nothing to compose) -- only
+`--incremental`'s selective re-analysis is exposed, and only for this "all mounts
+gone, leaf file untouched" shape specifically.
+
+Mechanical fix deliberately DEFERRED to M10, not applied in this fix-batch: closing
+it overturns T2's own accepted-and-pinned "avoid no-op writes" design one paragraph
+up, which two existing tests pin by asserting `staging.update_node_props` is NEVER
+called (`calls == []`) whenever `templates == [local_template]` --
+`test_trivial_chain_does_not_patch_handler_node_props` and
+`test_unresolvable_router_symbol_does_not_patch_handler_node_props`
+(tests/unit/test_router_prefix.py). Either fix direction requires INVERTING both
+pins (asserting the write DOES happen), not merely extending them: (a) an
+unconditional single-template write on every route_decl claim, dropping the
+`templates != [local_template]` guard entirely -- correct, but pays a real write
+for every trivial-root/unresolved route in a workspace (every M2/M6/M7 fixture
+route, and empirically most real routes); or (b) a node-props READ inside `link()`
+to compare against the CURRENTLY staged value before deciding to write -- correct
+and cheaper, but turns `link()` from a pure claims-in transformation into one that
+also reads node state, the exact extra read T2's own design explicitly rejected
+(see the "M9 T2" section above). Neither is a small, low-risk fix-batch change --
+both are M10's to make; flagged honestly here rather than silently inherited.
 
 Cross-product explosion guard (`_MAX_TEMPLATES = 16`, `_OVERFLOW` sentinel): a
 route_decl's own live-template count is bounded above by its router_symbol's own
