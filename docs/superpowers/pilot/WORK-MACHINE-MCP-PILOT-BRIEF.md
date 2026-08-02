@@ -28,15 +28,11 @@ embedding:
 
 ## 3. Чекпойнты индексации vs re-run №3
 
-| Метрика | №3 | Ожидание M9 |
-|---|---|---|
-| CALLS_HTTP anchored static/1.0 | 23 | 23 (без сдвига) |
-| calls_http_unresolved / **calls_http_external** | 36 / — | **разбиение**: ~35-36 переезжают в external (env известен, хост вне воркспейса); остаток unresolved зафиксировать |
-| route_prefix_unresolved | 0 | 0 |
-| NEXT_SEGMENT | 43 | ≥43 (+multi-mount пары, если в сервисах есть double-mount) |
-| signal_send_unlinked | 2 | 2 (принципиально динамические) |
-| **trace confidence целевого сценария** | **0.50** | **ВЫШЕ (главная проверка M9!)** + `external_exit_count ≥ 1` в выводе |
-| Карточки хендлеров | локальный путь | композитный `/api/v1/...` (compose-back) |
+Индекс-часть УЖЕ подтверждена валидацией 2026-08-03 (`2026-08-03-pilot-rerun-3-m9.md`):
+23 static / **7 external** / 29 unresolved (в external переезжают только env-заякоренные-вне-среза;
+unanchored остаются unresolved честно); NEXT_SEGMENT 43; external-трасса confidence 1.00 +
+«1 external exits»; compose-back 98/98; marks 8. Если числа при этом прогоне совпадают — коротко
+подтвердить и НЕ перегонять диагностику; фокус этого брифа — §4 (агентные сценарии).
 
 ## 4. MCP-регистрация и агентные сценарии (верификация №7)
 
