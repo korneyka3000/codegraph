@@ -16,7 +16,7 @@ singleton pattern, M1 gate P/R stays byte-identical)."""
 
 from __future__ import annotations
 
-from codegraph.parsing.facts import build_file_facts
+from codegraph.parsing.facts import ImportFact, build_file_facts
 from codegraph.parsing.module_singletons import (
     SingletonDispatch,
     SingletonEntry,
@@ -52,6 +52,7 @@ def test_module_level_ctor_assign_produces_heuristic_claim_without_lookup():
         "class_symbol": None,
         "class_name_text": "_DBRegistry",
         "resolution_tier": "heuristic",
+        "relpath": "app/db/registry.py",
     }]
 
 
@@ -69,6 +70,7 @@ def test_module_level_ctor_assign_resolves_static_via_ref_lookup():
         "class_symbol": _DB_REGISTRY_CLASS_SYM,
         "class_name_text": "_DBRegistry",
         "resolution_tier": "static",
+        "relpath": "app/db/registry.py",
     }]
 
 
@@ -131,6 +133,7 @@ def test_annotated_module_level_ctor_assign_still_produces_claim():
         "class_symbol": None,
         "class_name_text": "_DBRegistry",
         "resolution_tier": "heuristic",
+        "relpath": "app/db/registry.py",
     }]
 
 
@@ -183,6 +186,7 @@ def test_factory_function_resolved_symbol_falls_back_to_heuristic_claim():
         "class_symbol": None,
         "class_name_text": "MakePool",
         "resolution_tier": "heuristic",
+        "relpath": "app/pools.py",
     }]
 
 
@@ -360,6 +364,26 @@ def test_resolve_singleton_call_heuristic_tier_boundary_check_resolves_true_coll
     )
 
 
+def test_resolve_singleton_call_heuristic_tier_true_suffix_match_nested_class_boundary():
+    """`#`-boundary dedicated pin (M11 T2 backlog item -- m10-final-fix-report.md's
+    own documented gap: IMPORTANT-1's 3 new pins all exercised the "/" [top-level
+    class] boundary; the "#" [nested class] boundary was reasoned as covered by the
+    same `parsed.descriptors[i] in "/#"` check but never directly pinned). A nested
+    class's own descriptor is preceded by "#" (its enclosing class's own trailing
+    descriptor character), not "/" -- confirms the boundary check accepts this
+    shape too, not just top-level classes."""
+    nested_sym = f"{_SVC} `app.outer`/Outer#Client#get()."
+    idx = build_singleton_index([{
+        "name": "bar", "class_symbol": None,
+        "class_name_text": "Client", "resolution_tier": "heuristic",
+    }])
+    dispatch = resolve_singleton_call(idx, "bar", "get", {nested_sym}, "svc")
+    assert dispatch == SingletonDispatch(
+        dst_id="sym:svc:`app.outer`/Outer#Client#get().",
+        resolution="heuristic", confidence=0.6,
+    )
+
+
 def test_resolve_singleton_call_unknown_receiver_returns_none():
     idx = build_singleton_index([])
     assert resolve_singleton_call(idx, "not_a_singleton", "session", _def_symbols(), "svc") is None
@@ -398,7 +422,7 @@ def test_claims_round_trip_via_staging_matches_direct_construction(tmp_path):
     assert staged_index == direct_index
     assert staged_index.get("registry") == SingletonEntry(
         name="registry", class_symbol=None, class_name_text="_DBRegistry",
-        resolution_tier="heuristic",
+        resolution_tier="heuristic", origin_relpaths=frozenset({"app/db/registry.py"}),
     )
 
 
@@ -414,3 +438,98 @@ def test_claims_for_injected_service_relpath_keys_are_ignored_by_the_builder():
 
 def test_singleton_index_direct_construction_and_equality():
     assert SingletonIndex({}) == SingletonIndex({})
+
+
+# ============================================================================
+# M11 T2 (provenance-hardening, M10-final review Minor-2 backlog): a bare receiver
+# name match against the service-wide `by_name` map alone cannot tell a legitimate
+# same-origin receiver from a same-named but UNRELATED one (a same-name local import
+# from a DIFFERENT module in the caller file). `caller_relpath`/`caller_imports`
+# close that gap -- see resolve_singleton_call's own docstring for the full
+# rationale/precedent (M6-T3 import-corroboration, idiom_match._imports_module).
+# ============================================================================
+
+
+def _registry_index_with_origin() -> SingletonIndex:
+    return build_singleton_index([{
+        "name": "registry", "class_symbol": _DB_REGISTRY_CLASS_SYM,
+        "class_name_text": "_DBRegistry", "resolution_tier": "static",
+        "relpath": "app/db/registry.py",
+    }])
+
+
+def test_resolve_singleton_call_provenance_same_file_dispatches():
+    """Pin: same-file -> dispatches (the module-level binding is directly in
+    scope, no import needed)."""
+    idx = _registry_index_with_origin()
+    dispatch = resolve_singleton_call(
+        idx, "registry", "session", _def_symbols(), "svc",
+        caller_relpath="app/db/registry.py", caller_imports=[],
+    )
+    assert dispatch == SingletonDispatch(
+        dst_id="sym:svc:`app.db.registry`/_DBRegistry#session().",
+        resolution="static", confidence=1.0,
+    )
+
+
+def test_resolve_singleton_call_provenance_legitimate_import_dispatches():
+    """Pin: legitimate `from <singleton's own module> import <name>` -> dispatches."""
+    idx = _registry_index_with_origin()
+    caller_imports = [ImportFact("app.db.registry", ["registry"], 1)]
+    dispatch = resolve_singleton_call(
+        idx, "registry", "session", _def_symbols(), "svc",
+        caller_relpath="app/handlers.py", caller_imports=caller_imports,
+    )
+    assert dispatch == SingletonDispatch(
+        dst_id="sym:svc:`app.db.registry`/_DBRegistry#session().",
+        resolution="static", confidence=1.0,
+    )
+
+
+def test_resolve_singleton_call_provenance_foreign_module_import_shadow_refuses():
+    """Pin: the shadowing scenario this task closes -- a DIFFERENT file's
+    `registry` name, imported from a completely unrelated module (`thirdparty`,
+    not the singleton's own `app.db.registry`), must NOT dispatch even though the
+    bare receiver name textually collides -- the prior, honest no-dispatch path."""
+    idx = _registry_index_with_origin()
+    caller_imports = [ImportFact("thirdparty", ["registry"], 1)]
+    dispatch = resolve_singleton_call(
+        idx, "registry", "session", _def_symbols(), "svc",
+        caller_relpath="app/handlers.py", caller_imports=caller_imports,
+    )
+    assert dispatch is None
+
+
+def test_resolve_singleton_call_provenance_no_matching_import_at_all_refuses():
+    """Non-same-file caller with NO import of "registry" whatsoever -- refused,
+    same as the shadowing case (nothing legitimizes the receiver)."""
+    idx = _registry_index_with_origin()
+    dispatch = resolve_singleton_call(
+        idx, "registry", "session", _def_symbols(), "svc",
+        caller_relpath="app/handlers.py", caller_imports=[],
+    )
+    assert dispatch is None
+
+
+def test_resolve_singleton_call_provenance_skipped_when_not_supplied():
+    """Backward compatibility: omitting caller_relpath/caller_imports (every
+    pre-existing direct caller of this function) skips the check entirely --
+    dispatches exactly as pre-M11."""
+    idx = _registry_index_with_origin()
+    dispatch = resolve_singleton_call(idx, "registry", "session", _def_symbols(), "svc")
+    assert dispatch is not None
+
+
+def test_resolve_singleton_call_provenance_empty_origin_relpaths_is_vacuous_pass():
+    """An entry with NO recorded origin (a hand-built claim missing the "relpath"
+    key, e.g. every pre-M11 test fixture) has nothing to verify against -- honestly
+    treated as passing, never a guessed refusal."""
+    idx = build_singleton_index([{
+        "name": "registry", "class_symbol": _DB_REGISTRY_CLASS_SYM,
+        "class_name_text": "_DBRegistry", "resolution_tier": "static",
+    }])
+    dispatch = resolve_singleton_call(
+        idx, "registry", "session", _def_symbols(), "svc",
+        caller_relpath="app/handlers.py", caller_imports=[],
+    )
+    assert dispatch is not None

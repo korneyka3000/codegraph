@@ -8,8 +8,19 @@ leg proves end-to-end against REAL scip-python; Task 1 unit-tested it
 synthetically only, real-corpus verification is explicitly this task's job).
 
 `store`, bound here at true module level (ctor-form RHS, `DocStore` capitalized),
-is imported and called from app/routes/admin.py -- the exact dropped-CALLS shape
-that was 79 of 149 (53%) on the pilot's real corpus, all this ONE pattern.
+is imported and called from app/routes/admin.py -- the general shape the pilot
+ORIGINALLY (mis)attributed to 79 of 149 (53%) dropped CALLS on its real corpus, all
+one pattern. REASSESSED (M11 T2, docs/superpowers/reports/2026-08-03-pilot-
+rerun-5-open-gaps.md "Переоценка" section, see parsing/module_singletons.py's own
+corrected module docstring for the full writeup): that 79/53% attribution was a
+misdiagnosis -- the pilot's real `registry.session` call sites turn out to be a
+dynamic callable-ATTRIBUTE (a class-level `Callable[...]` annotation assigned at
+runtime), not a method call at all, so no method-node redirect could ever have
+resolved them; this mechanism handled that correctly (fail-closed, zero false
+edges). This fixture still legitimately demonstrates the MECHANISM end-to-end
+against real scip-python (a real class with a real `persist` method, scip's own
+binding suppressed by the `: Any` annotation below) -- just not literally the same
+79 pilot call sites.
 
 READ-FIRST FINDING (task-5, empirical, live scip-python 0.6.6 -- see
 task-5-report.md's own "mechanism bugs found" section for the full writeup):

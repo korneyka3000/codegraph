@@ -1,17 +1,38 @@
 """module_singletons: service-wide index of module-level `name = ClassName(...)`
-singleton assigns -- M10 T1, the MCP-pilot's biggest single graph win (docs/
-superpowers/reports/2026-08-03-mcp-pilot.md §5): `registry = _DBRegistry(config.
+singleton assigns -- M10 T1, motivated by the MCP-pilot's own diagnosis (docs/
+superpowers/reports/2026-08-03-mcp-pilot.md §5) of `registry = _DBRegistry(config.
 database.dsn)` at module level, then `registry.session()` call-sites elsewhere,
-resolve to a node-less `module.attr` symbol (scip can't connect the attribute access
-back to `_DBRegistry`'s own `session` method through the module-level instance
-binding) and get silently dropped at load -- 79 of 149 dropped CALLS (53%) on the
-pilot's real corpus, all this ONE pattern. Hedge (T5's own raw-scip-occurrence
-finding, fixtures/realstack/services/worker/app/services/doc_store.py's own
-docstring): this scip limitation is narrower in simple, self-contained synthetics
-than the phrasing above suggests -- a minimal two-file case resolves straight
-through the module-level binding with no drop at all; real-world messiness (a
-gradual-typing `: Any` escape hatch, confirmed empirically) is what still triggers
-it.
+resolving to a node-less `module.attr` symbol (scip can't connect the attribute
+access back to a class's own method through the module-level instance binding) and
+getting silently dropped at load -- the pilot counted 79 of 149 dropped CALLS (53%)
+on its real corpus as this ONE pattern.
+
+REASSESSED (M11 T2, rerun-5 open-gaps' own "Переоценка" section, docs/superpowers/
+reports/2026-08-03-pilot-rerun-5-open-gaps.md): once M10 actually ran against that
+real corpus, the pilot's 79/53% attribution turned out to be a misdiagnosis, not a
+mechanism debt. `registry.session` there is not a method call at all -- `session` is
+a class-level annotation (`session: Callable[..., AsyncSession]`) whose real value is
+assigned at RUNTIME (`self.session = sessionmaker(...)` inside `setup()`), so no
+`_DBRegistry#session` method node exists anywhere to dispatch to. This mechanism
+handled that correctly: a candidate was built, class shape was verified, no matching
+method was found among staged defs, and the redirect honestly refused rather than
+guess -- fail-closed, zero false edges, exactly its own "NEVER GUESS" contract
+working as designed (see `resolve_singleton_call`'s docstring below). Those 79 drops
+are consequently a property of the CODE (a principally dynamic, statically-
+unrecoverable callable-attribute -- the same class as 5 other `throttle`/
+`_driver_maker` attributes on the same corpus), not this mechanism's debt to pay. The
+mechanism itself remains correct and useful independent of that one misdiagnosed
+case: it harvested 92 genuine module-level singletons on the SAME real corpus (see
+rerun-5 open-gaps' own reproduction section) -- real bindings this index legitimately
+indexes and `extractors/calls.py` may legitimately dispatch through, with no false
+positives measured.
+
+Hedge (T5's own raw-scip-occurrence finding, fixtures/realstack/services/worker/app/
+services/doc_store.py's own docstring): the scip module-level-binding limitation this
+mechanism targets is also narrower in simple, self-contained synthetics than a first
+read suggests -- a minimal two-file case resolves straight through the module-level
+binding with no drop at all; real-world messiness (a gradual-typing `: Any` escape
+hatch, confirmed empirically) is what still triggers it.
 
 Mirrors class_attrs.py's own M7 T1 shape almost exactly (harvest -> per-file claims
 kind="module_singletons" -> service-wide index assembled from `staging.claims_for`,
@@ -93,10 +114,13 @@ factory function's own (or nested) descriptors structurally cannot match -- see
 
 Claim shape (JSON-serializable, per module docstring convention `class_attrs.py`
 already established): `{"name": str, "class_symbol": str | None, "class_name_text":
-str | None, "resolution_tier": "static" | "heuristic"}`. `build_singleton_index`
-reads ONLY these four keys via `.get`/`[...]` (never `**claim` unpacking), so it is
-unaffected by `staging.claims_for`'s own injected "_service"/"_relpath" metadata
-keys, mirroring `build_class_attr_index`'s identical tolerance.
+str | None, "resolution_tier": "static" | "heuristic", "relpath": str}`.
+`build_singleton_index` reads ONLY these five keys via `.get`/`[...]` (never
+`**claim` unpacking), so it is unaffected by `staging.claims_for`'s own injected
+"_service"/"_relpath" metadata keys, mirroring `build_class_attr_index`'s identical
+tolerance ("relpath", no leading underscore, is a claim-native key this module's OWN
+harvester writes -- see `SingletonEntry.origin_relpaths` below, M11 T2 -- not one of
+`claims_for`'s injected metadata; the two coexist without collision).
 
 Collision policy: two claims sharing the same `name` but a DIFFERENT identity
 (`(class_symbol, class_name_text)`) -- e.g. two unrelated files each defining a
@@ -108,15 +132,18 @@ needs anything more precise" precedent as `build_class_attr_index`.
 
 -- Join-time candidate resolution (extractors/calls.py's own consumer) --
 
-`resolve_singleton_call(index, receiver, method, def_symbols, service)` combines an
-indexed `SingletonEntry` with the ACTUAL call site's own method name (only known at
+`resolve_singleton_call(index, receiver, method, def_symbols, service, ...)` combines
+an indexed `SingletonEntry` with the ACTUAL call site's own method name (only known at
 the call site, never at harvest time) into a `SingletonDispatch(dst_id, resolution,
 confidence)` -- or `None` if nothing verifiable was found, in which case the caller's
 existing (pre-M10) behavior is completely unchanged (NEVER GUESS, the brief's own
 binding phrase: a candidate this module cannot verify against `def_symbols` is never
 handed back, not even as a low-confidence guess). `def_symbols` is exactly the
 service-wide `def_symbols` set M5 Task 1 already introduced (extractors/calls.py's
-own module docstring) -- reused here as-is, no new staged table/index.
+own module docstring) -- reused here as-is, no new staged table/index. The trailing
+optional `caller_relpath`/`caller_imports` (M11 T2) are a SEPARATE, additional gate
+-- receiver PROVENANCE, not candidate verification -- see the function's own
+docstring and `_receiver_provenance_ok` below for the full mechanism.
 
 Static-tier verification re-checks class shape (`_is_class_symbol`, the defensive
 twin of the harvest-side gate -- claims also reach this code constructed directly),
@@ -139,7 +166,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from codegraph.core import ids
-from codegraph.parsing.facts import FileFacts
+from codegraph.parsing.facts import FileFacts, ImportFact
 from codegraph.resolvers.scip.symbols import ParsedSymbol, parse_symbol
 
 ResolutionTier = Literal["static", "heuristic"]
@@ -151,12 +178,30 @@ class SingletonEntry:
     `name`. `class_symbol` is the raw scip/structural symbol string of the ctor'd
     class when the static tier resolved it (`None` for a pure textual-tier entry);
     `class_name_text` is the ctor callee's own decoded text, ALWAYS present
-    (harvested regardless of tier) -- the join-time textual fallback's only input."""
+    (harvested regardless of tier) -- the join-time textual fallback's only input.
+
+    `origin_relpaths` (M11 T2, provenance-hardening -- M10-final review Minor-2
+    backlog): the relpath(s) this singleton's own module-level assign was actually
+    harvested from (`harvest_module_singletons`'s own `relpath` parameter, carried
+    into every claim it returns as an explicit "relpath" key -- deliberately NOT
+    `staging.claims_for`'s own injected "_relpath" metadata key: that key is only
+    ever present after a staging round trip, and this needs to work identically for
+    the direct in-memory harvest->build_singleton_index path too, see
+    `build_singleton_index`'s own docstring). Usually a single relpath; a set to
+    soundly cover the rare, already-legitimate case of two files independently
+    assigning the IDENTICAL (class_symbol, class_name_text) identity under the same
+    name (a merge, not a collision, per `build_singleton_index`'s own policy) --
+    either origin file then verifies a receiver at join time (see
+    `resolve_singleton_call`'s own docstring). Empty for an entry built from claims
+    that never carried a "relpath" key (hand-built claims/tests predating this
+    task) -- `resolve_singleton_call` treats that honestly as "nothing to verify
+    against", never a guessed refusal."""
 
     name: str
     class_symbol: str | None
     class_name_text: str | None
     resolution_tier: ResolutionTier
+    origin_relpaths: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -224,7 +269,10 @@ def harvest_module_singletons(
     incremental mode) file, mirroring `harvest_class_attrs`'s own calling
     convention exactly -- the one difference is this harvester also needs
     `ref_symbol_lookup` (class-name resolution), which `harvest_class_attrs` never
-    required."""
+    required. Every claim also carries its own harvesting `relpath` (M11 T2,
+    provenance-hardening -- see `SingletonEntry.origin_relpaths`' own docstring for
+    why this is a claim-native key, not left to `staging.claims_for`'s injected
+    "_relpath" metadata)."""
     claims: list[dict] = []
     for a in facts.assigns:
         if a.enclosing_def is not None:
@@ -246,6 +294,7 @@ def harvest_module_singletons(
             "class_symbol": class_symbol,
             "class_name_text": a.callee_name,
             "resolution_tier": "static" if class_symbol is not None else "heuristic",
+            "relpath": relpath,
         })
     return claims
 
@@ -256,19 +305,35 @@ def build_singleton_index(claims: list[dict]) -> SingletonIndex:
     from `harvest_module_singletons` (in-memory) or `staging.claims_for
     ("module_singletons", service)` (the real analyze.py wiring) -- both funnel
     through this same function, reading only "name"/"class_symbol"/
-    "class_name_text"/"resolution_tier", so `claims_for`'s injected "_service"/
-    "_relpath" keys are silently ignored."""
+    "class_name_text"/"resolution_tier"/"relpath", so `claims_for`'s injected
+    "_service"/"_relpath" keys are silently ignored (note: "relpath", no
+    underscore, IS read -- see `SingletonEntry.origin_relpaths`' own docstring for
+    why it is a claim-native key `harvest_module_singletons` itself writes, not one
+    of `claims_for`'s injected metadata keys).
+
+    `origin_relpaths` accumulates EVERY relpath any claim for a given `name`
+    carried (regardless of that claim's own identity) -- sound because a `name`
+    that collides across two DIFFERENT identities resolves to `None` in `by_name`
+    below anyway (its relpaths are simply never read), so by the time a `name`
+    survives to a real `SingletonEntry`, every claim that contributed a relpath
+    for it necessarily agreed on the SAME identity too."""
     by_name_identities: dict[str, set[tuple[str | None, str | None]]] = {}
     by_name_entry: dict[str, SingletonEntry] = {}
+    by_name_relpaths: dict[str, set[str]] = {}
     for claim in claims:
         name = claim["name"]
         class_symbol = claim.get("class_symbol")
         class_name_text = claim.get("class_name_text")
         identity = (class_symbol, class_name_text)
         by_name_identities.setdefault(name, set()).add(identity)
+        relpaths = by_name_relpaths.setdefault(name, set())
+        relpath = claim.get("relpath")
+        if relpath is not None:
+            relpaths.add(relpath)
         by_name_entry[name] = SingletonEntry(
             name=name, class_symbol=class_symbol, class_name_text=class_name_text,
             resolution_tier=claim["resolution_tier"],
+            origin_relpaths=frozenset(relpaths),
         )
     by_name: dict[str, SingletonEntry | None] = {
         name: (by_name_entry[name] if len(identities) == 1 else None)
@@ -324,21 +389,70 @@ def _heuristic_candidate(
     return SingletonDispatch(ids.node_id(service, next(iter(matches))), "heuristic", 0.6)
 
 
+def _receiver_provenance_ok(
+    entry: SingletonEntry, caller_relpath: str, caller_imports: list[ImportFact],
+) -> bool:
+    """M11 T2 provenance check (see `resolve_singleton_call`'s own docstring for the
+    full rationale/precedent): `entry`'s bare `name` is legitimately reachable from
+    `caller_relpath` iff EITHER the singleton is defined in that SAME file, OR that
+    file imports `entry.name` FROM one of the singleton's own origin modules --
+    mirrors `idiom_match._match_import_name_method_form`'s (name, target_module)
+    PAIR check, not the looser any-import-with-that-name form (that looseness is
+    exactly the shadowing hole this closes). `entry.origin_relpaths` being empty (no
+    relpath info recorded at all -- a hand-built claim predating this task) is
+    honestly "nothing to verify against", not a guessed refusal."""
+    if not entry.origin_relpaths:
+        return True
+    if caller_relpath in entry.origin_relpaths:
+        return True
+    origin_modules = {ids.relpath_to_module(rp) for rp in entry.origin_relpaths}
+    return any(
+        entry.name in imp.names and imp.target_module in origin_modules
+        for imp in caller_imports
+    )
+
+
 def resolve_singleton_call(
     index: SingletonIndex,
     receiver: str,
     method: str,
     def_symbols: set[str],
     service: str,
+    caller_relpath: str | None = None,
+    caller_imports: list[ImportFact] | None = None,
 ) -> SingletonDispatch | None:
     """extractors/calls.py's own join-time hook: `receiver` is a call site's bare-name
     receiver text (e.g. "registry" in `registry.session()`), `method` its callee name
     (e.g. "session"). `None` whenever the receiver isn't a known, UNAMBIGUOUS
     singleton, or a candidate was built but could not be verified against
     `def_symbols` -- the caller's existing (pre-M10) resolution path is then left
-    completely untouched."""
+    completely untouched.
+
+    `caller_relpath`/`caller_imports` (M11 T2, M10-final review Minor-2 backlog):
+    OPTIONAL provenance verification of the RECEIVER NAME ITSELF, closing a
+    shadowing gap the bare service-wide `by_name` map cannot see on its own --
+    `receiver` is matched against the index by TEXT ALONE, so a call site whose file
+    happens to bind that SAME bare name from a completely unrelated import (`from
+    thirdparty import registry`) would, without this check, dispatch against THIS
+    service's `registry` singleton anyway whenever scip's own ref resolution
+    degraded or missed for that call site (exactly the situations
+    `extractors/calls.py::_try_singleton` is a fallback for) -- a same-named-but-
+    unrelated join, worse than the honest no-dispatch it replaces (M6-T3's own
+    import-corroboration precedent, `idiom_match._imports_module`/
+    `_match_import_name_method_form`). When BOTH are supplied (calls.py's own
+    `_try_singleton`, the sole production caller, always supplies both -- see its
+    own docstring), a dispatch is only honoured when `_receiver_provenance_ok`
+    (above) says the receiver is legitimately reachable from that file. Defaulting
+    both to `None` skips the check entirely -- every pre-existing direct caller/test
+    of this function, unaware of file-level provenance, is unaffected byte-for-byte
+    (mirrors this module's OWN `build_calls(singleton_index=None)`
+    backward-compatibility convention, M10 T1)."""
     entry = index.get(receiver)
     if entry is None:
+        return None
+    if caller_relpath is not None and not _receiver_provenance_ok(
+        entry, caller_relpath, caller_imports or [],
+    ):
         return None
     if entry.resolution_tier == "static" and entry.class_symbol is not None:
         return _static_candidate(entry.class_symbol, method, def_symbols, service)

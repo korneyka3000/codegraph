@@ -328,7 +328,18 @@ _REGISTRY_SESSION_SYM = "scip-python python svc 0.1 `app.db.registry`/_DBRegistr
 
 
 def _singleton_call_facts():
-    src = b'''async def handler():
+    # M11 T2 (provenance-hardening): a real `from app.db.registry import registry`
+    # import -- matches _REGISTRY_CLASS_SYM's own module (`app.db.registry`) --
+    # makes this consumer file a LEGITIMATE receiver-provenance match, so every
+    # dispatch test below (using _registry_singleton_index()'s hand-built claim,
+    # which carries no "relpath" and is therefore exempt from the check anyway --
+    # see resolve_singleton_call's own "empty origin_relpaths" vacuous-pass
+    # docstring) keeps dispatching, AND the real-harvest end-to-end test further
+    # below (whose claim DOES carry "relpath") legitimately dispatches too.
+    src = b'''from app.db.registry import registry
+
+
+async def handler():
     async with registry.session() as s:
         pass
 '''
@@ -934,3 +945,81 @@ def test_unknown_parameter_tail_not_rewritten(tmp_path):
     assert stats.calls_joined == 1
     e = next(e for e in st.iter_edges() if e.type == "CALLS")
     assert e.dst == "sym:svc:`w4`/f().(weird)"
+
+
+# ============================================================================
+# M11 T2 (provenance-hardening, M10-final review Minor-2 backlog): end-to-end
+# (real harvest -> index -> build_calls) confirmation that a same-named receiver
+# imported from a FOREIGN module never dispatches, through the actual production
+# wiring (_try_singleton threading relpath/facts.imports into
+# resolve_singleton_call) -- not just the unit-level resolve_singleton_call pins
+# in test_module_singletons.py.
+# ============================================================================
+
+
+def test_singleton_dispatch_refused_when_receiver_shadowed_by_foreign_import(tmp_path):
+    """A caller file whose own `registry` name is imported from a COMPLETELY
+    UNRELATED module (`thirdparty`, not this singleton's own `app.db.registry`)
+    must NOT dispatch against this service's `registry` singleton, even though
+    the bare receiver name collides textually -- the prior, honest no-dispatch
+    path is taken instead (still unresolved, exactly as if no singleton_index
+    had been wired at all)."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+
+    defining_src = b'''class _DBRegistry:
+    async def session(self):
+        pass
+
+
+registry = _DBRegistry("dsn")
+'''
+    defining_facts = build_file_facts("app/db/registry.py", defining_src)
+    shadow_src = b'''from thirdparty import registry
+
+
+async def handler():
+    async with registry.session() as s:
+        pass
+'''
+    shadow_facts = build_file_facts("app/handlers.py", shadow_src)
+
+    session_def = next(d for d in defining_facts.defs if d.name == "session")
+    class_def = next(d for d in defining_facts.defs if d.name == "_DBRegistry")
+    registry_assign = next(a for a in defining_facts.assigns if a.target == "registry")
+
+    st.add_defs("svc", [
+        DefRow("app/db/registry.py", _REGISTRY_SESSION_SYM,
+               session_def.name_start_byte, session_def.name_end_byte,
+               session_def.start_line),
+        DefRow("app/db/registry.py", _REGISTRY_CLASS_SYM,
+               class_def.name_start_byte, class_def.name_end_byte, class_def.start_line),
+    ])
+    st.add_refs("svc", [RefRow(
+        "app/db/registry.py", _REGISTRY_CLASS_SYM,
+        registry_assign.callee_start_byte, registry_assign.callee_end_byte,
+        registry_assign.start_line, 0,
+    )])
+
+    ref_symbol_lookup = lambda rp, sb: st.ref_symbol_at("svc", rp, sb)  # noqa: E731
+    st.add_claims(
+        "svc", "app/db/registry.py", "module_singletons",
+        harvest_module_singletons("app/db/registry.py", defining_facts, ref_symbol_lookup),
+    )
+    singleton_index = build_singleton_index(st.claims_for("module_singletons", "svc"))
+
+    facts_by_file = {
+        "app/db/registry.py": defining_facts, "app/handlers.py": shadow_facts,
+    }
+    stats = build_calls(
+        "svc", st, facts_by_file, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=singleton_index,
+    )
+    # ctor call still joins normally (1, module -> class, nothing to do with
+    # singleton dispatch); the shadowed `registry.session()` call does NOT
+    # dispatch -- unresolved, exactly as if singleton_index carried nothing for
+    # "registry" at all.
+    assert stats.calls_joined == 1 and stats.calls_unresolved == 1
+    edges = [e for e in st.iter_edges() if e.type == "CALLS"]
+    assert len(edges) == 1
+    assert edges[0].dst.endswith("_DBRegistry#")

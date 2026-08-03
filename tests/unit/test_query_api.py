@@ -507,6 +507,28 @@ def test_who_calls_activity_target_surfaces_invokes_activity_source_with_mechani
     assert caller["mechanism"] == "invokes_activity"
 
 
+def test_who_calls_multi_role_target_still_surfaces_invokes_activity_source():
+    """M10 T2 backlog pin (multi-role, "nice-to-have" per the M10-T2 review): a
+    target's roles list carries TemporalActivity ALONGSIDE another role (e.g. a
+    node that is BOTH a Temporal activity and a kafka message consumer handler)
+    -- the activity-hood check (`"TemporalActivity" in (target_nodes[0].get
+    ("roles") or ())`, see GraphQuery.who_calls' own docstring) is a MEMBERSHIP
+    test over the whole roles list, not an equality/first-element check, so
+    INVOKES_ACTIVITY sources are still surfaced exactly as for a single-role
+    activity target."""
+    store = FakeStore()
+    store.add_node("activity", roles=["TemporalActivity", "MessageConsumer"])
+    store.add_node("workflow")
+    store.add_edge("workflow", "INVOKES_ACTIVITY", "activity")
+    q = GraphQuery(_factory(store), {})
+    result = q.who_calls("activity")
+    assert result["truncated"] is False
+    assert len(result["callers"]) == 1
+    caller = result["callers"][0]
+    assert caller["id"] == "workflow"
+    assert caller["mechanism"] == "invokes_activity"
+
+
 def test_who_calls_activity_target_calls_caller_carries_no_mechanism():
     """An activity can ALSO have an ordinary CALLS caller (e.g. a unit test
     invoking the activity function directly, not through Temporal) -- that

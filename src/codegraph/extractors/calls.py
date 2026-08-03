@@ -66,7 +66,17 @@ review Important-1 -- the M1a honesty ladder is a PROVENANCE rule: a degraded ru
 S6 CALLS are heuristic/0.6 because the fallback resolver produced them, so no
 redirect may exceed the run's own base tier; see the inline cap comment in
 build_calls), and its edge carries `props["mechanism"] = "singleton_dispatch"`
-(existing edges' props stay exactly `{"callsite_count": N}`, unchanged)."""
+(existing edges' props stay exactly `{"callsite_count": N}`, unchanged).
+
+M11 T2 (provenance-hardening, M10-final review Minor-2 backlog): `_try_singleton`
+now also threads this call site's own `relpath`/`facts.imports` through to
+`resolve_singleton_call`'s optional provenance check -- a receiver name is only
+honoured when it is defined in the SAME file as the singleton claim, or imported
+FROM the claim's own origin module (M6-T3 import-corroboration precedent, mirrored
+from `idiom_match`); a same-named receiver imported from an unrelated module never
+dispatches (the prior, honest no-redirect path). See parsing/module_singletons.py's
+own `resolve_singleton_call`/`_receiver_provenance_ok` docstrings for the full
+mechanism."""
 
 from __future__ import annotations
 
@@ -78,7 +88,7 @@ from dataclasses import dataclass
 from codegraph.core import ids
 from codegraph.core.schema import EdgeRec
 from codegraph.extractors.python_core import nesting_chain
-from codegraph.parsing.facts import CallFact, FileFacts
+from codegraph.parsing.facts import CallFact, FileFacts, ImportFact
 from codegraph.parsing.module_singletons import (
     SingletonDispatch,
     SingletonIndex,
@@ -153,12 +163,22 @@ def _try_singleton(
     singleton_index: SingletonIndex | None,
     def_symbols_set: set[str],
     service: str,
+    caller_relpath: str,
+    caller_imports: list[ImportFact],
 ) -> SingletonDispatch | None:
     """M10 T1: try a module-level-singleton redirect for `call` -- None whenever
     there is nothing to try (no index wired) or the receiver isn't a bare (dot-free)
     name (mirrors `idiom_match._match_receiver`'s own "receiver -- ПРОСТОЕ имя [без
     точек]" convention: `self.registry.session()`/`mod.registry.session()` are never
-    attempted, only this task's own claimed shape -- a bare module-level binding)."""
+    attempted, only this task's own claimed shape -- a bare module-level binding).
+
+    M11 T2 (provenance-hardening, M10-final review Minor-2 backlog): `caller_relpath`/
+    `caller_imports` -- this call site's OWN file/imports (`build_calls`' per-file
+    loop variables, `relpath`/`facts.imports`, unconditionally available there) --
+    are always passed straight through to `resolve_singleton_call`'s own optional
+    provenance check (see its docstring for the full shadowing rationale this
+    closes); this function itself makes no provenance decision, it only supplies
+    what the check needs."""
     if singleton_index is None:
         return None
     receiver = call.receiver_text
@@ -166,6 +186,7 @@ def _try_singleton(
         return None
     return resolve_singleton_call(
         singleton_index, receiver, call.callee_name, def_symbols_set, service,
+        caller_relpath=caller_relpath, caller_imports=caller_imports,
     )
 
 
@@ -290,7 +311,9 @@ def build_calls(
             dispatch: SingletonDispatch | None = None
 
             if ref is None:
-                dispatch = _try_singleton(call, singleton_index, def_symbols_set, service)
+                dispatch = _try_singleton(
+                    call, singleton_index, def_symbols_set, service, relpath, facts.imports,
+                )
                 if dispatch is None:
                     calls_unresolved += 1
                     continue
@@ -305,6 +328,7 @@ def build_calls(
                             and ref.symbol not in local_defs_for_file(relpath)):
                         dispatch = _try_singleton(
                             call, singleton_index, def_symbols_set, service,
+                            relpath, facts.imports,
                         )
                         if dispatch is None:
                             calls_unresolved += 1
@@ -317,7 +341,10 @@ def build_calls(
                 # venv). `parsed.package`/`.descriptors` are deliberately not consulted
                 # here at all any more.
                 elif ref.symbol not in def_symbols_set:
-                    dispatch = _try_singleton(call, singleton_index, def_symbols_set, service)
+                    dispatch = _try_singleton(
+                        call, singleton_index, def_symbols_set, service,
+                        relpath, facts.imports,
+                    )
                     if dispatch is None:
                         calls_external += 1
                         continue
@@ -328,7 +355,10 @@ def build_calls(
                     # ORIGINAL (dangling) symbol, unchanged from pre-M10 behavior
                     # (still "joined", still silently dropped at load -- this task
                     # narrows, never widens, what gets dropped).
-                    dispatch = _try_singleton(call, singleton_index, def_symbols_set, service)
+                    dispatch = _try_singleton(
+                        call, singleton_index, def_symbols_set, service,
+                        relpath, facts.imports,
+                    )
 
             if dispatch is not None and dispatch.confidence > confidence:
                 # M10 review Important-1 (M1a honesty-ladder binding constraint):

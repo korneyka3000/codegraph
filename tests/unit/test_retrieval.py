@@ -275,6 +275,21 @@ def test_search_code_item_carries_chunk_kind_from_chunk_props():
     assert result["items"][0]["chunk_kind"] == "Function"
 
 
+def test_search_code_item_carries_chunk_kind_module_for_module_level_chunk():
+    # M10 T3 backlog pin: "Module" is the third real chunk_kind value alongside
+    # "Class"/"Function" (pipeline/load.py's own _CODE_KINDS = {"Module", "Class",
+    # "Function"}) -- a chunk covering module-level content (imports/top-level
+    # code, chunking/splitter.py's own module-header chunk) whose owning node is
+    # the Module node itself. retrieval._chunk_item is a raw prop pass-through
+    # (no special-casing of specific kind strings), so this end-to-end-at-the-
+    # retrieval-unit-level pin confirms "Module" flows through identically to the
+    # already-pinned "Class"/"Function" values.
+    store = _FakeStore()
+    store.text_chunks = [(_chunk("c1", chunk_kind="Module"), 1.0)]
+    result = retrieval.search_code(store, None, "q", mode="text")
+    assert result["items"][0]["chunk_kind"] == "Module"
+
+
 def test_search_code_item_chunk_kind_none_when_chunk_lacks_the_property():
     # Pre-T3-loaded graph / symbol absent from staged nodes: honest None, not a
     # KeyError -- same defensive convention as qualified_name.
