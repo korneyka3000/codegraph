@@ -397,6 +397,88 @@ def test_external_exit_count_sums_across_segments():
     assert result["external_exit_count"] == 2
 
 
+def test_two_external_hops_into_one_channel_first_walked_host_wins_stably():
+    """M10 T4 review Minor pin: several external producers into the SAME shared
+    channel within one segment -- the exit entry's host is the FIRST walked
+    hop's (walk order: `_sorted_hops`' stable (edge_type, neighbor_id) sort at
+    the entry node decides which producer expands first), NOT whichever hop the
+    store happened to yield last. Both edge-insertion orders produce the
+    identical winner -- pins the set-on-first-external-sight code path against
+    regressing to an unconditional (last-write-wins) overwrite, the exact
+    instability FalkorDB's non-contractual row order would expose."""
+    def build(reversed_: bool) -> FakeStore:
+        store = FakeStore()
+        store.add_node("entry", service="a", kind="Function")
+        store.add_node("p_a", service="a", kind="Function")
+        store.add_node("p_b", service="a", kind="Function")
+        store.add_node(
+            "chan:http:?:POST /events",
+            kind="Channel", name="POST /events", channel_kind="http_route", unresolved=True,
+        )
+        store.add_edge("entry", "CALLS", "p_a")
+        store.add_edge("entry", "CALLS", "p_b")
+        producers = [("p_a", "host-a.prod"), ("p_b", "host-b.prod")]
+        if reversed_:
+            producers.reverse()
+        for src, host in producers:
+            store.add_edge(
+                src, "CALLS_HTTP", "chan:http:?:POST /events",
+                confidence=0.5, resolution="heuristic", external=True, external_host=host,
+            )
+        return store
+
+    for reversed_ in (False, True):
+        result = traverse.trace_process(
+            build(reversed_), "entry", max_segments=12, min_confidence=0.3
+        )
+        exits = result["segments"][0]["exits"]
+        assert len(exits) == 1
+        assert exits[0]["external"] is True
+        # p_a expands before p_b (BFS frontier order from entry's own sorted
+        # CALLS hops), so p_a's host wins in BOTH stores, regardless of the
+        # order the CALLS_HTTP edges were inserted in.
+        assert exits[0]["external_host"] == "host-a.prod"
+        assert result["external_exit_count"] == 1
+
+
+def test_external_hop_after_non_external_hop_still_marks_exit_external():
+    """Sticky-True half of the same policy (the reason first-sight is scoped to
+    EXTERNAL sightings only, never a bare set-on-any-first-sight): a
+    non-external producer walked FIRST into a shared channel must not lock the
+    exit entry at (False, None) -- a later external hop still upgrades it
+    (honest boundary knowledge from ANY contributing edge surfaces). Per-hop
+    confidence exclusion stays independent of this entry-level aggregation: the
+    non-external hop's own 0.5 still floors the aggregate."""
+    store = FakeStore()
+    store.add_node("entry", service="a", kind="Function")
+    store.add_node("p_a", service="a", kind="Function")
+    store.add_node("p_b", service="a", kind="Function")
+    store.add_node(
+        "chan:http:?:POST /events",
+        kind="Channel", name="POST /events", channel_kind="http_route", unresolved=True,
+    )
+    store.add_edge("entry", "CALLS", "p_a")
+    store.add_edge("entry", "CALLS", "p_b")
+    # p_a (walked first) -- NOT external; p_b (walked second) -- external.
+    store.add_edge(
+        "p_a", "CALLS_HTTP", "chan:http:?:POST /events",
+        confidence=0.5, resolution="heuristic",
+    )
+    store.add_edge(
+        "p_b", "CALLS_HTTP", "chan:http:?:POST /events",
+        confidence=0.5, resolution="heuristic", external=True, external_host="gw.prod",
+    )
+
+    result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
+
+    exits = result["segments"][0]["exits"]
+    assert len(exits) == 1
+    assert exits[0]["external"] is True
+    assert exits[0]["external_host"] == "gw.prod"
+    assert result["external_exit_count"] == 1
+    assert result["confidence"] == 0.5  # the non-external hop's own 0.5 still counts
+
+
 def test_non_external_exit_hop_confidence_still_counts_toward_aggregate():
     """Contrast case: a plain (non-external) low-confidence exit -- e.g. the
     pre-existing generic-unresolved heuristic/0.5 HTTP channel -- still drags the

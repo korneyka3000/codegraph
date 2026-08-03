@@ -122,15 +122,22 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
     exit_producer_ids: set[str] = set()
     # M10 T4: channel_id -> (is_external, external_host) for THIS segment's exits --
     # sourced from the EDGE(s) that reached it, not the (now claim-agnostic) channel
-    # node. Sticky-True, first-host-wins policy: once any contributing edge marks a
-    # channel external, it stays external for this exit entry (a real hostname
-    # honestly named by ANY call into a shared unresolved endpoint is genuine
-    # boundary knowledge worth surfacing, never suppressed just because a sibling
-    # producer's own claim happened not to resolve one) -- deterministic because
-    # hops are processed in `_sorted_hops`' own stable order. This mirrors the
-    # pre-existing `exit_channel_nodes[neighbor_id] = neighbor` last-write-wins
-    # aggregation just below (harmless pre-M10 since node props were uniform per
-    # id; now genuinely doing a little more work because props aren't).
+    # node. Sticky-True + FIRST-external-sight host (M10 T4 review Minor: now
+    # enforced IN CODE, not just described -- the first cut did an unconditional
+    # overwrite, i.e. last-write-wins, contradicting this very comment): an
+    # external hop writes its host only while the entry is absent or still
+    # non-external; once an external entry exists, later external hops never
+    # overwrite it, so with several external producers into one shared channel the
+    # FIRST walked hop's host wins, deterministically (the walk's own order:
+    # `_sorted_hops`' stable per-node (edge_type, neighbor_id) sort + the BFS
+    # frontier order derived from it -- never FalkorDB's non-contractual row
+    # order). A non-external hop never downgrades an external entry (sticky-True:
+    # a real hostname honestly named by ANY call into a shared unresolved endpoint
+    # is genuine boundary knowledge worth surfacing, never suppressed just because
+    # a sibling producer's own claim happened not to resolve one) -- this upgrade
+    # case is exactly why "first sight" is scoped to EXTERNAL sightings only,
+    # never a bare set-on-any-first-sight. Both halves pinned in
+    # test_traverse.py's first-walked-host-wins / sticky-upgrade pair.
     exit_external: dict[str, tuple[bool, str | None]] = {}
     truncated = False
 
@@ -184,10 +191,13 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
                     exit_channel_nodes[neighbor_id] = neighbor
                     exit_producers.setdefault(neighbor_id, set()).add(node_id)
                     exit_producer_ids.add(node_id)
-                    if is_external_exit:
+                    current = exit_external.get(neighbor_id)
+                    if is_external_exit and (current is None or not current[0]):
+                        # first external sighting (or sticky upgrade of a
+                        # non-external entry) -- see exit_external's comment above.
                         exit_external[neighbor_id] = (True, edge_props.get("external_host"))
-                    else:
-                        exit_external.setdefault(neighbor_id, (False, None))
+                    elif current is None:
+                        exit_external[neighbor_id] = (False, None)
                 continue
 
             steps.append(

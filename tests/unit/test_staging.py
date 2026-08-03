@@ -1005,6 +1005,26 @@ def test_update_node_props_merge_wins_over_remove_on_overlap(tmp_path):
     assert updated.props == {"k": "new"}
 
 
+# -- M10 T4: get_node_props -- the READ half of update_node_props' own
+# SELECT-by-PK, added for linking/router_prefix.py's dissolution read-compare
+# (see both methods' docstrings). Same missing-row contract shape as its write
+# sibling, just the read spelling: None here where update_node_props returns
+# False.
+
+
+def test_get_node_props_returns_props_dict_for_existing_node(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    n = NodeRec(id="sym:a:`m`/f().", kind="Function", service="a", name="f",
+                qualified_name="m.f", props={"http_method": "GET", "path_template": "/x"})
+    st.upsert_nodes([n])
+    assert st.get_node_props(n.id) == {"http_method": "GET", "path_template": "/x"}
+
+
+def test_get_node_props_returns_none_for_missing_node(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    assert st.get_node_props("sym:a:nonexistent") is None
+
+
 # -- M3 T3: chunks (chunking.splitter.ChunkRec staged for T4/T6) --
 
 
