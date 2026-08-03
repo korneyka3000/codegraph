@@ -264,12 +264,15 @@ is a cheap, fully deterministic, content-derived tiebreak -- no claim-order or
 arbitrary-first-seen dependency), plus a `path_templates` key holding the FULL
 sorted list -- but the second key is added ONLY when there is more than one
 template (`len(templates) > 1`); a single-mount route's props stay byte-identical
-to the pre-T3 (T2-only) shape, no `path_templates` key at all, ever. The SAME
-`templates != [local_template]` comparison T2 already used to decide whether to
-write anything at all continues to cover every zero-write case uniformly (trivial
-root, unresolved router_symbol, total per-mount failure, AND cap overflow alike --
-all four set `templates = [local_template]` verbatim) -- no new branching needed,
-consistent with T2's own "avoid no-op writes" requirement.
+to the pre-T3 (T2-only) shape, no `path_templates` key at all, ever. T2/T3-era: the
+SAME `templates != [local_template]` comparison T2 already used to decide whether
+to write anything at all continued to cover every zero-write case uniformly
+(trivial root, unresolved router_symbol, total per-mount failure, AND cap overflow
+alike -- all four set `templates = [local_template]` verbatim) -- no new branching
+needed, consistent with T2's own "avoid no-op writes" requirement. M10 T4
+REPLACES the RIGHT-hand side of that comparison (see that section below) -- the
+LEFT-hand side (`templates`) and the write shape itself are unchanged by this
+paragraph's own T2/T3 design.
 
 Stale-key removal (M9 T3 review item 1): the single-template write passes
 `remove=("path_templates",)` to `staging.update_node_props` -- when a double-mount
@@ -283,47 +286,58 @@ test). Removing an absent key is a documented silent no-op
 (`Staging.update_node_props`'s own semantics: remove applies to the OLD props
 first, merge lands after and wins on overlap), so the remove is passed
 unconditionally on every single-template patch, including a first-ever one.
-RESIDUAL, tracked -- HONESTY UPGRADE (M9 final review Important-2, .superpowers/sdd/
-m9-final-fix-report.md): the note above previously undersold this gap by saying
-composed values merely "persist" -- stated EXPLICITLY, what actually happens is a
-violation of this project's own M4 "supreme" dump-equivalence invariant (an
-`--incremental` run must reach the byte-identical staging/graph state a fresh FULL
-reindex of the identical final tree would) for one specific edit shape: full-chain
-DISSOLUTION under `--incremental` -- every mount of a router removed (both
-`include_router` calls deleted from main.py, say) so the router reverts to a
-trivial root, while the HANDLER's own file is untouched (never goes stale, so S5
-never re-stages it LOCAL-only) -- leaves the handler node's `path_template`/
-`path_templates` props stuck at their last-composed, now-INCORRECT value, because
-`templates == [local_template]` puts this route back on the NO-write path above
-even though the composed value that used to be correct no longer applies.
-Reproduced directly by the M9 final review's probe1 (dissolve every mount via
-`staging.delete_file_layer` on the router-owning file alone, re-stage its
-surviving `router_decl`, re-link -- the handler node's props then diverge from a
-FRESH second `Staging` built from the identical final claim set, which never
-composed a prefix in the first place and so never had one to leave behind). A FULL
-reindex heals it (S5 unconditionally re-stages EVERY file LOCAL-only regardless of
-staleness, the handler's own file included; S7 then relinks over the current,
-now-mount-free claim set and correctly finds nothing to compose) -- only
-`--incremental`'s selective re-analysis is exposed, and only for this "all mounts
-gone, leaf file untouched" shape specifically.
+RESOLVED (M10 T4) -- HONESTY UPGRADE + FIX (M9 final review Important-2,
+.superpowers/sdd/m9-final-fix-report.md): the note historically here (through the
+M9 final review) undersold the gap by saying composed values merely "persist" --
+the review restated it EXPLICITLY as a violation of this project's own M4
+"supreme" dump-equivalence invariant (an `--incremental` run must reach the
+byte-identical staging/graph state a fresh FULL reindex of the identical final
+tree would) for one specific edit shape: full-chain DISSOLUTION under
+`--incremental` -- every mount of a router removed (both `include_router` calls
+deleted from main.py, say) so the router reverts to a trivial root, while the
+HANDLER's own file is untouched (never goes stale, so S5 never re-stages it
+LOCAL-only) -- left the handler node's `path_template`/`path_templates` props
+stuck at their last-composed, now-INCORRECT value, because `templates ==
+[local_template]` put this route back on the NO-write path above even though the
+composed value that used to be correct no longer applied. Reproduced directly by
+the M9 final review's probe1 (dissolve every mount via `staging.delete_file_layer`
+on the router-owning file alone, re-stage its surviving `router_decl`, re-link --
+the handler node's props then diverged from a FRESH second `Staging` built from
+the identical final claim set, which never composed a prefix in the first place
+and so never had one to leave behind) -- now pinned directly in
+`tests/unit/test_router_prefix.py`'s own
+`test_probe1_full_chain_dissolution_converges_to_fresh_reindex`.
 
-Mechanical fix deliberately DEFERRED to M10, not applied in this fix-batch: closing
-it overturns T2's own accepted-and-pinned "avoid no-op writes" design one paragraph
-up, which two existing tests pin by asserting `staging.update_node_props` is NEVER
-called (`calls == []`) whenever `templates == [local_template]` --
+FIX: `link()` now reads the handler node's CURRENTLY STAGED `path_template`/
+`path_templates` (`staging.get_node_props`, one call per route_decl claim) and
+compares `templates` against THAT instead of against a fresh recomputation of
+`local_template` -- direction (b) of the two the M9 final review's own carry
+named (a node-props read, not an unconditional write; see that review's report
+for why (a) was rejected: it pays a real write for every trivial-root/unresolved
+route in a workspace, empirically most real routes). This closes the gap for
+every fallback shape uniformly (trivial root, unresolved router_symbol, per-mount
+failure, cap overflow alike) with no new branching -- the write condition is
+simply `templates != staged_templates` now, where `staged_templates` is
+reconstructed from the node's OWN `path_templates` (if present) or singleton
+`[path_template]` (if not), `None` if the node carries neither (or doesn't exist
+-- `update_node_props` itself already no-ops safely on a missing id). `link()` is
+consequently no longer a pure claims-in transformation (T2's own original design
+constraint) -- an ACKNOWLEDGED, INTENDED trade this fix makes, not an oversight.
+
+The two pins T2's "avoid no-op writes" design left behind --
 `test_trivial_chain_does_not_patch_handler_node_props` and
 `test_unresolvable_router_symbol_does_not_patch_handler_node_props`
-(tests/unit/test_router_prefix.py). Either fix direction requires INVERTING both
-pins (asserting the write DOES happen), not merely extending them: (a) an
-unconditional single-template write on every route_decl claim, dropping the
-`templates != [local_template]` guard entirely -- correct, but pays a real write
-for every trivial-root/unresolved route in a workspace (every M2/M6/M7 fixture
-route, and empirically most real routes); or (b) a node-props READ inside `link()`
-to compare against the CURRENTLY staged value before deciding to write -- correct
-and cheaper, but turns `link()` from a pure claims-in transformation into one that
-also reads node state, the exact extra read T2's own design explicitly rejected
-(see the "M9 T2" section above). Neither is a small, low-risk fix-batch change --
-both are M10's to make; flagged honestly here rather than silently inherited.
+(tests/unit/test_router_prefix.py) -- are INVERTED per the review's own sanction
+(names/history kept deliberately, see each test's own updated docstring): they now
+stage a DELIBERATELY STALE value and assert the write DOES happen, correcting it.
+A THIRD test, `test_no_patch_attempted_when_staged_value_already_matches_composed`,
+takes over the original "avoid no-op writes" intent, correctly re-targeted at an
+ACTUAL no-op (staged value already equals composed) rather than a structural shape
+that merely usually implied one. Idempotency is unaffected: a second `link()` call
+over an unchanged claim set recomputes the identical `templates` a second time,
+which now already matches what the first call just staged, so the write is
+skipped exactly as before (`test_double_link_is_idempotent_for_handler_node_props`,
+`test_probe1_dissolution_then_second_link_is_idempotent`).
 
 Cross-product explosion guard (`_MAX_TEMPLATES = 16`, `_OVERFLOW` sentinel): a
 route_decl's own live-template count is bounded above by its router_symbol's own
@@ -589,17 +603,21 @@ def _resolve_prefixes(
 
 def link(staging: Staging) -> dict:
     """S7 entry point (called from linking.workspace.link_workspace, BEFORE
-    http_routes.link). staging-only (no FalkorDB access), mirrors http_routes.link's
-    own signature shape minus the (unneeded here) WorkspaceConfig parameter -- claims
-    -> graph -> Channel/HANDLES composition, PLUS (M9 T2/T3) a compose-back patch onto
-    each handler node's own path_template/path_templates props when the composed
-    template(s) differ from the local-only one already staged there (see module
-    docstring's own "M9 T2"/"M9 T3" sections for the full design/idempotency/
-    incremental-coherence argument). Returns {"route_prefix_unresolved": <count>} --
-    the number of route_decl claims whose composition fell back to the local-only
-    template (see module docstring's honesty rule for the failure shapes this counts;
-    M9 T3: a route composing to 2+ live templates via multi-mount is NOT counted here
-    -- it resolved, just plurally)."""
+    http_routes.link). Mirrors http_routes.link's own signature shape minus the
+    (unneeded here) WorkspaceConfig parameter -- claims -> graph -> Channel/HANDLES
+    composition, PLUS (M9 T2/T3, M10 T4) a compose-back patch onto each handler
+    node's own path_template/path_templates props when the composed template(s)
+    differ from the node's CURRENTLY STAGED value (see module docstring's own
+    "M9 T2"/"M9 T3"/"M10 T4" sections for the full design/idempotency/incremental
+    -coherence argument). M10 T4: no longer staging-only in the "never reads node
+    state" sense T2 originally shipped with -- one `staging.get_node_props` read
+    per route_decl claim is the acknowledged, intentional trade the read-compare
+    fix makes (still no FalkorDB access; staging.db itself is the only thing read).
+    Returns {"route_prefix_unresolved": <count>} -- the number of route_decl claims
+    whose composition fell back to the local-only template (see module docstring's
+    honesty rule for the failure shapes this counts; M9 T3: a route composing to
+    2+ live templates via multi-mount is NOT counted here -- it resolved, just
+    plurally)."""
     graph = _build_include_graph(staging)
     own_prefix = _build_own_prefix_map(staging)
     memo: dict[str, list[str] | object] = {}
@@ -640,21 +658,39 @@ def link(staging: Staging) -> dict:
                 assert isinstance(prefixes, list)
                 templates = sorted({_template(p + prefix_local, path) for p in prefixes})
 
-        # M9 T2/T3: compose-back -- patch the HANDLER node's own path_template
-        # (+ path_templates, when there is more than one live template) props to
-        # match, but only when it would actually change (avoid no-op writes; see
-        # module docstring's own "M9 T2" section). Every fallback branch above sets
-        # templates = [local_template] verbatim -- this one comparison catches ALL
-        # of them (trivial root, unresolved router_symbol, total per-mount failure,
-        # and cap overflow alike), no separate branch needed. The single-template
-        # write actively REMOVES any stale path_templates key (M9 T3 review item 1:
-        # a double-mount collapsing back to one mount re-patches path_template via
-        # shallow merge, but merge alone can never delete the now-dead list, and
-        # the handler's own file never went stale, so S5 never wipes it either --
-        # without remove= the dead path lived on the node forever); removing an
-        # absent key is a documented silent no-op, so the unconditional remove
-        # costs nothing on first-ever patches.
-        if templates != [local_template]:
+        # M9 T2/T3 + M10 T4 (read-compare -- closes the M9 final review's own
+        # Important-2 "RESIDUAL, tracked" gap; see module docstring's "M10 T4"
+        # section for the full before/after argument): patch the HANDLER node's
+        # own path_template (+ path_templates, when there is more than one live
+        # template) props to match `templates`, but only when it would actually
+        # change something -- compared against the node's CURRENTLY STAGED value
+        # (one `staging.get_node_props` read per claim), NOT a fresh
+        # recomputation of the local-only template the way this comparison used
+        # to work pre-M10. The old `templates != [local_template]` comparison
+        # degenerated to comparing `local_template` against itself in EVERY
+        # fallback branch (trivial root, unresolved router_symbol, total
+        # per-mount failure, cap overflow alike) -- structurally blind to a node
+        # whose staged value had drifted from what THIS run's claims currently
+        # compose (exactly the "every mount dissolved, handler file untouched"
+        # --incremental shape the M9 final review's probe1 caught). Comparing
+        # against the real staged value instead catches every such case
+        # uniformly, including writing the local template BACK when a chain
+        # fully dissolves, while still skipping a redundant write whenever the
+        # staged value already matches (the original "avoid no-op writes" goal,
+        # now correctly re-targeted at ACTUAL no-ops instead of a structural
+        # shape that only usually implied one). The single-template write still
+        # actively REMOVES any stale path_templates key unconditionally (M9 T3
+        # review item 1 -- removing an absent key is a documented silent no-op,
+        # so this costs nothing on a first-ever patch).
+        staged_props = staging.get_node_props(handler_node_id)
+        staged_path_templates = (staged_props or {}).get("path_templates")
+        if staged_path_templates is None:
+            staged_single = (staged_props or {}).get("path_template")
+            staged_templates = [staged_single] if staged_single is not None else None
+        else:
+            staged_templates = staged_path_templates
+
+        if templates != staged_templates:
             if len(templates) > 1:
                 staging.update_node_props(handler_node_id, {
                     "path_template": templates[0], "path_templates": templates,

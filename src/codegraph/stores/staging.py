@@ -1189,6 +1189,30 @@ class Staging:
                           name=name, qualified_name=qn, content_hash=ch,
                           props=json.loads(props), roles=roles)
 
+    def get_node_props(self, node_id: str) -> dict | None:
+        """M10 T4 (linking/router_prefix.py's own dissolution read-compare fix):
+        one node's CURRENTLY staged `props` dict by id, or None if no such node
+        exists. Mirrors `update_node_props`'s own `SELECT props FROM nodes WHERE
+        id=?` (a genuine single-column PRIMARY KEY lookup -- at most one row,
+        same as that method's own docstring already establishes) -- this is the
+        read half of that method's write, split out as its own method because
+        `router_prefix.link()` now needs to READ a handler node's currently
+        -staged `path_template`/`path_templates` BEFORE deciding whether to patch
+        it, comparing against the ACTUAL current value rather than a fresh
+        recomputation of the LOCAL-only template. See that module's own docstring
+        for why the old `templates != [local_template]` comparison -- correct at
+        the moment T2 shipped it, but blind to what the node ITSELF currently
+        holds -- could leave a stale composed value stuck on a node forever under
+        one specific `--incremental` full-chain-dissolution shape (M9 final
+        review Important-2's "RESIDUAL, tracked" note, now closed): `link()` was
+        deliberately a pure claims-in transformation before this task (no node
+        state read at all); this one read is the acknowledged, intentional trade
+        that closes the gap (see that review's own two named fix directions)."""
+        row = self._db.execute(
+            "SELECT props FROM nodes WHERE id=?", (node_id,)
+        ).fetchone()
+        return json.loads(row[0]) if row is not None else None
+
     def iter_edges(self) -> Iterator[EdgeRec]:
         """RAW, undeduplicated rows -- one per (src,dst,type,via_channel,
         origin_service) PK tuple. Since M5 T4 (SCHEMA_VERSION 6), a shared edge

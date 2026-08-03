@@ -687,14 +687,23 @@ def test_composed_patch_lands_on_handler_node_props(tmp_path):
 
 
 def test_trivial_chain_does_not_patch_handler_node_props(tmp_path, monkeypatch):
-    """No cross-file include chain (chain_prefix == "", the genuine-root case) ->
-    the composed template is byte-identical to the local one already staged -- the
-    compose-back patch must not even ATTEMPT a write (staging.update_node_props
-    itself is never called), not merely "write the same value harmlessly". This is
-    the explicit "avoid no-op writes" case from router_prefix.link's own
-    docstring: every M2/M6/M7 fixture route composes through exactly this path."""
+    """M10 T4 -- INVERTED (sanctioned by the M9 final review, .superpowers/sdd/
+    m9-final-fix-report.md Important-2; name/history kept deliberately, same
+    "make the inversion visible in git blame" convention as
+    test_env_map_hostname_label_not_a_workspace_service_falls_to_unmapped in
+    test_linking_http_routes.py). PRE-M10 this pinned "composed==local -> never
+    even attempt a write"; the read-compare redesign (linking/router_prefix.py's
+    `link()` now reads `staging.get_node_props` before deciding) means the write
+    is gated on the node's CURRENTLY STAGED value, not a fresh recomputation of
+    the local-only template -- so a trivial-root route (no include chain at all,
+    `templates == [local_template]` exactly as before) whose node is STAGED with
+    a STALE, different value (simulating exactly the dissolution shape this fix
+    closes: an earlier run's own composed value survives a mount's removal) DOES
+    get patched back to the fresh local template now, even though the OLD
+    `templates != [local_template]` comparison could never see the drift (both
+    sides of that comparison were identically `local_template`, always)."""
     st = Staging(tmp_path / "s.db")
-    st.upsert_nodes([_handler_node(HANDLER, path_template="/orders", http_method="POST")])
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/api/v1/orders", http_method="POST")])
     _route_decl(
         st, "orders-api", "app/routes/orders.py",
         router_symbol=ROUTER_A, verb="POST", path="", handler_node_id=HANDLER,
@@ -709,17 +718,20 @@ def test_trivial_chain_does_not_patch_handler_node_props(tmp_path, monkeypatch):
 
     router_prefix.link(st)
 
-    assert calls == []
+    assert calls != []  # INVERTED: the stale composed value must be written back
     node = next(n for n in st.iter_nodes() if n.id == HANDLER)
     assert node.props == {"http_method": "POST", "path_template": "/orders"}
 
 
 def test_unresolvable_router_symbol_does_not_patch_handler_node_props(tmp_path, monkeypatch):
-    """The OTHER template==local_template case: an unresolvable router_symbol
-    falls back to the local template too (honesty rule, route_prefix_unresolved
-    counted) -- also must not attempt a patch."""
+    """M10 T4 -- INVERTED, same sanction/history-preservation rationale as
+    test_trivial_chain_does_not_patch_handler_node_props just above. The OTHER
+    branch that sets `templates = [local_template]` (honesty rule: unresolvable
+    router_symbol) -- same read-compare-against-staged-value fix, same proof: a
+    stale staged value gets corrected even though the composed/local comparison
+    alone is (and always was) trivially equal here too."""
     st = Staging(tmp_path / "s.db")
-    st.upsert_nodes([_handler_node(HANDLER, path_template="/orders", http_method="POST")])
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/api/v1/orders", http_method="POST")])
     _route_decl(
         st, "orders-api", "app/routes/orders.py",
         router_symbol=None, verb="POST", path="", handler_node_id=HANDLER,
@@ -734,9 +746,161 @@ def test_unresolvable_router_symbol_does_not_patch_handler_node_props(tmp_path, 
 
     router_prefix.link(st)
 
-    assert calls == []
+    assert calls != []  # INVERTED: the stale composed value must be written back
     node = next(n for n in st.iter_nodes() if n.id == HANDLER)
     assert node.props["path_template"] == "/orders"
+
+
+def test_no_patch_attempted_when_staged_value_already_matches_composed(tmp_path, monkeypatch):
+    """M10 T4: the "avoid no-op writes" design goal survives the read-compare
+    redesign -- it's just correctly re-keyed on whether the node's STAGED value
+    already equals what THIS run freshly composes (never on which structural
+    shape produced that composed value, unlike the old, now-inverted pins just
+    above). A node reached via a genuine two-level include chain (NOT the
+    trivial/unresolved shapes) whose staged path_template is ALREADY the
+    composed one gets no redundant write -- this is the real successor to the
+    two inverted pins' original intent."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/api/v1/steps/{id}")])
+    _route_decl(
+        st, "worker", "app/routes/steps.py",
+        router_symbol=ROUTER_A, verb="GET", path="/steps/{id}", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/api/v1",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+    calls: list[tuple] = []
+    original = st.update_node_props
+    monkeypatch.setattr(
+        st, "update_node_props",
+        lambda *a, **k: (calls.append((a, k)), original(*a, **k))[1],
+    )
+
+    router_prefix.link(st)
+
+    assert calls == []
+    node = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert node.props["path_template"] == "/api/v1/steps/{id}"
+
+
+# -- M10 T4: full-chain DISSOLUTION under --incremental -- the M9 final review's
+# own probe1 (Important-2, .superpowers/sdd/m9-final-fix-report.md), now CLOSED
+# instead of merely documented. Every mount of a router removed (both
+# `include_router` calls deleted from the router-owning file), while the
+# HANDLER's own file stays untouched (never goes stale, so S5 never re-stages it
+# LOCAL-only) -- restores the M4 "supreme" dump-equivalence invariant for this
+# exact edit shape: an --incremental run's end state must be byte-identical to a
+# FRESH reindex of the identically-edited tree.
+
+
+def test_probe1_full_chain_dissolution_converges_to_fresh_reindex(tmp_path):
+    """Staging-level sequence test, mirroring the M9 final review's own probe1
+    mechanism exactly: mount (double, for a non-trivial starting point) -> link
+    -> dissolve EVERY mount via `staging.delete_file_layer` on the router-owning
+    file alone (re-staging only its surviving `router_decl`, no `router_include`
+    claim at all) -> re-link. Compared against an INDEPENDENT, FRESH `Staging`
+    built directly from the identical FINAL claim set (never having seen the
+    double-mount at all) -- what S1-S6 of a full reindex of the
+    already-dissolved source tree would stage. Scoped to the handler NODE's own
+    props (the exact divergence the review's probe1 found) plus the trivial
+    -root HANDLES edge -- stale-CHANNEL retirement across a dissolved mount is
+    clear_workspace_layer/gc_orphan_channels' job in the real link_workspace
+    sequence, deliberately not re-asserted here (same scoping precedent as
+    test_remount_removal_purges_stale_path_templates_key above, which predates
+    this fix)."""
+    # -- incremental path: double-mount, link, dissolve BOTH mounts, re-link --
+    st = Staging(tmp_path / "incremental.db")
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/x")])
+    _route_decl(
+        st, "worker", "app/routes/x.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/v1",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/legacy",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    router_prefix.link(st)
+    composed = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    assert composed.props["path_templates"] == ["/legacy/x", "/v1/x"]  # sanity: really composed
+
+    # Dissolve EVERY mount: the router-owning file's own re-analyze wipes its
+    # claims (delete_file_layer, the real incremental primitive
+    # pipeline/analyze.py uses) and NOTHING replaces the router_include claims
+    # -- source no longer calls include_router(...) for this router at all, only
+    # the bare `APP = FastAPI()` router_decl survives. The HANDLER's own file
+    # (app/routes/x.py) is untouched -- delete_file_layer is never called for
+    # it, exactly like a real incremental re-analyze that never re-visits it.
+    st.delete_file_layer("worker", {"app/main.py"}, drop_calls_evidence=set())
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+
+    router_prefix.link(st)
+
+    # -- fresh path: an independent Staging built directly from the FINAL claim
+    # set alone -- never having had a router_include claim for ROUTER_A in the
+    # first place, exactly what a FULL reindex of the already-dissolved tree
+    # would stage. ------------------------------------------------------------
+    fresh = Staging(tmp_path / "fresh.db")
+    fresh.upsert_nodes([_handler_node(HANDLER, path_template="/x")])
+    _route_decl(
+        fresh, "worker", "app/routes/x.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_decl_claim(fresh, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+    router_prefix.link(fresh)
+
+    incremental_node = next(n for n in st.iter_nodes() if n.id == HANDLER)
+    fresh_node = next(n for n in fresh.iter_nodes() if n.id == HANDLER)
+    assert incremental_node.props == fresh_node.props == {
+        "http_method": "GET", "path_template": "/x",
+    }
+    for label, staging_ in (("incremental", st), ("fresh", fresh)):
+        handles = [
+            e for e in staging_.iter_edges()
+            if e.type == "HANDLES" and e.dst == HANDLER and e.src == "chan:http:worker:GET /x"
+        ]
+        assert len(handles) == 1, (
+            f"{label}: expected exactly one trivial-root HANDLES, got {handles}"
+        )
+
+
+def test_probe1_dissolution_then_second_link_is_idempotent(tmp_path):
+    """Idempotency preserved (brief's own binding requirement): a SECOND link()
+    call after the dissolution-triggered patch converges -- no drift, no repeat
+    write needed (the staged value now already matches what keeps composing)."""
+    st = Staging(tmp_path / "s.db")
+    st.upsert_nodes([_handler_node(HANDLER, path_template="/x")])
+    _route_decl(
+        st, "worker", "app/routes/x.py",
+        router_symbol=ROUTER_A, verb="GET", path="/x", handler_node_id=HANDLER,
+        prefix_local="",
+    )
+    _router_include(
+        st, "worker", "app/main.py",
+        parent_symbol=APP, child_symbol=ROUTER_A, prefix="/v1",
+    )
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+    router_prefix.link(st)
+
+    st.delete_file_layer("worker", {"app/main.py"}, drop_calls_evidence=set())
+    _router_decl_claim(st, "worker", "app/main.py", router_symbol=APP, prefix_local="")
+    router_prefix.link(st)
+    once = next(n for n in st.iter_nodes() if n.id == HANDLER).props
+
+    router_prefix.link(st)
+    twice = next(n for n in st.iter_nodes() if n.id == HANDLER).props
+
+    assert once == twice == {"http_method": "GET", "path_template": "/x"}
 
 
 def test_double_link_is_idempotent_for_handler_node_props(tmp_path):
