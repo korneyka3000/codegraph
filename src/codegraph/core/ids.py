@@ -17,6 +17,18 @@ branches). Единственный вызыватель -- extractors/python_co
 M7 T4 (OPEN R3): `chan_temporal_signal` -- same name-only shape as chan_kafka/
 chan_event ("chan:temporal_signal:<name>"), added for Temporal signal/update
 handler+sender channels (see extractors/temporal_ext.py's module docstring).
+
+M11 T2 (review fix, relative-import provenance): `containing_package` +
+`resolve_relative_import` -- PROMOTED verbatim from extractors/python_core.py
+(its own module-local `_resolve_relative` + the inline package-derivation in
+`extract()`), where they built IMPORTS edges since M1a. Moved here, to the
+bottom layer both consumers already import, because parsing/module_singletons.py's
+receiver-provenance check needs the IDENTICAL normalization and the codebase's
+layering rule forbids a parsing->extractors import (see class_attrs.py's own
+`_nesting_chain` docstring for the rule; unlike that 6-line tree walk, this is
+subtle dot arithmetic where a drifting duplicate would be a real correctness
+risk, so the shared-single-source move is the right trade here). python_core
+now calls these through `ids.` -- one formula, two consumers, no drift.
 """
 
 from __future__ import annotations
@@ -29,6 +41,37 @@ def relpath_to_module(relpath: str) -> str:
     if p.endswith("/__init__"):
         p = p[: -len("/__init__")]
     return p.replace("/", ".")
+
+
+def containing_package(relpath: str) -> str:
+    """Dotted CONTAINING PACKAGE of a module, per Python's own relative-import
+    semantics: a package's `__init__.py` IS its package (`relpath_to_module`
+    already strips the "/__init__" tail, so its dotted form is the package
+    itself); a regular module's package is its dotted parent ("" for a top-level
+    module). Extracted byte-for-byte from extractors/python_core.py::extract's
+    own inline derivation (M11 T2 review fix -- see module docstring)."""
+    dotted = relpath_to_module(relpath)
+    if relpath.endswith("/__init__.py") or relpath == "__init__.py":
+        return dotted
+    return dotted.rsplit(".", 1)[0] if "." in dotted else ""
+
+
+def resolve_relative_import(package: str, target: str) -> str:
+    """Резолвинг относительного импорта против СОДЕРЖАЩЕГО ПАКЕТА (семантика Python):
+    один лидирующий '.' — сам package, каждая следующая точка — уровень выше.
+    package = dotted для __init__.py, parent(dotted) для обычного модуля ("" для
+    top-level) — ровно то, что `containing_package` выше выводит из relpath.
+    Абсолютный target возвращается как есть. (Перенесено 1:1 из
+    extractors/python_core.py::_resolve_relative, M11 T2 review fix — см.
+    модульный докстринг.)"""
+    if not target.startswith("."):
+        return target
+    dots = len(target) - len(target.lstrip("."))
+    rest = target.lstrip(".")
+    base = package.split(".") if package else []
+    up = dots - 1  # level 1 = сам package
+    base = base[: len(base) - up] if up <= len(base) else []
+    return ".".join([*base, rest] if rest else base)
 
 
 def module_descriptor(module_dotted: str) -> str:

@@ -27,19 +27,13 @@ def nesting_chain(defs: list[DefFact], d: DefFact) -> list[tuple[str, str]]:
     return list(reversed(chain))
 
 
-def _resolve_relative(package: str, target: str) -> str:
-    """Резолвинг относительного импорта против СОДЕРЖАЩЕГО ПАКЕТА (семантика Python):
-    один лидирующий '.' — сам package, каждая следующая точка — уровень выше.
-    package = dotted для __init__.py, parent(dotted) для обычного модуля ("" для
-    top-level). Абсолютный target возвращается как есть."""
-    if not target.startswith("."):
-        return target
-    dots = len(target) - len(target.lstrip("."))
-    rest = target.lstrip(".")
-    base = package.split(".") if package else []
-    up = dots - 1  # level 1 = сам package
-    base = base[: len(base) - up] if up <= len(base) else []
-    return ".".join([*base, rest] if rest else base)
+# M11 T2 review fix: `_resolve_relative` + the inline package-derivation both
+# PROMOTED verbatim to core/ids.py (`ids.resolve_relative_import` /
+# `ids.containing_package`) so parsing/module_singletons.py's receiver-provenance
+# check shares the IDENTICAL normalization without a parsing->extractors layering
+# inversion -- see ids.py's own module docstring for the full move rationale.
+# This module's IMPORTS-edge behavior is byte-identical (same formulas, now
+# called through `ids.`).
 
 
 def _module_node_id(service: str, dotted: str) -> str:
@@ -68,8 +62,7 @@ def extract(ctx: FileContext) -> ExtractionResult:
     facts = ctx.facts
     source = ctx.source
     dotted = ids.relpath_to_module(ctx.relpath)
-    is_package = ctx.relpath.endswith("/__init__.py") or ctx.relpath == "__init__.py"
-    package = dotted if is_package else dotted.rsplit(".", 1)[0] if "." in dotted else ""
+    package = ids.containing_package(ctx.relpath)
 
     nodes: list[NodeRec] = []
     edges: list[EdgeRec] = []
@@ -205,7 +198,7 @@ def extract(ctx: FileContext) -> ExtractionResult:
 
     # -- imports --
     for imp in facts.imports:
-        target = _resolve_relative(package, imp.target_module)
+        target = ids.resolve_relative_import(package, imp.target_module)
         if imp.names:
             for name in imp.names:
                 candidate = f"{target}.{name}" if target else name

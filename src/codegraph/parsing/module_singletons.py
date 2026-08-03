@@ -21,11 +21,15 @@ working as designed (see `resolve_singleton_call`'s docstring below). Those 79 d
 are consequently a property of the CODE (a principally dynamic, statically-
 unrecoverable callable-attribute -- the same class as 5 other `throttle`/
 `_driver_maker` attributes on the same corpus), not this mechanism's debt to pay. The
-mechanism itself remains correct and useful independent of that one misdiagnosed
-case: it harvested 92 genuine module-level singletons on the SAME real corpus (see
-rerun-5 open-gaps' own reproduction section) -- real bindings this index legitimately
-indexes and `extractors/calls.py` may legitimately dispatch through, with no false
-positives measured.
+mechanism itself remains correct and useful PROSPECTIVELY, independent of that one
+misdiagnosed case: it harvested 92 genuine module-level singletons on the SAME real
+corpus -- and, the honest companion number from the same rerun-5 reproduction
+section, 0 singleton-dispatch edges were actually emitted there (claims
+kind="module_singletons" = 92; edges props.mechanism="singleton_dispatch" = 0):
+zero false positives, and equally zero demonstrated dispatches on that corpus to
+date. The 92 real bindings are what this index stands ready to dispatch through
+whenever a matching staged method actually exists -- measured value so far is the
+harvest plus the fail-closed refusals, not recovered edges.
 
 Hedge (T5's own raw-scip-occurrence finding, fixtures/realstack/services/worker/app/
 services/doc_store.py's own docstring): the scip module-level-binding limitation this
@@ -400,14 +404,28 @@ def _receiver_provenance_ok(
     PAIR check, not the looser any-import-with-that-name form (that looseness is
     exactly the shadowing hole this closes). `entry.origin_relpaths` being empty (no
     relpath info recorded at all -- a hand-built claim predating this task) is
-    honestly "nothing to verify against", not a guessed refusal."""
+    honestly "nothing to verify against", not a guessed refusal.
+
+    RELATIVE imports (M11 T2 review fix): `ImportFact.target_module` carries the
+    raw dotted form (`from .registry import registry` -> ".registry"), which can
+    never textually equal an absolute origin module -- each target is first
+    resolved against the CALLER's own containing package via
+    `ids.resolve_relative_import(ids.containing_package(caller_relpath), ...)`,
+    the EXACT normalization extractors/python_core.py's IMPORTS-edge builder
+    applies (the formulas were promoted to core/ids.py for precisely this shared
+    use -- see ids.py's own module docstring). An absolute target passes through
+    `resolve_relative_import` unchanged, so the absolute-import behavior above is
+    untouched; a relative-but-FOREIGN import (`from ..other import registry`)
+    resolves to its real absolute module and still refuses honestly."""
     if not entry.origin_relpaths:
         return True
     if caller_relpath in entry.origin_relpaths:
         return True
     origin_modules = {ids.relpath_to_module(rp) for rp in entry.origin_relpaths}
+    caller_package = ids.containing_package(caller_relpath)
     return any(
-        entry.name in imp.names and imp.target_module in origin_modules
+        entry.name in imp.names
+        and ids.resolve_relative_import(caller_package, imp.target_module) in origin_modules
         for imp in caller_imports
     )
 

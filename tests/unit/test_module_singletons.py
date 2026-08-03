@@ -500,6 +500,43 @@ def test_resolve_singleton_call_provenance_foreign_module_import_shadow_refuses(
     assert dispatch is None
 
 
+def test_resolve_singleton_call_provenance_relative_import_same_package_dispatches():
+    """M11 T2 review fix (backlog-class 1 -- relative-import blind spot): an
+    idiomatic RELATIVE import (`from .registry import registry` in a sibling
+    module of the singleton's own package) must count as legitimate provenance.
+    ImportFact.target_module carries the raw dotted form (".registry"), which can
+    never textually equal the absolute origin module ("app.db.registry") -- it is
+    resolved against the CALLER's own containing package first
+    (ids.resolve_relative_import / ids.containing_package: the exact same
+    normalization python_core's IMPORTS-edge builder applies, now shared from
+    core/ids.py). Pre-fix this refused (fail-closed but an undocumented recall
+    regression for a completely idiomatic style)."""
+    idx = _registry_index_with_origin()
+    caller_imports = [ImportFact(".registry", ["registry"], 1)]
+    dispatch = resolve_singleton_call(
+        idx, "registry", "session", _def_symbols(), "svc",
+        caller_relpath="app/db/handlers.py", caller_imports=caller_imports,
+    )
+    assert dispatch == SingletonDispatch(
+        dst_id="sym:svc:`app.db.registry`/_DBRegistry#session().",
+        resolution="static", confidence=1.0,
+    )
+
+
+def test_resolve_singleton_call_provenance_relative_import_foreign_module_refuses():
+    """The relative form is not a free pass: `from ..other import registry`
+    resolves (against caller package "app.db") to "app.other" -- NOT the
+    singleton's own "app.db.registry" -- so it refuses exactly like the absolute
+    foreign-module shadow case above (relative, but still foreign)."""
+    idx = _registry_index_with_origin()
+    caller_imports = [ImportFact("..other", ["registry"], 1)]
+    dispatch = resolve_singleton_call(
+        idx, "registry", "session", _def_symbols(), "svc",
+        caller_relpath="app/db/handlers.py", caller_imports=caller_imports,
+    )
+    assert dispatch is None
+
+
 def test_resolve_singleton_call_provenance_no_matching_import_at_all_refuses():
     """Non-same-file caller with NO import of "registry" whatsoever -- refused,
     same as the shadowing case (nothing legitimizes the receiver)."""
