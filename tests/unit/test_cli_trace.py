@@ -223,6 +223,12 @@ def test_trace_mermaid_escapes_quotes_and_pipes_in_labels(tmp_path, monkeypatch)
 
 # -- M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): external
 # exits ("channel VERB /path -> external <host>") -- text + mermaid, both renderers.
+#
+# M10 T4 (linking/http_routes.py's own module docstring, "SHARED-CHANNEL PROPS"
+# section): `external`/`external_host` moved OFF the exit's `channel` sub-dict
+# (edge-sourced now, not a channel-node prop) onto the exit entry itself, as
+# sibling keys of `channel`/`next_entry_ids` -- see query/traverse.py's
+# `_resolve_exits`. cli.py's renderers read `ex.get("external")` accordingly.
 
 _EXTERNAL_EXIT_RESULT = {
     "segments": [
@@ -235,10 +241,10 @@ _EXTERNAL_EXIT_RESULT = {
                     "channel": {
                         "id": "chan:http:?:POST /api/v1/users/legal-entities",
                         "name": "POST /api/v1/users/legal-entities",
-                        "external": True,
-                        "external_host": "api-gateway.prod.svc.cluster.local",
                     },
                     "next_entry_ids": [],
+                    "external": True,
+                    "external_host": "api-gateway.prod.svc.cluster.local",
                 },
             ],
             "truncated": False,
@@ -330,10 +336,10 @@ def test_trace_text_format_prefers_resolved_next_ids_over_external_flag(tmp_path
                 "steps": [],
                 "exits": [
                     {
-                        "channel": {
-                            "id": "c1", "name": "X", "external": True, "external_host": "h",
-                        },
+                        "channel": {"id": "c1", "name": "X"},
                         "next_entry_ids": ["e2"],
+                        "external": True,
+                        "external_host": "h",
                     },
                 ],
                 "truncated": False,
@@ -408,11 +414,9 @@ def test_trace_mermaid_escapes_quotes_in_external_host_label(tmp_path, monkeypat
                 "steps": [],
                 "exits": [
                     {
-                        "channel": {
-                            "id": "c1", "name": 'X"y',
-                            "external": True, "external_host": 'weird"host',
-                        },
+                        "channel": {"id": "c1", "name": 'X"y'},
                         "next_entry_ids": [],
+                        "external": True, "external_host": 'weird"host',
                     },
                 ],
                 "truncated": False,

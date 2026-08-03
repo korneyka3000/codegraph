@@ -89,22 +89,49 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
     M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): `confidences`
     (returned, folded into `trace_process`'s own aggregate -- see that function's
     docstring for the before/after formula) collects EVERY walked hop's confidence
-    EXCEPT an exit-hop (CALLS_HTTP/PRODUCES) into a channel node whose own props
-    carry `external=True` (linking/http_routes.py's tier 2a: a REAL, known hostname
-    outside the workspace). The edge itself still carries its own honest
-    heuristic/0.5 -- only its CONTRIBUTION to this trace's aggregate floor is
-    excluded, so a documented boundary never reads as equivalent to an unmodeled
-    gap. The excluded edge is otherwise treated identically to any other exit
-    (still recorded in `exit_channel_nodes`/`exit_producers`/`exit_producer_ids`,
-    still subject to the SAME `min_confidence` presence filter via `_sorted_hops`
-    above -- exclusion is from the AGGREGATE only, never from the walk or the
-    rendered trace itself)."""
+    EXCEPT an exit-hop (CALLS_HTTP/PRODUCES) whose own EDGE props carry
+    `external=True` (linking/http_routes.py's tier 2a: a REAL, known hostname
+    outside the workspace -- M10 T4: read off the edge, see below). The edge itself
+    still carries its own honest heuristic/0.5 -- only its CONTRIBUTION to this
+    trace's aggregate floor is excluded, so a documented boundary never reads as
+    equivalent to an unmodeled gap. The excluded edge is otherwise treated
+    identically to any other exit (still recorded in `exit_channel_nodes`/
+    `exit_producers`/`exit_producer_ids`, still subject to the SAME
+    `min_confidence` presence filter via `_sorted_hops` above -- exclusion is from
+    the AGGREGATE only, never from the walk or the rendered trace itself).
+
+    M10 T4 (linking/http_routes.py's own module docstring, "SHARED-CHANNEL PROPS"
+    section): `external`/`external_host` moved from the channel NODE's own props to
+    the CALLS_HTTP EDGE's (per-claim now, replacing the M9 fail-closed merge
+    palliative that used to guard a shared node's props from cross-claim
+    collision -- collision is structurally impossible on an edge, nothing to guard
+    against any more). `is_external_exit` below therefore reads `edge_props`, not
+    `neighbor` -- this is a PER-HOP read, already naturally correct even when
+    several different producer edges land on the SAME shared/unresolved channel
+    within one segment (each hop's own edge decides its OWN exclusion, never a
+    property of the shared destination node). `exit_external` (new) carries the
+    aggregated external/host annotation for `_resolve_exits` below to attach to
+    each rendered exit ENTRY (a channel can still be reached by more than one
+    producer within a segment -- see that dict's own inline comment for the
+    deliberately simple aggregation policy)."""
     steps: list[dict] = []
     step_parents: list[str] = []
     confidences: list[float] = []
     exit_channel_nodes: dict[str, NodeOut] = {}
     exit_producers: dict[str, set[str]] = {}
     exit_producer_ids: set[str] = set()
+    # M10 T4: channel_id -> (is_external, external_host) for THIS segment's exits --
+    # sourced from the EDGE(s) that reached it, not the (now claim-agnostic) channel
+    # node. Sticky-True, first-host-wins policy: once any contributing edge marks a
+    # channel external, it stays external for this exit entry (a real hostname
+    # honestly named by ANY call into a shared unresolved endpoint is genuine
+    # boundary knowledge worth surfacing, never suppressed just because a sibling
+    # producer's own claim happened not to resolve one) -- deterministic because
+    # hops are processed in `_sorted_hops`' own stable order. This mirrors the
+    # pre-existing `exit_channel_nodes[neighbor_id] = neighbor` last-write-wins
+    # aggregation just below (harmless pre-M10 since node props were uniform per
+    # id; now genuinely doing a little more work because props aren't).
+    exit_external: dict[str, tuple[bool, str | None]] = {}
     truncated = False
 
     visited = {entry_id}
@@ -137,16 +164,18 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
             neighbor_id = neighbor.get("id")
             confidence = edge_props.get("confidence")
             is_exit = edge_type in _EXIT_EDGE_TYPES
-            # M9 T1: an exit-hop into a channel flagged external=True (linking/
-            # http_routes.py's tier 2a -- a REAL, known hostname outside the
-            # workspace, see that module's docstring) is honest KNOWLEDGE of a
+            # M9 T1 / M10 T4: an exit-hop whose own EDGE is flagged external=True
+            # (linking/http_routes.py's tier 2a -- a REAL, known hostname outside
+            # the workspace, see that module's docstring) is honest KNOWLEDGE of a
             # boundary, not modeling uncertainty -- its own edge confidence stays
             # exactly as recorded (heuristic/0.5, "no unearned confidence") but is
             # EXCLUDED from this trace's aggregate confidence floor below, so it
             # never drags an otherwise-fully-resolved trace down to 0.5. Every
             # OTHER edge (steps, non-external exits, NEXT_SEGMENT transitions in
-            # _resolve_exits below) is unaffected.
-            is_external_exit = is_exit and bool(neighbor.get("external"))
+            # _resolve_exits below) is unaffected. M10 T4: reads `edge_props`
+            # (this specific hop's own CALLS_HTTP/PRODUCES edge), not `neighbor`
+            # (the destination channel node) -- see this function's own docstring.
+            is_external_exit = is_exit and bool(edge_props.get("external"))
             if confidence is not None and not is_external_exit:
                 confidences.append(confidence)
 
@@ -155,6 +184,10 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
                     exit_channel_nodes[neighbor_id] = neighbor
                     exit_producers.setdefault(neighbor_id, set()).add(node_id)
                     exit_producer_ids.add(node_id)
+                    if is_external_exit:
+                        exit_external[neighbor_id] = (True, edge_props.get("external_host"))
+                    else:
+                        exit_external.setdefault(neighbor_id, (False, None))
                 continue
 
             steps.append(
@@ -170,7 +203,9 @@ def _walk_segment(store: Any, entry_id: str, min_confidence: float) -> dict:
                 visited.add(neighbor_id)
                 frontier.append((neighbor_id, depth + 1))
 
-    exits = _resolve_exits(store, exit_channel_nodes, exit_producers, min_confidence, confidences)
+    exits = _resolve_exits(
+        store, exit_channel_nodes, exit_producers, exit_external, min_confidence, confidences,
+    )
     return {
         "steps": steps,
         "step_parents": step_parents,
@@ -185,6 +220,7 @@ def _resolve_exits(
     store: Any,
     exit_channel_nodes: dict[str, NodeOut],
     exit_producers: dict[str, set[str]],
+    exit_external: dict[str, tuple[bool, str | None]],
     min_confidence: float,
     confidences: list[float],
 ) -> list[dict]:
@@ -193,7 +229,16 @@ def _resolve_exits(
     via_channel_id matches THIS channel (a producer node can have NEXT_SEGMENT
     edges to several different channels' consumers -- via_channel_id disambiguates
     which ones belong here), collect their destination ids (see module docstring
-    for why this one lookup already covers every cross-channel shape)."""
+    for why this one lookup already covers every cross-channel shape).
+
+    M10 T4: each exit entry additionally carries `external`/`external_host`
+    (sourced from `exit_external`, built by `_walk_segment` off the CALLS_HTTP/
+    PRODUCES edge(s) that reached this channel -- see that dict's own inline
+    comment) as SIBLING keys of `channel`, not nested inside it -- `channel` is
+    now a claim-agnostic node dict that never carries these props itself (see
+    linking/http_routes.py's own docstring). `external_host` is always present
+    (None when not external) rather than omitted, matching `mcp/schemas.py`'s
+    `TraceExit` field defaults."""
     exits = []
     for channel_id in sorted(exit_channel_nodes):
         next_ids: set[str] = set()
@@ -210,10 +255,13 @@ def _resolve_exits(
                 neighbor_id = neighbor.get("id")
                 if neighbor_id is not None:
                     next_ids.add(neighbor_id)
+        is_external, external_host = exit_external.get(channel_id, (False, None))
         exits.append(
             {
                 "channel": exit_channel_nodes[channel_id],
                 "next_entry_ids": sorted(next_ids),
+                "external": is_external,
+                "external_host": external_host,
             }
         )
     return exits
@@ -338,11 +386,12 @@ def trace_process(
     chain is only as trustworthy as its weakest link; 1.0 if the trace contains no
     edges at all (single node, no steps/exits -- nothing to doubt). AFTER M9 T1
     (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): IDENTICAL minimum-
-    over-walked-edges formula, EXCEPT an exit-hop (CALLS_HTTP/PRODUCES) into a
-    channel flagged `external=True` (linking/http_routes.py's tier 2a -- a real,
-    known hostname genuinely outside the workspace) no longer contributes its own
-    confidence to this minimum at all -- see `_walk_segment`'s own docstring for
-    exactly where that exclusion happens. Rationale: "env known, hostname outside
+    over-walked-edges formula, EXCEPT an exit-hop (CALLS_HTTP/PRODUCES) FLAGGED
+    `external=True` (linking/http_routes.py's tier 2a -- a real, known hostname
+    genuinely outside the workspace; M10 T4: the flag lives on the edge itself now,
+    not the destination channel node) no longer contributes its own confidence to
+    this minimum at all -- see `_walk_segment`'s own docstring for exactly where
+    that exclusion happens. Rationale: "env known, hostname outside
     the workspace" is HONEST KNOWLEDGE of a boundary, not the same kind of
     uncertainty a genuinely-unmodeled miss represents -- before this change, a
     single external HTTP call anywhere in an otherwise fully-resolved (static/1.0)
@@ -356,11 +405,13 @@ def trace_process(
 
     external_exit_count (M9 T1 review Important): the machine-readable companion
     to the exclusion above -- the number of exit entries across the WHOLE trace
-    whose channel is flagged `external=True` (0 = fully internal trace). Without
-    it, a programmatic/MCP consumer reading confidence=1.0 off the top would
-    conclude "fully traced" for a trace that actually stops at a workspace
-    boundary -- a human sees the external legs in the rendered exits, a machine
-    needs a top-level signal (exactly the precedent the `truncated` field set).
+    flagged `external=True` (0 = fully internal trace; M10 T4: the flag itself now
+    lives on the exit entry, sourced from the CALLS_HTTP edge, not the channel --
+    see `_walk_segment`/`_resolve_exits`). Without it, a programmatic/MCP consumer
+    reading confidence=1.0 off the top would conclude "fully traced" for a trace
+    that actually stops at a workspace boundary -- a human sees the external legs
+    in the rendered exits, a machine needs a top-level signal (exactly the
+    precedent the `truncated` field set).
     A count rather than a bool: strictly richer, same falsy "nothing to flag"
     reading. Counted per exit ENTRY (a channel appearing as an exit of two
     different segments counts twice -- matches what the rendered trace shows),
@@ -408,9 +459,10 @@ def trace_process(
 
         for exit_ in walked["exits"]:
             # M9 T1 review Important: count external-boundary exits (per exit
-            # entry, over the whole trace) -- the data is already collected (the
-            # channel node dict rides in every exit), this is pure bookkeeping.
-            if (exit_.get("channel") or {}).get("external"):
+            # entry, over the whole trace) -- the data is already collected (M10
+            # T4: `external` rides the exit entry itself now, sourced from the
+            # edge -- see _resolve_exits), this is pure bookkeeping.
+            if exit_.get("external"):
                 external_exit_count += 1
             for next_id in exit_["next_entry_ids"]:
                 if next_id not in visited_entries:

@@ -22,7 +22,8 @@ built) -- "NO static/1.0 without anchor, ever" is the task's own binding rule.
      routes narrowed to that ONE service; a UNIQUE form-match -> static/1.0. 2+
      matches within that one service -> unresolved (a real config ambiguity).
   2. ENV KNOWN, UNMAPPED (base_url_env set but neither source names a service):
-     unconditionally unresolved, no matching attempted -- synthetic channel carries
+     unconditionally unresolved, no matching attempted -- the CALLS_HTTP edge
+     (M10 T4 -- per-claim, not the shared synthetic channel any more) carries
      `config_ref=<env name>` for doctor/graph-inspection visibility.
   3. UNANCHORED (no base_url_env at all): matched across every service; a UNIQUE
      form-match -> heuristic/0.7 (never static, regardless of resolution_hint). 2+
@@ -259,8 +260,9 @@ def test_base_url_env_unmapped_is_unresolved_with_config_ref(tmp_path):
     registry NOR the (empty, here) env_sources-derived env_map can name a service
     for it -- unconditionally unresolved (no matching attempted at all: a
     coincidental path-shape match against an unrelated modeled service would be
-    actively wrong, not merely uncertain). Synthetic channel carries
-    config_ref=<env name> for doctor/graph-inspection visibility."""
+    actively wrong, not merely uncertain). M10 T4: config_ref=<env name> rides the
+    CALLS_HTTP EDGE (per-claim), not the shared synthetic channel -- see
+    linking/http_routes.py's own module docstring for why."""
     st = Staging(tmp_path / "s.db")
     chan = _route_channel("service-a", "GET", "/x")
     st.upsert_nodes([chan])
@@ -271,14 +273,17 @@ def test_base_url_env_unmapped_is_unresolved_with_config_ref(tmp_path):
     assert stats == {"calls_http": 1, "calls_http_unresolved": 1, "calls_http_external": 0}
 
     unresolved_chan = next(n for n in st.iter_nodes() if n.kind == "Channel" and n.id != chan.id)
-    assert unresolved_chan.props.get("config_ref") == "OTHER_URL"
-    # M9 T1: "OTHER_URL" isn't in env_sources at all (empty here) -- NOT the same as
-    # a hostname that fails to match a workspace service (that's the "external" tier
-    # below) -- no external prop at all on this genuinely-unmapped channel.
+    assert "config_ref" not in unresolved_chan.props  # M10 T4: never a node prop any more
     assert "external" not in unresolved_chan.props
     assert "external_host" not in unresolved_chan.props
     edge = next(e for e in st.iter_edges() if e.type == "CALLS_HTTP")
     assert edge.dst == unresolved_chan.id
+    assert edge.props.get("config_ref") == "OTHER_URL"
+    # M9 T1: "OTHER_URL" isn't in env_sources at all (empty here) -- NOT the same as
+    # a hostname that fails to match a workspace service (that's the "external" tier
+    # below) -- no external prop at all on this genuinely-unmapped claim's edge.
+    assert "external" not in edge.props
+    assert "external_host" not in edge.props
 
 
 def test_claim_without_base_url_env_considers_all_services(tmp_path):
@@ -421,7 +426,11 @@ def test_env_map_hostname_label_not_a_workspace_service_falls_to_unmapped(tmp_pa
 
     assert stats == {"calls_http": 1, "calls_http_unresolved": 0, "calls_http_external": 1}
     unresolved_chan = next(n for n in st.iter_nodes() if n.kind == "Channel" and n.id != chan.id)
-    assert unresolved_chan.props.get("config_ref") == "SOME_URL"
+    assert "config_ref" not in unresolved_chan.props  # M10 T4: moved to the edge
+    edge = next(
+        e for e in st.iter_edges() if e.type == "CALLS_HTTP" and e.dst == unresolved_chan.id
+    )
+    assert edge.props.get("config_ref") == "SOME_URL"
 
 
 # -- M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): tier-2 split --
@@ -433,6 +442,11 @@ def test_env_map_hostname_label_not_a_workspace_service_falls_to_unmapped(tmp_pa
 
 
 def test_env_map_hostname_not_a_workspace_service_is_external_tier(tmp_path):
+    """M10 T4: `external`/`external_host`/`config_ref` all ride the CALLS_HTTP EDGE
+    now (EdgeRec.props -- kafka's own `_props_for`/config_ref-on-edge convention is
+    the precedent, see linking/http_routes.py's module docstring) -- the channel
+    node itself stays a clean, claim-agnostic `?`-owner unresolved node, carrying
+    only what's fully determined by (verb, path_template) alone."""
     helm = tmp_path / "values.yaml"
     helm.write_text('SOME_URL: "http://api-gateway.prod.svc.cluster.local"\n')
     st = Staging(tmp_path / "s.db")
@@ -446,16 +460,20 @@ def test_env_map_hostname_not_a_workspace_service_is_external_tier(tmp_path):
     assert stats == {"calls_http": 1, "calls_http_unresolved": 0, "calls_http_external": 1}
     ext_chan = next(n for n in st.iter_nodes() if n.kind == "Channel" and n.id != chan.id)
     assert ext_chan.id == "chan:http:?:GET /x"  # id form UNCHANGED (owner=None -> "?")
-    assert ext_chan.props.get("config_ref") == "SOME_URL"
-    assert ext_chan.props.get("external") is True
-    assert ext_chan.props.get("external_host") == "api-gateway.prod.svc.cluster.local"
     assert ext_chan.props.get("unresolved") is True
+    # nothing claim-specific lives on the node any more -- the whole point of the fix.
+    assert "config_ref" not in ext_chan.props
+    assert "external" not in ext_chan.props
+    assert "external_host" not in ext_chan.props
 
     edge = next(e for e in st.iter_edges() if e.type == "CALLS_HTTP")
     assert edge.dst == ext_chan.id
     # "no unearned confidence" -- IDENTICAL to the plain unmapped tier, M9 T1's
     # binding constraint (the trace-level payoff is in query/traverse.py instead).
     assert edge.resolution == "heuristic" and edge.confidence == 0.5
+    assert edge.props.get("config_ref") == "SOME_URL"
+    assert edge.props.get("external") is True
+    assert edge.props.get("external_host") == "api-gateway.prod.svc.cluster.local"
 
 
 def test_env_known_value_not_url_shaped_is_unmapped_not_external(tmp_path):
@@ -475,9 +493,13 @@ def test_env_known_value_not_url_shaped_is_unmapped_not_external(tmp_path):
 
     assert stats == {"calls_http": 1, "calls_http_unresolved": 1, "calls_http_external": 0}
     chan = next(n for n in st.iter_nodes() if n.kind == "Channel")
-    assert chan.props.get("config_ref") == "SOME_URL"
+    assert "config_ref" not in chan.props  # M10 T4: moved to the edge
     assert "external" not in chan.props
     assert "external_host" not in chan.props
+    edge = next(e for e in st.iter_edges() if e.type == "CALLS_HTTP")
+    assert edge.props.get("config_ref") == "SOME_URL"
+    assert "external" not in edge.props
+    assert "external_host" not in edge.props
 
 
 def test_anchored_via_env_map_wins_over_external_even_though_hostname_also_present(
@@ -596,18 +618,21 @@ def test_calls_http_total_counts_both_resolved_and_unresolved(tmp_path):
     assert stats == {"calls_http": 2, "calls_http_unresolved": 1, "calls_http_external": 0}
 
 
-# -- M9 final review Important-1: shared unresolved-channel id collision -- two+
-# claims that share (verb, path_template) collapse onto ONE synthetic channel id
-# (see linking/http_routes.py's own "On NO match" docstring paragraph) even when
-# they come from DIFFERENT tiers (external/unmapped/ambiguous); a plain last-
-# write-wins on the whole node used to let external/external_host leak onto, or
-# vanish from, that shared node depending on claims_for's own (service, relpath,
-# payload_json) order. `_reconcile_shared_channel_external_props` (linking/
-# http_routes.py) now merges FAIL-CLOSED: external/external_host survive ONLY
-# when EVERY contributing claim was external AND named the SAME host. Claim order
-# is controlled via relpath ("a_first.py" sorts before "b_second.py" in
-# claims_for's own (service, relpath, payload_json) ordering -- the same trick
-# the M9 final review's own probe2 uses) rather than left to chance. --
+# -- M10 T4 (per-edge external props -- the PROPER fix replacing the M9 final
+# review's fail-closed merge palliative, `_reconcile_shared_channel_external_
+# props`, now DELETED): two+ claims that share (verb, path_template) still
+# collapse onto ONE synthetic channel id (see linking/http_routes.py's own "On
+# NO match" docstring paragraph), even when they come from DIFFERENT tiers
+# (external/unmapped/ambiguous) -- but `external`/`external_host`/`config_ref`
+# no longer live on that shared NODE at all (EdgeRec.props instead, kafka's own
+# `_props_for` convention -- see the module docstring's updated "SHARED-CHANNEL"
+# section). Each claim's CALLS_HTTP edge carries its OWN props independently, so
+# there is nothing left for two colliding claims to clobber or disagree about --
+# the collision class the M9 palliative had to fail-closed-merge around is GONE,
+# not merely handled more carefully. These four scenarios (a/b/c/d) are kept,
+# renamed/rewritten, specifically to make that disappearance visible in history:
+# same setups the M9 final review used to prove the merge rule correct, now
+# proving there is no merge rule left to need. --
 
 _COLLISION_VERB = "POST"
 _COLLISION_TEMPLATE = "/events"
@@ -650,22 +675,29 @@ def _only_channel(st: Staging) -> object:
     return chans[0]
 
 
+def _flat_edge_props(edge) -> dict:
+    """Mirrors pipeline/load.py's `_edge_props` flattening (core fields + e.props
+    merged into one dict) -- the shape `neighbors()` actually hands back off a
+    real store (see stores/falkordb/store.py's `_one_way`: `e.properties`)."""
+    return {**edge.props, "confidence": edge.confidence, "resolution": edge.resolution}
+
+
 @pytest.mark.parametrize(
     "order", ["external-then-unmapped", "unmapped-then-external"],
 )
-def test_collision_external_unmapped_order_independent_strip_and_no_exclusion(tmp_path, order):
+def test_collision_external_and_unmapped_edges_keep_independent_props(tmp_path, order):
     """(a)/(b): an external (tier 2a) and an unmapped (tier 2b) claim share the
     SAME (verb, path_template) -> SAME synthetic channel id, in BOTH claims_for
-    orders. Pins two things per order: (1) the shared node carries NEITHER
-    `external` NOR `external_host` (the fail-closed strip, order-independent --
-    the direct fix for the RED probe2 order-dependence), and (2) a trace walking
-    the external claim's own edge into that now-honest node does NOT exclude the
-    exit from the aggregate confidence floor (query/traverse.py's
-    `is_external_exit` reads the NEIGHBOR node's own `external` prop -- absent
-    here, so the edge's real heuristic/0.5 correctly counts, matching the
-    "counters stay per-claim, only NODE props degrade" rule -- an unearned
-    exclusion here would be exactly the confidence-floor violation the review
-    flagged)."""
+    orders. The shared NODE carries NEITHER external/external_host/config_ref
+    (nothing claim-specific lives there any more, regardless of order -- no
+    last-writer-wins to be order-dependent about), while EACH EDGE independently
+    keeps its own claim's props. Trace payoff (the fix's whole point): the
+    external claim's OWN edge is now correctly EXCLUDED from a trace's confidence
+    floor -- the M9 palliative had to give this up (fail-closed: strip on ANY
+    sibling disagreement, since the shared NODE alone could never tell which hop
+    was the external one); per-edge, there's no ambiguity to be conservative
+    about any more. The unmapped sibling's own edge is symmetric proof: it does
+    NOT wrongly inherit an exclusion it never earned."""
     helm = tmp_path / "values.yaml"
     helm.write_text(f'GW_URL: "http://{_GW_HOST}"\n')
     st = Staging(tmp_path / "s.db")
@@ -686,29 +718,43 @@ def test_collision_external_unmapped_order_independent_strip_and_no_exclusion(tm
     chan = _only_channel(st)
     assert "external" not in chan.props
     assert "external_host" not in chan.props
+    assert "config_ref" not in chan.props  # never a node prop any more, either tier
 
-    edge = next(
-        e for e in st.iter_edges()
-        if e.type == "CALLS_HTTP" and e.src == ext_src and e.dst == chan.id
-    )
-    assert edge.resolution == "heuristic" and edge.confidence == 0.5  # honest, unchanged
+    ext_edge = next(e for e in st.iter_edges() if e.src == ext_src)
+    assert ext_edge.dst == chan.id
+    assert ext_edge.resolution == "heuristic" and ext_edge.confidence == 0.5  # honest, unchanged
+    assert ext_edge.props.get("external") is True
+    assert ext_edge.props.get("external_host") == _GW_HOST
+    assert ext_edge.props.get("config_ref") == "GW_URL"
 
-    store = _MiniTraceStore(
-        ext_src, {"id": chan.id, **chan.props},
-        {"confidence": edge.confidence, "resolution": edge.resolution},
-    )
-    result = traverse.trace_process(store, ext_src, max_segments=12, min_confidence=0.3)
-    # NOT excluded: would read 1.0 (the "no edges to doubt" trivial default) had
-    # the stale external=True wrongly survived the merge and excluded this hop.
-    assert result["confidence"] == 0.5
-    assert result["external_exit_count"] == 0
+    unm_edge = next(e for e in st.iter_edges() if e.src == unm_src)
+    assert unm_edge.dst == chan.id
+    assert unm_edge.props.get("config_ref") == "MYSTERY_URL"
+    assert "external" not in unm_edge.props
+    assert "external_host" not in unm_edge.props
+
+    ext_store = _MiniTraceStore(ext_src, {"id": chan.id, **chan.props}, _flat_edge_props(ext_edge))
+    ext_result = traverse.trace_process(ext_store, ext_src, max_segments=12, min_confidence=0.3)
+    # Excluded: the "no edges to doubt" trivial default (1.0), not the edge's own
+    # honest 0.5 -- proves the external claim's OWN edge gets its deserved
+    # exclusion now, order-independent.
+    assert ext_result["confidence"] == 1.0
+    assert ext_result["external_exit_count"] == 1
+
+    unm_store = _MiniTraceStore(unm_src, {"id": chan.id, **chan.props}, _flat_edge_props(unm_edge))
+    unm_result = traverse.trace_process(unm_store, unm_src, max_segments=12, min_confidence=0.3)
+    # NOT excluded: the unmapped sibling never earned it -- would wrongly read 1.0
+    # had it leaked an exclusion from the external sibling sharing this node.
+    assert unm_result["confidence"] == 0.5
+    assert unm_result["external_exit_count"] == 0
 
 
-def test_collision_two_external_different_hosts_strips_props(tmp_path):
+def test_collision_two_external_edges_keep_their_own_distinct_hosts(tmp_path):
     """(c): two external (tier 2a) claims share (verb, path_template) but resolve
-    to DIFFERENT real hostnames -- host disagreement disqualifies external props
-    on the shared node exactly like an outright non-external sibling does (never
-    "keep whichever claim happened to write last")."""
+    to DIFFERENT real hostnames. Under the OLD node-prop design this was a genuine
+    disagreement the shared node had to arbitrate (fail-closed: strip both).
+    Per-edge, there is nothing to arbitrate -- each edge simply keeps its own
+    claim's host, independently."""
     helm = tmp_path / "values.yaml"
     helm.write_text(
         f'GW_URL: "http://{_GW_HOST}"\n'
@@ -728,13 +774,20 @@ def test_collision_two_external_different_hosts_strips_props(tmp_path):
     assert "external" not in chan.props
     assert "external_host" not in chan.props
 
+    edge_a = next(e for e in st.iter_edges() if e.src == "sym:caller:a")
+    edge_b = next(e for e in st.iter_edges() if e.src == "sym:caller:b")
+    assert edge_a.props.get("external") is True and edge_b.props.get("external") is True
+    assert edge_a.props.get("external_host") == _GW_HOST
+    assert edge_b.props.get("external_host") == "billing.ext.prod.env"
 
-def test_collision_two_external_same_host_keeps_props(tmp_path):
-    """(d): two DIFFERENT env names that both resolve to the IDENTICAL real
-    hostname (a plausible alias/legacy-env-name shape) -- unlike (c), every
-    contributing claim agrees, so the merge KEEPS external/external_host on the
-    shared node (the positive case: the fail-closed rule must not over-strip when
-    the claims genuinely agree)."""
+
+def test_collision_two_external_edges_with_same_host_are_independent_not_merged(tmp_path):
+    """(d): two DIFFERENT env names that both happen to resolve to the IDENTICAL
+    real hostname -- still two fully independent edges (no merge/dedup of props
+    ever attempted, unlike the old node-level design's positive "agreement" case).
+    Each edge keeps its OWN `config_ref` (the env name that produced IT) even
+    though `external_host` happens to coincide -- proving this isn't secretly
+    still a shared-node write under the hood."""
     helm = tmp_path / "values.yaml"
     helm.write_text(
         f'GW_URL: "http://{_GW_HOST}"\n'
@@ -751,5 +804,13 @@ def test_collision_two_external_same_host_keeps_props(tmp_path):
 
     assert stats == {"calls_http": 2, "calls_http_unresolved": 0, "calls_http_external": 2}
     chan = _only_channel(st)
-    assert chan.props.get("external") is True
-    assert chan.props.get("external_host") == _GW_HOST
+    assert "external" not in chan.props
+    assert "external_host" not in chan.props
+
+    edge_a = next(e for e in st.iter_edges() if e.src == "sym:caller:a")
+    edge_b = next(e for e in st.iter_edges() if e.src == "sym:caller:b")
+    assert edge_a.props.get("external") is True and edge_b.props.get("external") is True
+    assert edge_a.props.get("external_host") == _GW_HOST
+    assert edge_b.props.get("external_host") == _GW_HOST
+    assert edge_a.props.get("config_ref") == "GW_URL"
+    assert edge_b.props.get("config_ref") == "GW_URL_ALIAS"

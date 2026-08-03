@@ -695,11 +695,13 @@ def _trace_tree(result: dict) -> Tree:
             next_ids = ex.get("next_entry_ids") or []
             if next_ids:
                 dest = escape(", ".join(next_ids))
-            elif channel.get("external"):
-                # M9 T1: a real, known hostname outside the workspace (linking/
-                # http_routes.py's tier 2a) -- honest boundary knowledge, shown
-                # distinctly from a genuine "unresolved" modeling gap below.
-                dest = f"external {escape(str(channel.get('external_host') or '?'))}"
+            elif ex.get("external"):
+                # M9 T1 (M10 T4: read off the EXIT entry -- edge-sourced now, see
+                # query/traverse.py -- not the channel node): a real, known
+                # hostname outside the workspace (linking/http_routes.py's tier
+                # 2a) -- honest boundary knowledge, shown distinctly from a
+                # genuine "unresolved" modeling gap below.
+                dest = f"external {escape(str(ex.get('external_host') or '?'))}"
             else:
                 dest = "unresolved"
             seg_node.add(f"channel {chan_label} -> {dest}")
@@ -733,15 +735,17 @@ def _trace_mermaid(result: dict) -> str:
     brief) -- 0 collapsed steps (the common case: short segments, or --full)
     leaves the label exactly as before.
 
-    M9 T1: a real, known hostname outside the workspace (channel.external=True,
-    linking/http_routes.py's tier 2a) that has NO resolved next_entry_ids (the
-    normal case -- an external target has no in-workspace consumer to resolve to
-    by construction) gets a dedicated leaf node (`X{n}["external <host>"]`, `n` a
-    simple render-local counter -- Channel ids aren't valid bare mermaid node
-    tokens, same reasoning as segments using plain `S{i}`) plus one arrow into it,
-    same label convention as a resolved segment-to-segment arrow. A genuinely
-    PLAIN unresolved exit (no external flag) is UNCHANGED: still silently dropped,
-    exactly as any dangling/unresolved next hop always has been."""
+    M9 T1: a real, known hostname outside the workspace (exit.external=True --
+    M10 T4: read off the EXIT entry, edge-sourced, see query/traverse.py, not
+    channel.external any more -- linking/http_routes.py's tier 2a) that has NO
+    resolved next_entry_ids (the normal case -- an external target has no
+    in-workspace consumer to resolve to by construction) gets a dedicated leaf
+    node (`X{n}["external <host>"]`, `n` a simple render-local counter -- Channel
+    ids aren't valid bare mermaid node tokens, same reasoning as segments using
+    plain `S{i}`) plus one arrow into it, same label convention as a resolved
+    segment-to-segment arrow. A genuinely PLAIN unresolved exit (no external flag)
+    is UNCHANGED: still silently dropped, exactly as any dangling/unresolved next
+    hop always has been."""
     segments = result.get("segments", [])
     entry_to_index = {
         seg["entry"]["id"]: i
@@ -766,8 +770,8 @@ def _trace_mermaid(result: dict) -> str:
                 if j is not None:
                     lines.append(f"    S{i} -->|{chan_label}| S{j}")
                     drew_resolved_arrow = True
-            if not drew_resolved_arrow and channel.get("external"):
-                host = str(channel.get("external_host") or "?").replace('"', "'")
+            if not drew_resolved_arrow and ex.get("external"):
+                host = str(ex.get("external_host") or "?").replace('"', "'")
                 leaf = f"X{external_leaf_count}"
                 external_leaf_count += 1
                 lines.append(f'    {leaf}["external {host}"]')

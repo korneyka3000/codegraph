@@ -386,10 +386,12 @@ def _external_exit_hop_diff(result: dict) -> list[str]:
     THIS trace (reached via publish_submitted_event's own CALLS, itself reached via
     DocSubmissionWorkflow.run's INVOKES_ACTIVITY, itself reached via
     submit_document's own temporal_start CALLS -- all intra-segment edge types), and
-    (b) the `external`/`external_host` props survive the FULL round trip this
-    `result` was built from -- `GraphQuery.trace_process` over the LIVE FalkorDB-
-    backed store (not staging), closing the M9-T1 reviewer's own carry
-    (progress.md M9-T1: "external=True через реальный FalkorDB round-trip")."""
+    (b) the `external`/`external_host` fields (M10 T4 -- exit-entry-level now,
+    edge-sourced, see query/traverse.py's `_resolve_exits`; were `channel`-nested
+    pre-M10) survive the FULL round trip this `result` was built from --
+    `GraphQuery.trace_process` over the LIVE FalkorDB-backed store (not staging),
+    closing the M9-T1 reviewer's own carry (progress.md M9-T1: "external=True через
+    реальный FalkorDB round-trip")."""
     problems: list[str] = []
     segments = result["segments"]
     submit_segment = next(
@@ -404,30 +406,29 @@ def _external_exit_hop_diff(result: dict) -> list[str]:
             "external hop: segment with entry=app.routes.submit.submit_document not found"
         )
         return problems
-    exits_by_channel = {
-        (ex.get("channel") or {}).get("id"): ex.get("channel") or {}
-        for ex in submit_segment.get("exits", [])
+    exits_by_channel_id = {
+        (ex.get("channel") or {}).get("id"): ex for ex in submit_segment.get("exits", [])
     }
-    channel = exits_by_channel.get(AUDIT_CHANNEL)
-    if channel is None:
+    exit_ = exits_by_channel_id.get(AUDIT_CHANNEL)
+    if exit_ is None:
         problems.append(
             f"external hop: segment 1 (submit_document) must have an exit into "
             f"{AUDIT_CHANNEL!r} (AuditClient.submit_audit_event's NEW external "
             f"target, reached via CALLS from publish_submitted_event) -- exit "
-            f"channels found: {sorted(c for c in exits_by_channel if c is not None)}"
+            f"channels found: {sorted(c for c in exits_by_channel_id if c is not None)}"
         )
         return problems
-    if channel.get("external") is not True:
+    if exit_.get("external") is not True:
         problems.append(
-            f"external hop: channel {AUDIT_CHANNEL!r} read back off the LIVE "
-            f"FalkorDB-backed trace must carry external=True, got {channel.get('external')!r} "
-            f"(full channel props: {channel})"
+            f"external hop: exit into {AUDIT_CHANNEL!r} read back off the LIVE "
+            f"FalkorDB-backed trace must carry external=True, got {exit_.get('external')!r} "
+            f"(full exit: {exit_})"
         )
-    if channel.get("external_host") != AUDIT_HOST:
+    if exit_.get("external_host") != AUDIT_HOST:
         problems.append(
-            f"external hop: channel {AUDIT_CHANNEL!r} read back off the LIVE "
+            f"external hop: exit into {AUDIT_CHANNEL!r} read back off the LIVE "
             f"FalkorDB-backed trace must carry external_host={AUDIT_HOST!r}, got "
-            f"{channel.get('external_host')!r} (full channel props: {channel})"
+            f"{exit_.get('external_host')!r} (full exit: {exit_})"
         )
     return problems
 
@@ -587,18 +588,23 @@ def test_m9_gate(tmp_path, falkordb_cfg):
             )
 
         # -- M9 T1 (task-5): external HTTP target -- staging-level props/counter --
-        # NOTE: external/external_host/unresolved/config_ref live on the
-        # CHANNEL NODE (make_channel_node's own extra_props), NOT on the
-        # CALLS_HTTP edge itself (EdgeRec carries no props at all for this
-        # fallback shape, see linking/http_routes.py's own
-        # _unresolved_channel_and_edge) -- confirmed by reading
-        # test_linking_http_routes.py's own test_env_map_hostname_not_a_
-        # workspace_service_is_external_tier, which checks `ext_chan.props`,
-        # never `edge.props`.
+        # NOTE (M10 T4 -- was NODE-level pre-M10, see git history for the old
+        # shape): external/external_host/config_ref live on the CALLS_HTTP EDGE
+        # itself now (EdgeRec.props, kafka's own `_props_for` convention -- see
+        # linking/http_routes.py's own module docstring, "SHARED-CHANNEL PROPS"
+        # section, for the full replaced-palliative rationale); the CHANNEL node
+        # keeps only `unresolved=True` -- confirmed by reading
+        # test_linking_http_routes.py's own
+        # test_env_map_hostname_not_a_workspace_service_is_external_tier, which
+        # checks `edge.props`, never `ext_chan.props`, for these three keys.
         _pin_edge(
             problems, staging, "external CALLS_HTTP (AuditClient)", "CALLS_HTTP",
             AUDIT_CALLSITE, AUDIT_CHANNEL,
             resolution="heuristic", confidence=0.5,
+            props_subset={
+                "external": True, "external_host": AUDIT_HOST,
+                "config_ref": "SERVICE_AUDIT_URL",
+            },
         )
         audit_chan_node = next(
             (n for n in staging.iter_nodes() if n.id == AUDIT_CHANNEL), None
@@ -606,16 +612,24 @@ def test_m9_gate(tmp_path, falkordb_cfg):
         if audit_chan_node is None:
             problems.append(f"external channel {AUDIT_CHANNEL!r} not found in staging")
         else:
-            for key, want in (
-                ("external", True), ("external_host", AUDIT_HOST), ("unresolved", True),
-                ("config_ref", "SERVICE_AUDIT_URL"),
-            ):
-                got = audit_chan_node.props.get(key)
-                if got != want:
-                    problems.append(
-                        f"external channel {AUDIT_CHANNEL!r}: expected props[{key!r}] "
-                        f"== {want!r}, got {got!r} (full props: {audit_chan_node.props})"
-                    )
+            if audit_chan_node.props.get("unresolved") is not True:
+                problems.append(
+                    f"external channel {AUDIT_CHANNEL!r}: expected props['unresolved'] "
+                    f"== True, got {audit_chan_node.props.get('unresolved')!r} "
+                    f"(full props: {audit_chan_node.props})"
+                )
+            # M10 T4: nothing claim-specific survives on the shared node any more --
+            # this is the actual payoff of the fix, worth pinning as a NEGATIVE too.
+            leaked = [
+                k for k in ("external", "external_host", "config_ref")
+                if k in audit_chan_node.props
+            ]
+            if leaked:
+                problems.append(
+                    f"external channel {AUDIT_CHANNEL!r}: props {leaked} must NOT "
+                    f"live on the shared channel node any more (M10 T4 moved them to "
+                    f"the edge) -- full props: {audit_chan_node.props}"
+                )
         if link_stats.get("calls_http_external", 0) != 1:
             problems.append(
                 f"calls_http_external must be exactly 1 (AuditClient.submit_audit_event, "

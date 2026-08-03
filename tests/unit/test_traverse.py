@@ -267,11 +267,17 @@ def test_min_confidence_filters_next_segment_transition():
 
 
 # -- M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): external
-# exit-hops (CALLS_HTTP/PRODUCES into a channel flagged external=True -- a
-# documented boundary outside the workspace, see linking/http_routes.py) are
-# EXCLUDED from the trace/segment aggregate confidence floor -- honest knowledge
-# of a boundary must not drag a trace down the same way a genuine modeling gap
-# does, even though the EDGE itself still (honestly) carries heuristic/0.5.
+# exit-hops (CALLS_HTTP/PRODUCES flagged external=True -- a documented boundary
+# outside the workspace, see linking/http_routes.py) are EXCLUDED from the
+# trace/segment aggregate confidence floor -- honest knowledge of a boundary must
+# not drag a trace down the same way a genuine modeling gap does, even though the
+# EDGE itself still (honestly) carries heuristic/0.5.
+#
+# M10 T4 (linking/http_routes.py's own module docstring, "SHARED-CHANNEL PROPS"
+# section): `external`/`external_host` moved from the channel NODE's own props to
+# the CALLS_HTTP/PRODUCES EDGE's -- the fixtures below set them on `add_edge`, not
+# `add_node`, and exit assertions read `exits[i]["external"]`/`["external_host"]`
+# (sibling keys of `exits[i]["channel"]` now), not `exits[i]["channel"]["external"]`.
 
 
 def test_external_exit_hop_confidence_excluded_from_aggregate_stays_1_0():
@@ -281,13 +287,13 @@ def test_external_exit_hop_confidence_excluded_from_aggregate_stays_1_0():
     store.add_node("strong_step", service="a", kind="Function")
     store.add_node(
         "chan:http:?:GET /external",
-        kind="Channel", name="GET /external", channel_kind="http_route",
-        unresolved=True, external=True, external_host="api-gateway.prod.svc.cluster.local",
+        kind="Channel", name="GET /external", channel_kind="http_route", unresolved=True,
     )
     store.add_edge("entry", "CALLS", "strong_step", confidence=1.0, resolution="static")
     store.add_edge(
         "entry", "CALLS_HTTP", "chan:http:?:GET /external",
         confidence=0.5, resolution="heuristic",
+        external=True, external_host="api-gateway.prod.svc.cluster.local",
     )
 
     result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
@@ -297,8 +303,9 @@ def test_external_exit_hop_confidence_excluded_from_aggregate_stays_1_0():
     # heuristic/0.5 edge confidence -- EXCLUDED from the aggregate, never hidden.
     exits = result["segments"][0]["exits"]
     assert len(exits) == 1
-    assert exits[0]["channel"]["external"] is True
-    assert exits[0]["channel"]["external_host"] == "api-gateway.prod.svc.cluster.local"
+    assert exits[0]["external"] is True
+    assert exits[0]["external_host"] == "api-gateway.prod.svc.cluster.local"
+    assert "external" not in exits[0]["channel"]  # the node itself carries neither prop
     # M9 T1 review Important: the machine-readable top-level signal -- a
     # programmatic/MCP consumer reading confidence=1.0 alone would conclude
     # "fully traced" for a trace that actually stops at a workspace boundary (a
@@ -318,14 +325,14 @@ def test_external_exclusion_preserves_min_over_remaining_edges():
     store.add_node("weak_step", service="a", kind="Function")
     store.add_node(
         "chan:http:?:GET /external",
-        kind="Channel", name="GET /external", channel_kind="http_route",
-        unresolved=True, external=True, external_host="api-gateway.prod.svc.cluster.local",
+        kind="Channel", name="GET /external", channel_kind="http_route", unresolved=True,
     )
     store.add_edge("entry", "CALLS", "strong_step", confidence=1.0, resolution="static")
     store.add_edge("entry", "CALLS", "weak_step", confidence=0.6, resolution="heuristic")
     store.add_edge(
         "entry", "CALLS_HTTP", "chan:http:?:GET /external",
         confidence=0.5, resolution="heuristic",
+        external=True, external_host="api-gateway.prod.svc.cluster.local",
     )
 
     result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)
@@ -368,19 +375,23 @@ def test_external_exit_count_sums_across_segments():
     store.add_node("entryB", service="b", kind="Function")
     store.add_node("chan:event_type:E", kind="Channel", channel_kind="event_type")
     store.add_node(
-        "chan:http:?:GET /ext-a", kind="Channel", channel_kind="http_route",
-        unresolved=True, external=True, external_host="gw-a.prod",
+        "chan:http:?:GET /ext-a", kind="Channel", channel_kind="http_route", unresolved=True,
     )
     store.add_node(
-        "chan:http:?:GET /ext-b", kind="Channel", channel_kind="http_route",
-        unresolved=True, external=True, external_host="gw-b.prod",
+        "chan:http:?:GET /ext-b", kind="Channel", channel_kind="http_route", unresolved=True,
     )
-    store.add_edge("entryA", "CALLS_HTTP", "chan:http:?:GET /ext-a", confidence=0.5)
+    store.add_edge(
+        "entryA", "CALLS_HTTP", "chan:http:?:GET /ext-a", confidence=0.5,
+        external=True, external_host="gw-a.prod",
+    )
     store.add_edge("entryA", "PRODUCES", "chan:event_type:E")
     store.add_edge(
         "entryA", "NEXT_SEGMENT", "entryB", via_channel_id="chan:event_type:E", derived=True
     )
-    store.add_edge("entryB", "CALLS_HTTP", "chan:http:?:GET /ext-b", confidence=0.5)
+    store.add_edge(
+        "entryB", "CALLS_HTTP", "chan:http:?:GET /ext-b", confidence=0.5,
+        external=True, external_host="gw-b.prod",
+    )
 
     result = traverse.trace_process(store, "entryA", max_segments=12, min_confidence=0.3)
     assert result["external_exit_count"] == 2
@@ -417,12 +428,12 @@ def test_external_exit_with_no_other_edges_at_all_is_the_trivial_1_0_case():
     store.add_node("entry", service="a", kind="Function")
     store.add_node(
         "chan:http:?:GET /external",
-        kind="Channel", name="GET /external", channel_kind="http_route",
-        unresolved=True, external=True, external_host="api-gateway.prod.svc.cluster.local",
+        kind="Channel", name="GET /external", channel_kind="http_route", unresolved=True,
     )
     store.add_edge(
         "entry", "CALLS_HTTP", "chan:http:?:GET /external",
         confidence=0.5, resolution="heuristic",
+        external=True, external_host="api-gateway.prod.svc.cluster.local",
     )
 
     result = traverse.trace_process(store, "entry", max_segments=12, min_confidence=0.3)

@@ -166,14 +166,22 @@ class TraceExit(BaseModel):
 
     M9 T1 (docs/superpowers/reports/2026-07-24-pilot-rerun-3.md §3): `channel` is a
     plain, untyped dict (whatever the graph node's own properties are), not a
-    nested pydantic model -- linking/http_routes.py's tier-2a `external`/
-    `external_host` props therefore already validate here with NO schema change at
-    all, additively, alongside every other Channel prop (owner_service, config_ref,
-    unresolved, ...) this field has always carried verbatim. See
+    nested pydantic model -- every OTHER Channel prop (owner_service, config_ref,
+    unresolved, ...) this field has always carried verbatim still does.
+
+    M10 T4 (linking/http_routes.py's own module docstring, "SHARED-CHANNEL PROPS"
+    section): `external`/`external_host` moved OFF the channel node's own props
+    (they now ride the CALLS_HTTP edge instead, per-claim -- see that module's
+    docstring for why) -- `channel` therefore no longer carries them at all.
+    `TraceExit` grows two ADDITIVE fields mirroring that move instead:
+    `external: bool = False` / `external_host: str | None = None`, populated by
+    query/traverse.py's `_resolve_exits` off the walked edge(s). See
     tests/unit/test_mcp_schemas.py for a pinned proof."""
 
     channel: dict
     next_entry_ids: list[str]
+    external: bool = False
+    external_host: str | None = None
 
 
 class TraceSegment(BaseModel):
@@ -188,12 +196,13 @@ class TraceSegment(BaseModel):
 class TraceProcessOutput(BaseModel):
     segments: list[TraceSegment]
     # min по всем пройденным рёбрам (шаги + переходы); 1.0 если рёбер нет. M9 T1:
-    # exit-хопы в channel.external=True (см. TraceExit) ИСКЛЮЧЕНЫ из этого минимума
-    # -- см. query/traverse.py::trace_process докстринг за полной формулой до/после.
+    # exit-хопы с exit.external=True (см. TraceExit; M10 T4 -- было channel.
+    # external=True) ИСКЛЮЧЕНЫ из этого минимума -- см. query/traverse.py::
+    # trace_process докстринг за полной формулой до/после.
     confidence: float
     truncated: bool  # true если truncated у любого сегмента ИЛИ max_segments срезал список
     # M9 T1 review Important: machine-readable спутник exclusion'а выше -- число
-    # exit-входов ВСЕЙ трассы с channel.external=True (0 = полностью внутренний
+    # exit-входов ВСЕЙ трассы с exit.external=True (0 = полностью внутренний
     # трейс). Без него программный/MCP-потребитель, читающий confidence=1.0 с
     # верха, заключил бы «fully traced» для трассы, упирающейся в границу
     # воркспейса (человек видит external-леги в рендере, машина -- нет; прецедент

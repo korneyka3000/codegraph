@@ -71,12 +71,14 @@ tiers, evaluated per claim by `_target`:
            service set) -- not modeling uncertainty, and the pilot's own dominant
            unresolved shape. Still unconditionally unresolved, no matching attempted
            (same reasoning as 2b: a coincidental path-shape match against an
-           unrelated MODELED service would be actively wrong): the synthetic Channel
-           carries `external=True` + `external_host=<hostname>` ADDITIVELY alongside
-           the pre-existing `unresolved=True` + `config_ref=<env name>` -- id form
-           UNCHANGED (owner=None -> "?", see `_route_table`'s own owner-is-None skip:
-           an external target is still not a real in-workspace route future claims
-           should match against). Counted separately, in `calls_http_external`, NOT
+           unrelated MODELED service would be actively wrong): the CALLS_HTTP EDGE
+           (M10 T4 -- per-claim, see "SHARED-CHANNEL PROPS" below for why NOT the
+           channel) carries `external=True` + `external_host=<hostname>` ADDITIVELY
+           alongside `config_ref=<env name>`; the synthetic Channel itself keeps
+           only the pre-existing `unresolved=True` -- id form UNCHANGED (owner=None
+           -> "?", see `_route_table`'s own owner-is-None skip: an external target
+           is still not a real in-workspace route future claims should match
+           against). Counted separately, in `calls_http_external`, NOT
            `calls_http_unresolved` -- see `link`'s own docstring. Resolution/
            confidence stay heuristic/0.5 -- IDENTICAL to 2b, "no unearned confidence"
            (this module's binding constraint, unchanged by the split); what changes
@@ -87,7 +89,8 @@ tiers, evaluated per claim by `_target`:
        2b. UNMAPPED -- env_sources has NOTHING usable for this env name at all
            (absent entirely, a non-string value, or a string that doesn't parse as a
            URL with a hostname -- see env_map.py's own docstring for the exact
-           non-cases). Unchanged from the pre-M9 design: unconditionally unresolved,
+           non-cases). Unchanged from the pre-M9 design in every way except WHERE it
+           lands (M10 T4): unconditionally unresolved, the edge carries
            `config_ref=<env name>` only (no `external`/`external_host` props at
            all), counted in `calls_http_unresolved`.
   3. UNANCHORED -- claim.base_url_env is None, no target-service evidence at all.
@@ -131,34 +134,46 @@ resolution="heuristic", confidence 0.5 (deliberately below every resolved tier -
 unresolved match is a WEAKER claim than even the unanchored heuristic/0.7 tier), and the
 claim is counted in calls_http_unresolved.
 
-SHARED-CHANNEL PROPS MERGE (M9 final review Important-1, .superpowers/sdd/
-m9-final-fix-report.md): the id-determinism-is-the-dedup pattern just above means claims
-from DIFFERENT tiers -- external (2a), unmapped (2b), AND the zero-or-multi-candidate
-ambiguous case -- can all collapse onto the SAME shared id, as long as they share (verb,
-path_template) verbatim; nothing about the id form distinguishes WHY a claim was
-unresolved. `link()`'s own `unresolved_channels[chan.id] = chan` is last-writer-wins over
-`claims_for`'s (service, relpath, payload_json) order -- a plain last-write on the WHOLE
-node therefore let one claim's `external`/`external_host` either leak onto a sibling claim
-that never resolved a hostname at all (unearned: that sibling's own trace exit would then
-be wrongly EXCLUDED from the confidence floor, see query/traverse.py's `is_external_exit`),
-or vanish because a later non-external sibling overwrote it (lost: an earlier claim's
-genuine external knowledge would render with no trace of why) -- both directions
-ORDER-DEPENDENT on an order `claims_for` never promises. `_reconcile_shared_channel_
-external_props` (called from `link`, right before the upsert) closes this FAIL-CLOSED:
-`external`/`external_host` survive on a shared node ONLY when EVERY claim that ever mapped
-onto that id was itself external AND named the SAME host; any non-external sibling or any
-hostname disagreement strips both props from the node unconditionally -- see that
-function's own docstring for the full mechanism. `calls_http_external`/
-`calls_http_unresolved` are counted per-claim, before this reconciliation runs, so neither
-counter is affected -- only the shared NODE's own props can degrade. The proper fix --
-`external`/`external_host` on the CALLS_HTTP EDGE instead (inherently per-claim, so it can
-never collide the way a shared NODE can), with traverse.py reading the edge instead of the
-neighbor node -- is out of scope for this fix-batch; tracked for M10.
-"""
+SHARED-CHANNEL PROPS -- PER-EDGE, NOT PER-NODE (M10 T4, replacing the M9 final review
+Important-1 fail-closed merge palliative, .superpowers/sdd/m9-final-fix-report.md): the
+id-determinism-is-the-dedup pattern just above means claims from DIFFERENT tiers --
+external (2a), unmapped (2b), AND the zero-or-multi-candidate ambiguous case -- can still
+all collapse onto the SAME shared channel id, as long as they share (verb, path_template)
+verbatim; nothing about the id form distinguishes WHY a claim was unresolved. Before this
+task, `external`/`external_host`/`config_ref` lived on that shared Channel NODE's own
+props -- a plain `unresolved_channels[chan.id] = chan` last-write-wins over `claims_for`'s
+(service, relpath, payload_json) order therefore let one claim's `external`/`external_host`
+either leak onto a sibling claim that never resolved a hostname at all (unearned: that
+sibling's own trace exit would then be wrongly EXCLUDED from the confidence floor, see
+query/traverse.py's `is_external_exit`), or vanish because a later non-external sibling
+overwrote it (lost: an earlier claim's genuine external knowledge would render with no
+trace of why) -- both directions ORDER-DEPENDENT on an order `claims_for` never promises.
+The M9 final review's own fix (`_reconcile_shared_channel_external_props`, since DELETED)
+closed this FAIL-CLOSED: survive on the shared node ONLY when every contributing claim
+agreed, strip on any disagreement -- correct, but conservative by construction (a
+genuinely external claim colliding with an unrelated unmapped sibling permanently lost its
+own deserved trace-confidence exclusion), and it explicitly left `config_ref` unaddressed
+(scoped out by that review), still susceptible to the same order-dependent leak/lose.
+
+M10 T4 removes the collision class ITSELF rather than reconciling around it:
+`external`/`external_host`/`config_ref` now live on the CALLS_HTTP EDGE (`EdgeRec.props`)
+instead of the shared Channel NODE -- the SAME convention `extractors/kafka_ext.py`'s
+`_props_for` already established for its own call-site-resolved `config_ref` shape (see
+that module's own "M6 T3 review Minor-3" comment for the precedent and the one narrow case
+where kafka deliberately diverges from it). An edge is never shared the way a node id can
+be -- `link()` appends exactly one `EdgeRec` per claim, each with its own independently
+-built `props` dict -- so two claims colliding onto the same channel id simply produce two
+edges with two unrelated `props`, nothing to merge, nothing to strip, no write-order to be
+sensitive to. The shared Channel node itself keeps only what (verb, path_template) alone
+already fully determines -- `unresolved=True`, `channel_kind`, `http_method`,
+`path_template` -- which is BYTE-IDENTICAL regardless of which colliding claim happened to
+produce it, so "collision" stops being a meaningful concept for this node at all.
+`calls_http_external`/`calls_http_unresolved` are unaffected (still counted per-claim, same
+as before); `query/traverse.py` reads `external`/`external_host` off the walked edge's own
+props now, not the neighbor node -- see that module's own docstring."""
 
 from __future__ import annotations
 
-import dataclasses
 from typing import NamedTuple
 
 from codegraph.config.models import WorkspaceConfig
@@ -303,74 +318,29 @@ def _unresolved_channel_and_edge(
     """Shared by BOTH the plain-unmapped (tier 2b) and external (tier 2a, M9 T1)
     fallbacks, and the zero/multi-candidate ambiguous case below -- all four honest
     misses need the IDENTICAL id form / resolution / confidence / extractor /
-    evidence shape, differing only in which extra props ride along. `external_host`
-    (only ever passed together with `config_ref=<the SAME env name>`, from tier 2a)
-    additively sets `external=True` + `external_host=<hostname>` on the synthetic
-    channel -- see module docstring's tier 2a for the full reasoning; id form,
-    resolution, confidence are UNCHANGED regardless of whether it's passed."""
-    extra: dict[str, object] = {"config_ref": config_ref} if config_ref is not None else {}
-    if external_host is not None:
-        extra["external"] = True
-        extra["external_host"] = external_host
+    evidence shape for the CHANNEL, differing only in which extra props ride along
+    on the EDGE (M10 T4 -- see module docstring's "SHARED-CHANNEL PROPS" section for
+    why the edge, not the node). `external_host` (only ever passed together with
+    `config_ref=<the SAME env name>`, from tier 2a) additively sets `external=True`
+    + `external_host=<hostname>` on the CALLS_HTTP edge; the channel itself carries
+    NONE of these three props -- only `unresolved=True`, fully determined by (verb,
+    path_template) alone, so id form/resolution/confidence stay UNCHANGED regardless
+    of which extra props ride along."""
     chan = make_channel_node(
         "http_route", method=claim["verb"], template=claim["path_template"],
         http_method=claim["verb"], path_template=claim["path_template"], unresolved=True,
-        **extra,
     )
+    props: dict[str, object] = {"config_ref": config_ref} if config_ref is not None else {}
+    if external_host is not None:
+        props["external"] = True
+        props["external_host"] = external_host
     edge = EdgeRec(
         src=claim["src_id"], dst=chan.id, type="CALLS_HTTP",
         resolution=_UNRESOLVED_RESOLUTION, confidence=_UNRESOLVED_CONFIDENCE,
         extractor=_EXTRACTOR, evidence_file=claim.get("_relpath"),
-        evidence_line=claim.get("evidence_line"),
+        evidence_line=claim.get("evidence_line"), props=props,
     )
     return chan, edge
-
-
-def _reconcile_shared_channel_external_props(
-    unresolved_channels: dict[str, NodeRec], host_markers: dict[str, set[str | None]],
-) -> dict[str, NodeRec]:
-    """M9 final review Important-1 (.superpowers/sdd/m9-final-fix-report.md) -- the
-    FAIL-CLOSED merge rule for a shared unresolved-channel id, applied once, right
-    before `link`'s own upsert (see module docstring's "SHARED-CHANNEL PROPS MERGE"
-    section for the full motivation).
-
-    `host_markers[chan_id]` carries one marker PER CLAIM that ever mapped onto
-    `chan_id` (via `link`'s own per-branch `.setdefault(chan.id, set()).add(...)`):
-    a hostname string for an external (tier 2a) claim, `None` for an unmapped
-    (2b) or zero-or-multi-candidate ambiguous claim -- both of the latter contribute
-    the SAME `None` marker on purpose, they are equally "not external" for this
-    rule's own purposes. `external`/`external_host` survive on `chan_id`'s node
-    ONLY when that set is a single-element, all-string set (every contributing
-    claim was external, and every one of them named the identical host) -- NEVER a
-    majority vote, never "keep whichever claim wrote last anyway": one dissenting
-    `None`, or two DIFFERENT hostnames, strips both props from the node
-    unconditionally. Every OTHER prop (`unresolved`, `config_ref`, `channel_kind`,
-    `http_method`, `path_template`) is left exactly as `link`'s own last-write
-    already set it -- this function touches ONLY the two props this task's review
-    scoped; `config_ref` in particular can still legitimately show whichever
-    contributing claim's env name happened to write last, unchanged from before
-    this fix (out of scope here, see the module docstring's own M10 note for the
-    real per-edge fix that would also resolve this).
-
-    `NodeRec` is frozen (core/schema.py) -- a disqualified node is rebuilt via
-    `dataclasses.replace` with a fresh `props` dict rather than mutated in place.
-    A node whose props never carried either key to begin with (the common,
-    no-collision case: an unmapped or ambiguous claim's OWN channel, or a single
-    external claim with no colliding sibling) is left as the SAME object,
-    untouched -- no allocation, no upsert-order change, for the overwhelming
-    majority of claims that never collide at all."""
-    for chan_id, node in unresolved_channels.items():
-        markers = host_markers.get(chan_id, set())
-        all_external_same_host = None not in markers and len(markers) == 1
-        if all_external_same_host:
-            continue  # every contributing claim agrees -- node already correct
-        if "external" not in node.props and "external_host" not in node.props:
-            continue  # nothing to strip -- avoid a needless allocation
-        stripped_props = {
-            k: v for k, v in node.props.items() if k not in ("external", "external_host")
-        }
-        unresolved_channels[chan_id] = dataclasses.replace(node, props=stripped_props)
-    return unresolved_channels
 
 
 def link(cfg: WorkspaceConfig, staging: Staging) -> dict:
@@ -387,14 +357,12 @@ def link(cfg: WorkspaceConfig, staging: Staging) -> dict:
     env_hostname_map = build_env_hostname_map(cfg.env_sources)
 
     edges: list[EdgeRec] = []
-    unresolved_channels: dict[str, NodeRec] = {}  # id -> node, dedup within this call
-    # M9 final review Important-1: one marker PER CONTRIBUTING CLAIM (never per
-    # node) for a given shared id -- a hostname string for an external claim,
-    # `None` for an unmapped/ambiguous one -- consumed by
-    # _reconcile_shared_channel_external_props below (see that function's own
-    # docstring for the fail-closed merge rule this drives, and the module
-    # docstring's "SHARED-CHANNEL PROPS MERGE" section for the full motivation).
-    channel_host_markers: dict[str, set[str | None]] = {}
+    # id -> node, dedup within this call -- M10 T4: every colliding claim's channel
+    # is BYTE-IDENTICAL regardless of which one produced it (see module docstring's
+    # "SHARED-CHANNEL PROPS" section), so a plain last-write-wins dict is no longer
+    # order-sensitive in any observable way -- nothing PER-CLAIM survives on this
+    # node any more for a later write to clobber or a reconciliation pass to fix up.
+    unresolved_channels: dict[str, NodeRec] = {}
     unresolved = 0
     external = 0
 
@@ -402,13 +370,12 @@ def link(cfg: WorkspaceConfig, staging: Staging) -> dict:
         target = _target(claim, cfg, env_service_map, env_hostname_map)
         if target.kind == "external":
             # Tier 2a (M9 T1): a real, known hostname outside the workspace -- no
-            # matching attempted (same reasoning as 2b), but the channel additively
-            # names WHY it's unresolved -- see module docstring.
+            # matching attempted (same reasoning as 2b), but the EDGE additively
+            # names WHY it's unresolved (M10 T4 -- see module docstring).
             chan, edge = _unresolved_channel_and_edge(
                 claim, config_ref=target.env_name, external_host=target.external_host,
             )
             unresolved_channels[chan.id] = chan
-            channel_host_markers.setdefault(chan.id, set()).add(target.external_host)
             edges.append(edge)
             external += 1
             continue
@@ -416,7 +383,6 @@ def link(cfg: WorkspaceConfig, staging: Staging) -> dict:
             # Tier 2b: no matching attempted at all -- see module docstring.
             chan, edge = _unresolved_channel_and_edge(claim, config_ref=target.env_name)
             unresolved_channels[chan.id] = chan
-            channel_host_markers.setdefault(chan.id, set()).add(None)
             edges.append(edge)
             unresolved += 1
             continue
@@ -431,14 +397,10 @@ def link(cfg: WorkspaceConfig, staging: Staging) -> dict:
             # separate calls_http_ambiguous counter was deliberately dropped.
             chan, edge = _unresolved_channel_and_edge(claim)
             unresolved_channels[chan.id] = chan
-            channel_host_markers.setdefault(chan.id, set()).add(None)
             edges.append(edge)
             unresolved += 1
 
     if unresolved_channels:
-        unresolved_channels = _reconcile_shared_channel_external_props(
-            unresolved_channels, channel_host_markers,
-        )
         staging.upsert_nodes(list(unresolved_channels.values()))
     if edges:
         staging.upsert_edges(edges)
