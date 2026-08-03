@@ -365,6 +365,54 @@ def test_mcp_contract_trace_process_live_on_three_segment_mini_graph(falkordb_cf
                 full_out = TraceProcessOutput(**full_res.data)  # схема валидна
                 assert full_out == trace_out
 
+                # -- M10 T2 (pilot §4.3): who_calls live on the TemporalActivity node
+                # (verify_documents) -- its only in-edge is INVOKES_ACTIVITY (from
+                # workflow_run), never CALLS; pre-T2 who_calls walked CALLS only and
+                # returned an empty (and misleading -- "dead code") result here. The
+                # live round trip proves roles/INVOKES_ACTIVITY survive the REAL
+                # staging -> FalkorDB path (not just the in-memory fake store T2's
+                # own unit tests use), same live-proof rationale as seg1.entry.roles
+                # above.
+                who_res = await c.call_tool("who_calls", {"node_id": verify_documents.id})
+                assert who_res.is_error is False
+                who_out = WhoCallsOutput(**who_res.data)  # схема валидна (аддитивно)
+                assert who_out.truncated is False
+                assert {c["id"] for c in who_out.callers} == {workflow_run.id}
+                activity_caller = next(
+                    c for c in who_out.callers if c["id"] == workflow_run.id
+                )
+                assert activity_caller["mechanism"] == "invokes_activity"
+
+                # -- transitive=True crosses the INVOKES_ACTIVITY hop symmetrically,
+                # then continues over workflow_run's own ordinary
+                # CALLS(mechanism=temporal_start) in-edge "as before" -- that
+                # second-level caller (handle_order_created) carries NO mechanism
+                # key of its own, only workflow_run does.
+                who_trans_res = await c.call_tool(
+                    "who_calls",
+                    {"node_id": verify_documents.id, "transitive": True, "max_depth": 2},
+                )
+                assert who_trans_res.is_error is False
+                who_trans_out = WhoCallsOutput(**who_trans_res.data)
+                assert who_trans_out.truncated is False
+                by_id = {c["id"]: c for c in who_trans_out.callers}
+                assert set(by_id) == {workflow_run.id, handle_order_created.id}
+                assert by_id[workflow_run.id]["mechanism"] == "invokes_activity"
+                assert "mechanism" not in by_id[handle_order_created.id]
+
+                # -- ordinary (non-activity) target on this SAME graph -- byte-
+                # identical pre-T2 shape: get_document has no INVOKES_ACTIVITY
+                # in-edge at all, but pin it anyway on a node that (unlike
+                # test_mcp_contract_list_tools_and_live_tool_calls' node "b") DOES
+                # carry other roles (RouteHandler), proving the check is genuinely
+                # role-SPECIFIC (TemporalActivity), not "has any role".
+                who_ordinary_res = await c.call_tool(
+                    "who_calls", {"node_id": get_document.id}
+                )
+                assert who_ordinary_res.is_error is False
+                who_ordinary_out = WhoCallsOutput(**who_ordinary_res.data)
+                assert {c["id"] for c in who_ordinary_out.callers} == set()
+
                 # -- list_processes live: the config-sourced anchor from this graph --
                 lp_res = await c.call_tool("list_processes", {})
                 assert lp_res.is_error is False

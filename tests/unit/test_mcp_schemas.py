@@ -17,6 +17,7 @@ from codegraph.mcp.schemas import (
     TraceProcessInput,
     TraceProcessOutput,
     TraceStep,
+    WhoCallsOutput,
 )
 
 
@@ -162,3 +163,25 @@ def test_trace_process_output_external_exit_count_defaults_to_zero_when_absent()
     at all) must keep validating -- the field defaults to 0, never required."""
     out = TraceProcessOutput(segments=[], confidence=0.5, truncated=False)
     assert out.external_exit_count == 0
+
+
+# -- M10 T2 (pilot §4.3): WhoCallsOutput.callers[].mechanism -- same "prove
+# additivity, don't just assert" precedent as TraceExit.channel above: `callers`
+# stays a plain `list[dict]`, so nothing here NEEDS a schema change to validate --
+# pinned anyway so a future refactor that DOES tighten this type has to notice.
+
+
+def test_who_calls_output_caller_accepts_mechanism_additively():
+    out = WhoCallsOutput(
+        callers=[{"id": "sym:svc:workflow_run", "mechanism": "invokes_activity"}],
+        truncated=False,
+    )
+    assert out.callers[0]["mechanism"] == "invokes_activity"
+
+
+def test_who_calls_output_caller_without_mechanism_still_validates_unchanged():
+    """Additivity pin: a plain CALLS-sourced caller dict (no mechanism key at
+    all -- the pre-T2, and still the ordinary-function, shape) keeps validating,
+    and the key stays genuinely absent (not None)."""
+    out = WhoCallsOutput(callers=[{"id": "sym:svc:a"}], truncated=False)
+    assert "mechanism" not in out.callers[0]

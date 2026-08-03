@@ -149,7 +149,12 @@ def build_server(
     @mcp.tool
     def who_calls(node_id: str, transitive: bool = False, max_depth: int = 3) -> dict:
         """Вызывающие узел через CALLS-рёбра: прямые (transitive=false) или BFS вверх
-        по цепочке вызовов до max_depth (клампится к 1..5, transitive=true)."""
+        по цепочке вызовов до max_depth (клампится к 1..5, transitive=true). M10 T2
+        (pilot §4.3): если у node_id роль TemporalActivity, дополнительно
+        учитываются входящие INVOKES_ACTIVITY-рёбра (воркфлоу вызывает активность
+        через execute_activity_method) на всех уровнях обхода -- такие callers несут
+        доп. поле mechanism="invokes_activity"; обычные CALLS-callers его не несут.
+        Для узлов без роли TemporalActivity поведение не меняется."""
         return gq.who_calls(node_id, transitive=transitive, max_depth=max_depth)
 
     @mcp.tool

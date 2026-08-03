@@ -56,6 +56,11 @@ _DEFAULT_CALLER_LIMIT = 50  # who_calls: внутренний cap суммарн
 # на оба инструмента, поэтому cap внутренний, module-level (тесты monkeypatch'ат его для
 # детерминированной проверки truncated без построения графа на 50+ узлов).
 
+# M10 T2 (pilot §4.3): who_calls' in-edge type filter when node_id's OWN role is
+# TemporalActivity -- see GraphQuery.who_calls' own docstring for the full
+# semantics (когда используется, почему "symmetric", mechanism-разметка).
+_ACTIVITY_CALLER_EDGE_TYPES: tuple[str, ...] = ("CALLS", "INVOKES_ACTIVITY")
+
 # -- M2 T8 --
 _VALID_TRACE_DIRECTIONS = frozenset({"downstream", "upstream"})
 _MAX_SEGMENTS_MIN, _MAX_SEGMENTS_MAX = 1, 20  # trace_process max_segments clamp
@@ -258,13 +263,63 @@ class GraphQuery:
             return {"error": f"falkordb unreachable: {e}"}
 
     def who_calls(self, node_id: str, transitive: bool = False, max_depth: int = 3) -> dict:
+        """Callers of node_id over CALLS in-edges: direct only (transitive=False,
+        depth=1) or BFS up the call chain to max_depth (clamped to [1,5]).
+
+        M10 T2 (pilot §4.3 -- "who_calls на Temporal-активности вернул 0"): a
+        Temporal activity's REAL caller is the workflow that invokes it via
+        `execute_activity_method`, which resolves to an INVOKES_ACTIVITY edge, not
+        CALLS -- an agent asking who_calls on an activity with no direct CALLS
+        in-edge used to get an honest-looking but WRONG empty result ("dead
+        code"). Fix: node_id's OWN role is read off its stored `roles` prop
+        (fetched once via store.get_nodes([node_id]), BEFORE the walk starts) --
+        if it includes "TemporalActivity", INVOKES_ACTIVITY is treated as a
+        call-equivalent in-edge type for the WHOLE walk (this hop AND every
+        transitive hop after it, symmetrically -- `_ACTIVITY_CALLER_EDGE_TYPES`
+        used at every BFS level once this is decided), not just the first hop.
+
+        This is a per-QUERY decision made ONCE from node_id's own role, NOT
+        re-evaluated per frontier node as the BFS descends -- a who_calls call
+        rooted at an ordinary function (no TemporalActivity role, OR node_id
+        missing from the graph entirely -- store.get_nodes returns [], same as
+        pre-T2's implicit "unknown node -> empty result", never an error) NEVER
+        queries INVOKES_ACTIVITY at any depth: byte-identical to pre-T2 output
+        for every non-activity target (pinned in test_query_api.py's "ordinary
+        function target unaffected" test). Concretely, for the pilot's own shape
+        (activity <-INVOKES_ACTIVITY- workflow <-CALLS(mechanism=temporal_start)-
+        starter -- temporal_start is an existing CALLS-edge prop, NOT its own
+        edge type, see linking/workspace.py): who_calls(activity_id) already
+        surfaces the workflow; who_calls(activity_id, transitive=True) ALSO
+        surfaces the starter one hop further out, over workflow's own ordinary
+        CALLS in-edge ("as before" -- no special-casing needed there, the walk
+        just keeps using the same CALLS+INVOKES_ACTIVITY filter and finds nothing
+        extra past what CALLS alone would have).
+
+        Each returned caller dict is UNCHANGED from before unless the specific
+        edge that discovered it was INVOKES_ACTIVITY, in which case it
+        additively carries `mechanism: "invokes_activity"` (mcp/schemas.py's
+        WhoCallsOutput.callers stays `list[dict]` -- no schema break, see that
+        model's own docstring). A caller_id reachable via BOTH an
+        INVOKES_ACTIVITY edge and an ordinary CALLS edge (to the same or a
+        different frontier node across the walk) still carries the mechanism tag
+        -- sticky once set, so the order hops are discovered in never changes the
+        result. A plain CALLS-only caller never carries this key (absent, not
+        null/false)."""
         max_depth = max(_MAX_DEPTH_MIN, min(_MAX_DEPTH_MAX, max_depth))
         depth = max_depth if transitive else 1
         try:
             store = self.store_factory()
+            target_nodes = store.get_nodes([node_id])
+            is_activity_target = bool(target_nodes) and "TemporalActivity" in (
+                target_nodes[0].get("roles") or ()
+            )
+            call_edge_types = (
+                list(_ACTIVITY_CALLER_EDGE_TYPES) if is_activity_target else ["CALLS"]
+            )
             visited = {node_id}
             frontier = [node_id]
             callers_by_id: dict[str, dict] = {}
+            activity_sourced: set[str] = set()  # caller_ids discovered via >=1 INVOKES_ACTIVITY hop
             truncated = False
             for _ in range(depth):
                 next_frontier: list[str] = []
@@ -273,15 +328,17 @@ class GraphQuery:
                         truncated = True
                         break
                     remaining = _DEFAULT_CALLER_LIMIT - len(callers_by_id)
-                    step = store.neighbors(nid, ["CALLS"], "in", remaining + 1)
+                    step = store.neighbors(nid, call_edge_types, "in", remaining + 1)
                     if len(step) > remaining:
                         step = step[:remaining]
                         truncated = True
-                    for _edge_type, _edge_props, node_dict, _direction in step:
+                    for edge_type, _edge_props, node_dict, _direction in step:
                         caller_id = node_dict.get("id")
                         if caller_id is None:
                             continue
                         callers_by_id[caller_id] = node_dict
+                        if edge_type == "INVOKES_ACTIVITY":
+                            activity_sourced.add(caller_id)
                         if caller_id not in visited:
                             visited.add(caller_id)
                             next_frontier.append(caller_id)
@@ -290,7 +347,13 @@ class GraphQuery:
                 frontier = next_frontier
                 if not frontier:
                     break
-            return {"callers": list(callers_by_id.values()), "truncated": truncated}
+            callers: list[dict] = []
+            for caller_id, node_dict in callers_by_id.items():
+                if caller_id in activity_sourced:
+                    callers.append({**node_dict, "mechanism": "invokes_activity"})
+                else:
+                    callers.append(node_dict)
+            return {"callers": callers, "truncated": truncated}
         except (StoreError, StoreUnavailable) as e:
             return {"error": f"falkordb unreachable: {e}"}
 

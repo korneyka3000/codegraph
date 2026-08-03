@@ -106,6 +106,19 @@ class WhoCallsInput(BaseModel):
 
 
 class WhoCallsOutput(BaseModel):
+    """callers -- caller node property dicts (see query.api.GraphQuery.who_calls).
+
+    M10 T2 (pilot §4.3): when node_id's OWN role is TemporalActivity, a caller
+    reached via an INVOKES_ACTIVITY edge (Temporal's `execute_activity_method`,
+    the workflow-side invocation mechanism -- see extractors/temporal_ext.py)
+    additively carries `mechanism: "invokes_activity"` inside its dict. Same
+    precedent as TraceExit.channel's own additive `external`/`external_host`
+    props above: `callers` stays a plain, untyped `list[dict]` -- this validates
+    with NO code change here at all, `mechanism` is just another key a dict is
+    free to carry. A caller reached ONLY via an ordinary CALLS edge never
+    carries this key (absent, not null/false). See tests/unit/test_mcp_schemas.py
+    for a pinned proof."""
+
     callers: list[dict]
     truncated: bool
 

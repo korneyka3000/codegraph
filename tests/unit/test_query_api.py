@@ -482,6 +482,144 @@ def test_who_calls_store_unreachable_returns_error_dict():
     assert "falkordb unreachable" in result["error"]
 
 
+# -- M10 T2 (pilot §4.3): who_calls x INVOKES_ACTIVITY -- a Temporal activity's
+# "real" callers are workflows invoking it via execute_activity_method, which
+# resolves to an INVOKES_ACTIVITY edge, not CALLS -- who_calls used to walk CALLS
+# only and silently returned 0 for an activity with no direct CALLS in-edge (an
+# agent asking "who calls this" would wrongly conclude dead code). node_id's OWN
+# role (fetched once via store.get_nodes([node_id]) before the walk) decides,
+# for the WHOLE call, whether INVOKES_ACTIVITY is treated as a call-equivalent
+# in-edge type alongside CALLS -- see query.api.GraphQuery.who_calls' own
+# docstring for the full semantics this pins.
+
+
+def test_who_calls_activity_target_surfaces_invokes_activity_source_with_mechanism():
+    store = FakeStore()
+    store.add_node("activity", roles=["TemporalActivity"])
+    store.add_node("workflow")
+    store.add_edge("workflow", "INVOKES_ACTIVITY", "activity")
+    q = GraphQuery(_factory(store), {})
+    result = q.who_calls("activity")
+    assert result["truncated"] is False
+    assert len(result["callers"]) == 1
+    caller = result["callers"][0]
+    assert caller["id"] == "workflow"
+    assert caller["mechanism"] == "invokes_activity"
+
+
+def test_who_calls_activity_target_calls_caller_carries_no_mechanism():
+    """An activity can ALSO have an ordinary CALLS caller (e.g. a unit test
+    invoking the activity function directly, not through Temporal) -- that
+    caller is found via CALLS, not INVOKES_ACTIVITY, so it carries no mechanism
+    key at all (absent, not null/false -- same additive convention as
+    TraceExit.channel's external/external_host props)."""
+    store = FakeStore()
+    store.add_node("activity", roles=["TemporalActivity"])
+    store.add_node("direct_caller")
+    store.add_edge("direct_caller", "CALLS", "activity")
+    q = GraphQuery(_factory(store), {})
+    result = q.who_calls("activity")
+    assert len(result["callers"]) == 1
+    caller = result["callers"][0]
+    assert caller["id"] == "direct_caller"
+    assert "mechanism" not in caller
+
+
+def test_who_calls_activity_target_queries_both_edge_types_in_direction():
+    store = FakeStore()
+    store.add_node("activity", roles=["TemporalActivity"])
+    store.add_node("workflow")
+    store.add_edge("workflow", "INVOKES_ACTIVITY", "activity")
+    q = GraphQuery(_factory(store), {})
+    q.who_calls("activity")
+    assert store.neighbor_calls[0][1] == ["CALLS", "INVOKES_ACTIVITY"]
+    assert store.neighbor_calls[0][2] == "in"
+
+
+def test_who_calls_ordinary_function_target_unaffected_by_activity_handling():
+    """Pinned: a target WITHOUT the TemporalActivity role gets byte-identical
+    pre-T2 behavior -- edge_types queried stays exactly ["CALLS"], and no
+    mechanism key ever appears, even when an INVOKES_ACTIVITY edge happens to
+    exist into this (non-activity) node (defensive: the check is node_id's OWN
+    role, not "does an INVOKES_ACTIVITY in-edge exist")."""
+    store = FakeStore()
+    store.add_node("b", roles=["RouteHandler"])  # has A role, just not the one that matters
+    store.add_node("a")
+    store.add_edge("a", "CALLS", "b")
+    store.add_edge("a", "INVOKES_ACTIVITY", "b")
+    q = GraphQuery(_factory(store), {})
+    result = q.who_calls("b")
+    assert store.neighbor_calls[0][1] == ["CALLS"]
+    assert len(result["callers"]) == 1
+    assert "mechanism" not in result["callers"][0]
+
+
+def test_who_calls_missing_target_node_defaults_to_calls_only():
+    """node_id absent from the graph entirely (store.get_nodes returns []) --
+    same graceful empty-result, CALLS-only behavior as pre-T2 (who_calls never
+    hard-errors on an unknown node_id, see GraphQuery module docstring)."""
+    store = FakeStore()
+    store.add_node("caller")
+    store.add_edge("caller", "CALLS", "ghost")
+    q = GraphQuery(_factory(store), {})
+    result = q.who_calls("ghost")
+    assert store.neighbor_calls[0][1] == ["CALLS"]
+    assert {c["id"] for c in result["callers"]} == {"caller"}
+
+
+def test_who_calls_transitive_crosses_invokes_activity_hop_symmetrically():
+    """Transitive semantics (M10 plan): activity <-INVOKES_ACTIVITY- workflow
+    <-CALLS(mechanism=temporal_start)- starter. who_calls(activity,
+    transitive=True) sees BOTH levels: workflow (mechanism="invokes_activity")
+    and, one hop further out, starter -- reached over workflow's OWN ordinary
+    CALLS in-edge ("as before": temporal_start is an existing CALLS-edge prop,
+    not a distinct edge type -- see linking/workspace.py), so starter carries no
+    mechanism key of its own."""
+    store = FakeStore()
+    store.add_node("activity", roles=["TemporalActivity"])
+    store.add_node("workflow")
+    store.add_node("starter")
+    store.add_edge("workflow", "INVOKES_ACTIVITY", "activity")
+    store.add_edge("starter", "CALLS", "workflow", mechanism="temporal_start")
+    q = GraphQuery(_factory(store), {})
+    result = q.who_calls("activity", transitive=True, max_depth=2)
+    by_id = {c["id"]: c for c in result["callers"]}
+    assert set(by_id) == {"workflow", "starter"}
+    assert by_id["workflow"]["mechanism"] == "invokes_activity"
+    assert "mechanism" not in by_id["starter"]
+
+
+def test_who_calls_activity_target_direct_mode_does_not_cross_second_hop():
+    """transitive=False (default): even for an activity target, only depth-1
+    in-edges are walked -- the starter behind the workflow (2 hops away) is NOT
+    surfaced, exactly the pre-T2 direct-mode depth contract."""
+    store = FakeStore()
+    store.add_node("activity", roles=["TemporalActivity"])
+    store.add_node("workflow")
+    store.add_node("starter")
+    store.add_edge("workflow", "INVOKES_ACTIVITY", "activity")
+    store.add_edge("starter", "CALLS", "workflow")
+    q = GraphQuery(_factory(store), {})
+    result = q.who_calls("activity")
+    assert {c["id"] for c in result["callers"]} == {"workflow"}
+
+
+def test_who_calls_activity_target_caller_reachable_via_both_edge_types_keeps_mechanism():
+    """Edge case: the same caller_id has BOTH an INVOKES_ACTIVITY and a CALLS
+    edge straight into the activity target -- mechanism is sticky (order of
+    edge-type discovery during the walk must not change the result, see
+    GraphQuery.who_calls docstring)."""
+    store = FakeStore()
+    store.add_node("activity", roles=["TemporalActivity"])
+    store.add_node("both")
+    store.add_edge("both", "INVOKES_ACTIVITY", "activity")
+    store.add_edge("both", "CALLS", "activity")
+    q = GraphQuery(_factory(store), {})
+    result = q.who_calls("activity")
+    assert len(result["callers"]) == 1
+    assert result["callers"][0]["mechanism"] == "invokes_activity"
+
+
 # -- amendment 1: fresh store per call (T3 stale-handle finding) --
 
 
