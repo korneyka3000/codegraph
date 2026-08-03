@@ -61,9 +61,12 @@ never guessing when the candidate can't be verified (the ORIGINAL, pre-M10 path 
 then taken completely unchanged, including staying "dangling" when that was already
 going to happen). A successful redirect's resolution/confidence come from the
 SingletonIndex entry's OWN tier (static/1.0 or heuristic/0.6 -- see that module's
-docstring), not from this function's `resolution`/`confidence` parameters, and its
-edge carries `props["mechanism"] = "singleton_dispatch"` (existing edges' props stay
-exactly `{"callsite_count": N}`, unchanged)."""
+docstring), CAPPED at this function's `resolution`/`confidence` parameters (M10
+review Important-1 -- the M1a honesty ladder is a PROVENANCE rule: a degraded run's
+S6 CALLS are heuristic/0.6 because the fallback resolver produced them, so no
+redirect may exceed the run's own base tier; see the inline cap comment in
+build_calls), and its edge carries `props["mechanism"] = "singleton_dispatch"`
+(existing edges' props stay exactly `{"callsite_count": N}`, unchanged)."""
 
 from __future__ import annotations
 
@@ -233,6 +236,22 @@ def build_calls(
                     # (still "joined", still silently dropped at load -- this task
                     # narrows, never widens, what gets dropped).
                     dispatch = _try_singleton(call, singleton_index, def_symbols_set, service)
+
+            if dispatch is not None and dispatch.confidence > confidence:
+                # M10 review Important-1 (M1a honesty-ladder binding constraint):
+                # this function's `resolution`/`confidence` parameters are a
+                # PROVENANCE statement about the whole run's S6 join ("CALLS from
+                # the fallback resolver: heuristic/0.6" -- analyze.py's own module
+                # docstring), not a per-edge reliability estimate -- the
+                # `degraded=True => no static CALLS` invariant is pinned
+                # service-wide by test_pipeline_analyze's
+                # test_analyze_degraded_path_falls_back_to_heuristic_calls. A
+                # singleton redirect's own tier may therefore never EXCEED the base
+                # tier: min semantics (a heuristic/0.6 dispatch under a static/1.0
+                # base keeps its own honest 0.6; a static/1.0 dispatch under a
+                # degraded heuristic/0.6 base is capped to the base). The redirect
+                # itself (dst, mechanism prop) is unaffected.
+                dispatch = SingletonDispatch(dispatch.dst_id, resolution, confidence)
 
             dst_id = (
                 dispatch.dst_id if dispatch is not None

@@ -441,6 +441,31 @@ def test_singleton_dispatch_heuristic_tier_redirects_and_carries_lower_confidenc
     assert e.resolution == "heuristic" and e.confidence == 0.6
 
 
+def test_singleton_dispatch_capped_at_degraded_base_tier(tmp_path):
+    """M10 review Important-1 (M1a honesty-ladder binding constraint): a degraded
+    run's S6 CALLS are heuristic/0.6 by PROVENANCE (the fallback resolver produced
+    them), not by per-occurrence reliability -- pinned service-wide by
+    test_pipeline_analyze.test_analyze_degraded_path_falls_back_to_heuristic_calls'
+    own `all(...)` assertion. A static-tier singleton redirect must therefore never
+    EXCEED the run's own base tier: min(dispatch tier, base tier). The redirect
+    itself (dst, mechanism prop) still happens -- only its tier is capped."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    facts, _call = _singleton_call_facts()
+    st.add_defs("svc", [DefRow("app/db/registry.py", _REGISTRY_SESSION_SYM, 0, 1, 1)])
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"),
+        resolution="heuristic", confidence=0.6,  # exactly what analyze.py passes when degraded
+        singleton_index=_registry_singleton_index(tier="static"),
+    )
+    assert stats.calls_joined == 1
+    e = next(e for e in st.iter_edges() if e.type == "CALLS")
+    assert e.dst == "sym:svc:`app.db.registry`/_DBRegistry#session()."
+    assert e.resolution == "heuristic" and e.confidence == 0.6
+    assert e.props["mechanism"] == "singleton_dispatch"
+
+
 def test_singleton_dispatch_method_missing_stays_unresolved(tmp_path):
     st = Staging(tmp_path / "s.db")
     st.begin_service("svc")

@@ -1412,11 +1412,17 @@ def test_analyze_full_writes_module_singletons_claims_unconditionally(tmp_path):
 
 def test_analyze_full_resolves_module_level_singleton_method_call_end_to_end(tmp_path):
     """The brief's own repro, driven through the REAL analyze_service pipeline (not
-    build_calls directly): a degraded (_AlwaysFailRunner) run still reaches the
-    STATIC tier here -- resolvers/fallback.py's own ref-building resolves a
-    same-file class reference (`_DBRegistry` referenced by the ctor call inside its
-    OWN defining file) exactly as scip would, so the singleton's class type is
-    "static"-resolved even with no real scip-python involved at all."""
+    build_calls directly), on the DEGRADED path (_AlwaysFailRunner). The redirect
+    itself works with no real scip-python at all -- resolvers/fallback.py's own
+    ref-building resolves a same-file class reference (`_DBRegistry` referenced by
+    the ctor call inside its OWN defining file), so the CLAIM's class-resolution
+    tier is honestly "static" -- but the emitted EDGE is capped at heuristic/0.6
+    (M10 review Important-1): the M1a honesty ladder is a PROVENANCE rule ("S6
+    CALLS from the fallback resolver: heuristic/0.6" -- this module's own
+    docstring, pinned service-wide by
+    test_analyze_degraded_path_falls_back_to_heuristic_calls' `all(...)` assertion
+    above), so no degraded run may emit a static CALLS edge, singleton-dispatched
+    or not."""
     svc = ServiceConfig(name="svc", path=_singleton_service_tree(tmp_path))
     st = Staging(tmp_path / "s.db")
     report = analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
@@ -1427,7 +1433,9 @@ def test_analyze_full_resolves_module_level_singleton_method_call_end_to_end(tmp
     assert len(dispatched) == 1
     e = dispatched[0]
     assert e.dst.endswith("_DBRegistry#session().")
-    assert e.resolution == "static" and e.confidence == 1.0
+    assert e.resolution == "heuristic" and e.confidence == 0.6
+    # the degraded-run invariant holds over EVERY CALLS edge, dispatched included.
+    assert all(x.resolution == "heuristic" and x.confidence == 0.6 for x in edges)
 
 
 def test_analyze_incremental_singleton_class_change_escalates_stale_to_all_files(tmp_path):
@@ -1483,3 +1491,37 @@ def test_analyze_incremental_non_singleton_change_does_not_escalate(tmp_path):
     assert report["mode"] == "incremental"
     assert report["stale_escalation"] is None
     assert report["stale_relpaths"] == ("app/handlers.py",)
+
+
+def test_analyze_incremental_both_claim_kinds_changed_reports_combined_marker(tmp_path):
+    """M10 review Minor: when BOTH escalation-tracked claim kinds moved in the SAME
+    incremental run (a Settings default edit AND a singleton class swap), the marker
+    must name both -- a single-kind marker would hide the second cause from anyone
+    debugging why the run escalated. Single-kind runs keep their pre-existing
+    markers byte-identical (pinned by the two dedicated tests above)."""
+    svc_root = tmp_path / "svc"
+    (svc_root / "app" / "db").mkdir(parents=True)
+    (svc_root / "app" / "__init__.py").write_text("")
+    (svc_root / "app" / "db" / "__init__.py").write_text("")
+    (svc_root / "app" / "config.py").write_text(_SETTINGS_SRC)
+    (svc_root / "app" / "db" / "registry.py").write_text(_SINGLETON_DEFINING_SRC)
+    (svc_root / "app" / "handlers.py").write_text(_SINGLETON_CONSUMER_SRC)
+    svc = ServiceConfig(name="svc", path=svc_root)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    (svc_root / "app" / "config.py").write_text(
+        _SETTINGS_SRC.replace("http://localhost:8000", "http://localhost:9000"),
+    )
+    (svc_root / "app" / "db" / "registry.py").write_text(
+        _SINGLETON_DEFINING_SRC.replace("_DBRegistry", "_OtherRegistry"),
+    )
+
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["stale_escalation"] == "class_attrs+module_singletons_changed"
+    assert report["stale_files"] == report["files"] == 5

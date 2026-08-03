@@ -799,21 +799,24 @@ def _analyze_incremental(
             svc.name, rp, "module_singletons",
             harvest_module_singletons(rp, facts_by_file[rp], ref_symbol_lookup),
         )
-    class_attrs_changed = _class_attrs_digest(staging, svc.name) != old_class_attrs_digest
-    module_singletons_changed = (
-        _module_singletons_digest(staging, svc.name) != old_module_singletons_digest
-    )
-    if class_attrs_changed or module_singletons_changed:
+    changed_kinds = [
+        kind
+        for kind, old_digest, digest_fn in (
+            ("class_attrs", old_class_attrs_digest, _class_attrs_digest),
+            ("module_singletons", old_module_singletons_digest, _module_singletons_digest),
+        )
+        if digest_fn(staging, svc.name) != old_digest
+    ]
+    if changed_kinds:
         all_scanned = {rp for rp, _, _ in rows}
         if all_scanned - stale:
-            # class_attrs takes precedence when BOTH moved in the same run (keeps
-            # the pre-existing marker value/test byte-identical for a pure
-            # class_attrs change); module_singletons gets its OWN distinct marker
-            # so a caller/test can tell which claim kind actually escalated.
-            stale_escalation = (
-                "class_attrs_changed" if class_attrs_changed
-                else "module_singletons_changed"
-            )
+            # M10 review Minor: the marker names EVERY claim kind whose digest
+            # moved -- "class_attrs_changed" / "module_singletons_changed" alone
+            # (byte-identical to their pre-existing single-kind values), joined
+            # with "+" when both moved in the same run
+            # ("class_attrs+module_singletons_changed"), so neither cause is
+            # hidden from whoever debugs why the run escalated.
+            stale_escalation = "+".join(changed_kinds) + "_changed"
             stale = all_scanned
             stale_sorted = sorted(stale)
             staging.delete_file_layer(

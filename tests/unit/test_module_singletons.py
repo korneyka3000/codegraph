@@ -154,6 +154,33 @@ cache = _Cache(y)
     assert {c["name"] for c in claims} == {"registry", "cache"}
 
 
+def test_factory_function_resolved_symbol_falls_back_to_heuristic_claim():
+    """M10 review Important-2: `pool = MakePool(x)` where MakePool is a CapWords
+    FACTORY FUNCTION -- the ctor-form heuristic can't tell (CamelCase text is all it
+    sees), but the ref lookup CAN: the resolved symbol's descriptors end "()."
+    (function), not "#" (class). Trusting it as a static claim would let the join
+    build `MakePool().<method>().` -- which can GENUINELY exist as a staged def (a
+    nested function inside the factory), a real false-positive path (see the
+    resolve_singleton_call pin below). Harvest must fall back to the heuristic tier
+    (class_symbol=None), whose textual scan is structurally class-shape-safe (its
+    suffix contains "#" -- see _heuristic_candidate's own docstring)."""
+    src = b"pool = MakePool(x)\n"
+    facts = build_file_facts("app/pools.py", src)
+    assign = next(a for a in facts.assigns if a.target == "pool")
+    factory_fn_sym = f"{_SVC} `app.factories`/MakePool()."
+
+    def lookup(rp, sb):
+        return factory_fn_sym if sb == assign.callee_start_byte else None
+
+    claims = harvest_module_singletons("app/pools.py", facts, lookup)
+    assert claims == [{
+        "name": "pool",
+        "class_symbol": None,
+        "class_name_text": "MakePool",
+        "resolution_tier": "heuristic",
+    }]
+
+
 # -- SingletonEntry / SingletonIndex: assembly + collisions --
 
 
@@ -225,6 +252,25 @@ def test_resolve_singleton_call_static_tier_method_does_not_exist_never_guesses(
     dispatch = resolve_singleton_call(
         idx, "registry", "nonexistent_method", _def_symbols(), "svc",
     )
+    assert dispatch is None
+
+
+def test_resolve_singleton_call_static_tier_function_shaped_class_symbol_refused():
+    """M10 review Important-2, the defensive join-side twin of the harvest-side pin
+    above (claims are also built directly, not only by harvest_module_singletons):
+    a claim whose class_symbol is FUNCTION-shaped (descriptors end "().", not "#")
+    must be refused even when the would-be candidate `MakePool().session().`
+    ACTUALLY EXISTS in def_symbols -- a nested `def session()` inside the factory is
+    a real, stageable def, so without the shape check this would join a
+    `pool.session()` call to the factory's inner helper with static/1.0 confidence:
+    the strongest false-positive form of this bug, not just a mislabeled tier."""
+    factory_fn_sym = f"{_SVC} `app.factories`/MakePool()."
+    nested_fn_sym = f"{_SVC} `app.factories`/MakePool().session()."
+    idx = build_singleton_index([{
+        "name": "pool", "class_symbol": factory_fn_sym,
+        "class_name_text": "MakePool", "resolution_tier": "static",
+    }])
+    dispatch = resolve_singleton_call(idx, "pool", "session", {nested_fn_sym}, "svc")
     assert dispatch is None
 
 

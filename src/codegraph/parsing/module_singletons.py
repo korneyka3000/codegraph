@@ -59,18 +59,29 @@ fallback analyze modes alike (resolvers/fallback.py's own `resolve_service` stag
 proper structural ref for a same-file or from-imported class ctor reference too, the
 identical "scip-python python <svc> 0.0 <descriptor>" shape a real scip run
 produces), so "static tier" here means "THIS occurrence resolved", not "real scip was
-running". A LOCAL symbol (`parsed.is_local`) is honestly rejected even when found --
-a `local N` symbol has no descriptors to append a method segment to (ids are
-file-scoped: `sym:<svc>:<relpath>:<local>`) and there is no sound way to widen it
-service-wide. Resolution failure (no lookup wired, lookup returns None, or a local
-symbol) falls back to the TEXTUAL tier: `class_name_text` (the ctor callee's own
+running" (the RUN-level honesty ladder is enforced separately, at edge emission --
+see the join-time paragraph below). A LOCAL symbol (`parsed.is_local`) is honestly
+rejected even when found -- a `local N` symbol has no descriptors to append a method
+segment to (ids are file-scoped: `sym:<svc>:<relpath>:<local>`) and there is no
+sound way to widen it service-wide. A NON-CLASS-shaped symbol is rejected too (M10
+review Important-2, `_is_class_symbol`: descriptors must end "#") -- the ctor-form
+heuristic only sees CamelCase TEXT, so `pool = MakePool(x)` with a CapWords factory
+FUNCTION passes it and resolves to `.../MakePool().` here; trusting that as static
+would let the join build `MakePool().<method>().`, which can GENUINELY exist as a
+staged def (a nested function inside the factory) -- a real false-positive join
+target the def-existence check alone cannot catch. Resolution failure (no lookup
+wired, lookup returns None, a local symbol, or a non-class-shaped symbol) falls
+back to the TEXTUAL tier: `class_name_text` (the ctor callee's own
 decoded text, ALWAYS carried in the claim regardless of tier) is all a join-time
 consumer gets to work with -- `resolve_singleton_call`'s heuristic branch scans this
 service's OWN `def_symbols` for a UNIQUE class body ending `<class_name_text>#
 <method>().`; more than one match (two same-named classes anywhere in the service)
 is an honest ambiguity -> None, "false match worse than no match" (the exact same
 policy class_attrs.py's `field_by_name`/`settings_field`/`enum_values` already
-apply to their own suffix collisions).
+apply to their own suffix collisions). The textual tier needs no separate
+class-shape check: its suffix literally contains the class-descriptor "#", so a
+factory function's own (or nested) descriptors structurally cannot match -- see
+`_heuristic_candidate`'s docstring.
 
 -- Claims / index assembly --
 
@@ -101,17 +112,19 @@ handed back, not even as a low-confidence guess). `def_symbols` is exactly the
 service-wide `def_symbols` set M5 Task 1 already introduced (extractors/calls.py's
 own module docstring) -- reused here as-is, no new staged table/index.
 
-Static-tier verification reconstructs the FULL scip symbol string for the candidate
-method (same scheme/manager/package/version as the resolved class_symbol, itself a
-real, staged, verified symbol -- never invented) and checks it against `def_symbols`
-membership, exactly the same "def-existence, not just parseable" criterion
-`extractors/calls.py::build_calls` already uses for its own first-party join
-decision. Success confidence is a fixed (static, 1.0)/(heuristic, 0.6) pair keyed by
-which tier resolved the CLASS name -- not the caller's own analyze-wide
-resolution/confidence (which reflects whether SCIP ran at all for the whole
-service) -- because a scip-resolved ClassName is exactly as trustworthy under a
-degraded whole-service run as a real one (the fallback resolver's own structural
-symbols are equally exact for same-file/from-import references, see above)."""
+Static-tier verification re-checks class shape (`_is_class_symbol`, the defensive
+twin of the harvest-side gate -- claims also reach this code constructed directly),
+then reconstructs the FULL scip symbol string for the candidate method (same
+scheme/manager/package/version as the resolved class_symbol, itself a real, staged,
+verified symbol -- never invented) and checks it against `def_symbols` membership,
+exactly the same "def-existence, not just parseable" criterion `extractors/calls.py
+::build_calls` already uses for its own first-party join decision. Success
+confidence is a fixed (static, 1.0)/(heuristic, 0.6) pair keyed by which tier
+resolved the CLASS name; the RUN-level honesty ladder is NOT this module's concern
+-- `build_calls` itself caps a dispatch at its own base resolution/confidence (M10
+review Important-1: the M1a ladder is a PROVENANCE rule -- a degraded run's S6 CALLS
+are heuristic/0.6 because the fallback resolver produced them, so no redirect may
+exceed the run's base tier; see the cap comment in extractors/calls.py)."""
 
 from __future__ import annotations
 
@@ -121,7 +134,7 @@ from typing import Literal
 
 from codegraph.core import ids
 from codegraph.parsing.facts import FileFacts
-from codegraph.resolvers.scip.symbols import parse_symbol
+from codegraph.resolvers.scip.symbols import ParsedSymbol, parse_symbol
 
 ResolutionTier = Literal["static", "heuristic"]
 
@@ -178,6 +191,22 @@ def _is_ctor_form(name: str) -> bool:
     return bool(stripped) and stripped[0].isupper()
 
 
+def _is_class_symbol(parsed: ParsedSymbol) -> bool:
+    """M10 review Important-2: a symbol the static tier may trust as a CLASS --
+    non-local, with descriptors ending "#" (scip's own class-descriptor suffix,
+    mirrored by `ids.structural_descriptor` and every def-id path). A CapWords
+    FACTORY FUNCTION (`.../MakePool().`) resolves via the same ref lookup but is
+    NOT class-shaped -- appending a method segment to it would produce a
+    nested-function descriptor (`MakePool().session().`), which can genuinely be a
+    staged def, i.e. a real false-positive join target, not just a mislabeled
+    tier."""
+    return (
+        not parsed.is_local
+        and parsed.descriptors is not None
+        and parsed.descriptors.endswith("#")
+    )
+
+
 def harvest_module_singletons(
     relpath: str,
     facts: FileFacts,
@@ -199,7 +228,12 @@ def harvest_module_singletons(
         class_symbol: str | None = None
         if ref_symbol_lookup is not None and a.callee_start_byte is not None:
             sym = ref_symbol_lookup(relpath, a.callee_start_byte)
-            if sym is not None and not parse_symbol(sym).is_local:
+            # M10 review Important-2: shape-gate the static tier -- the ctor-form
+            # heuristic only ever sees CamelCase TEXT, so a CapWords factory
+            # FUNCTION passes it and resolves here to a function symbol; only a
+            # genuinely class-shaped symbol (`_is_class_symbol`) earns a static
+            # claim, anything else falls back to the textual tier honestly.
+            if sym is not None and _is_class_symbol(parse_symbol(sym)):
                 class_symbol = sym
         claims.append({
             "name": a.target,
@@ -241,7 +275,14 @@ def _static_candidate(
     class_symbol: str, method: str, def_symbols: set[str], service: str,
 ) -> SingletonDispatch | None:
     parsed = parse_symbol(class_symbol)
-    if parsed.is_local or parsed.descriptors is None:
+    # M10 review Important-2: `_is_class_symbol` here is the DEFENSIVE twin of the
+    # harvest-side gate (harvest_module_singletons already refuses to write a
+    # static claim for a non-class-shaped symbol) -- claims also reach this code
+    # constructed directly (tests, any future claim producer), and appending
+    # `<method>().` to a FUNCTION-shaped descriptor builds a nested-function id
+    # that can genuinely exist in def_symbols, so the def-existence check alone
+    # cannot catch it.
+    if not _is_class_symbol(parsed):
         return None
     descriptors = f"{parsed.descriptors}{method}()."
     candidate_symbol = (
@@ -255,6 +296,13 @@ def _static_candidate(
 def _heuristic_candidate(
     class_name_text: str, method: str, def_symbols: set[str], service: str,
 ) -> SingletonDispatch | None:
+    """Textual tier. Class shape needs NO extra check here (M10 review Important-2,
+    documented decision): the scanned suffix `<class_name_text>#<method>().`
+    CONTAINS the class-descriptor "#" itself, so it can only ever match a method
+    inside a genuine class body -- a CapWords factory function's descriptors
+    (`MakePool().`, and its nested defs' `MakePool().session().`) structurally
+    cannot end with `MakePool#session().`. The shape requirement is enforced by the
+    suffix format, not risk-accepted."""
     suffix = f"{class_name_text}#{method}()."
     matches: set[str] = set()
     for sym in def_symbols:
