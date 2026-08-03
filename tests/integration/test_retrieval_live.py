@@ -142,6 +142,12 @@ def test_search_code_text_mode_finds_matching_chunk_no_embedder_needed(falkordb_
         # qualified_name denormalized onto the Chunk node at load (T7 review fix) --
         # the staged symbol's own qualified_name, read straight off the live graph.
         assert result["items"][0]["qualified_name"] == "app.orders.create_order"
+        # M10 T3 (pilot §4.1): enclosing_symbol/chunk_kind, same load-time join,
+        # read straight off the live graph -- proves the FULL pipeline (load_graph's
+        # staging.iter_nodes() pass -> Chunk node props -> retrieval._chunk_item),
+        # not just the pure _chunk_props helper unit tests already cover.
+        assert result["items"][0]["enclosing_symbol"] == "app.orders.create_order"
+        assert result["items"][0]["chunk_kind"] == "Function"  # match_sym.kind above
     finally:
         _cleanup(falkordb_cfg, f"{TEXT_MODE_GRAPH}__build", TEXT_MODE_GRAPH)
 

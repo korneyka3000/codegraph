@@ -214,8 +214,8 @@ def test_search_code_item_shape_has_exactly_the_contract_fields():
     store.text_chunks = [(_chunk("c1"), 1.0)]
     result = retrieval.search_code(store, None, "q", mode="text")
     assert set(result["items"][0]) == {
-        "chunk_id", "symbol_id", "qualified_name", "service", "relpath",
-        "start_line", "end_line", "snippet", "score",
+        "chunk_id", "symbol_id", "qualified_name", "enclosing_symbol", "chunk_kind",
+        "service", "relpath", "start_line", "end_line", "snippet", "score",
     }
 
 
@@ -235,6 +235,81 @@ def test_search_code_item_qualified_name_none_when_chunk_lacks_the_property():
     store.text_chunks = [(_chunk("c1"), 1.0)]  # _chunk() sets no qualified_name
     result = retrieval.search_code(store, None, "q", mode="text")
     assert result["items"][0]["qualified_name"] is None
+
+
+# -- M10 T3 (pilot §4.1): enclosing_symbol/chunk_kind -- a search hit self-describes
+# WHICH symbol (method vs. class) it covers, closing the "right class, wrong
+# sub-chunk" gap the pilot's §4.1/§4.2 misses trace back to (big classes split into
+# N sibling chunks sharing one qualified_name for their header/gap pieces --
+# chunking/splitter.py rule 3 -- while method-level pieces already carry the
+# METHOD's own qualified_name; nothing on the item made that distinction explicit).
+
+
+def test_search_code_item_enclosing_symbol_mirrors_qualified_name():
+    # enclosing_symbol is the SAME value as qualified_name (both are "the owning
+    # node's qualified_name", already denormalized onto the Chunk node at load time
+    # -- see pipeline/load._chunk_props) -- an explicit, unambiguously-named
+    # additive field rather than a second store lookup or a rename of the existing
+    # (back-compat) qualified_name key.
+    store = _FakeStore()
+    store.text_chunks = [(_chunk("c1", qualified_name="app.orders.create_order"), 1.0)]
+    result = retrieval.search_code(store, None, "q", mode="text")
+    assert result["items"][0]["enclosing_symbol"] == "app.orders.create_order"
+    assert result["items"][0]["enclosing_symbol"] == result["items"][0]["qualified_name"]
+
+
+def test_search_code_item_enclosing_symbol_none_when_chunk_lacks_qualified_name():
+    store = _FakeStore()
+    store.text_chunks = [(_chunk("c1"), 1.0)]  # _chunk() sets no qualified_name
+    result = retrieval.search_code(store, None, "q", mode="text")
+    assert result["items"][0]["enclosing_symbol"] is None
+
+
+def test_search_code_item_carries_chunk_kind_from_chunk_props():
+    # chunk_kind is denormalized onto the Chunk node at load time (pipeline/
+    # load._chunk_props, M10 T3, mirroring the qualified_name join) -- the owning
+    # node's kind ("Module"/"Class"/"Function"), NOT the chunk's own "kind": "Chunk".
+    store = _FakeStore()
+    store.text_chunks = [(_chunk("c1", chunk_kind="Function"), 1.0)]
+    result = retrieval.search_code(store, None, "q", mode="text")
+    assert result["items"][0]["chunk_kind"] == "Function"
+
+
+def test_search_code_item_chunk_kind_none_when_chunk_lacks_the_property():
+    # Pre-T3-loaded graph / symbol absent from staged nodes: honest None, not a
+    # KeyError -- same defensive convention as qualified_name.
+    store = _FakeStore()
+    store.text_chunks = [(_chunk("c1"), 1.0)]  # _chunk() sets no chunk_kind
+    result = retrieval.search_code(store, None, "q", mode="text")
+    assert result["items"][0]["chunk_kind"] is None
+
+
+def test_search_code_item_chunk_kind_distinguishes_method_from_class_level_chunk():
+    # The concrete pilot scenario (§4.1): a big class split into a class-level
+    # header/gap chunk (chunk_kind="Class", qualified_name is the bare class name)
+    # and a method-level chunk (chunk_kind="Function", qualified_name is
+    # "ClassName.method_name") are now distinguishable without guessing from
+    # qualified_name's shape alone.
+    store = _FakeStore()
+    store.text_chunks = [
+        (_chunk("class#c0", qualified_name="DocumentStorageClient", chunk_kind="Class"), 2.0),
+        (
+            _chunk(
+                "method#c0",
+                qualified_name="DocumentStorageClient.upload_file_for_document",
+                chunk_kind="Function",
+            ),
+            1.0,
+        ),
+    ]
+    result = retrieval.search_code(store, None, "q", mode="text")
+    by_id = {i["chunk_id"]: i for i in result["items"]}
+    assert by_id["class#c0"]["chunk_kind"] == "Class"
+    assert by_id["method#c0"]["chunk_kind"] == "Function"
+    assert (
+        by_id["method#c0"]["enclosing_symbol"]
+        == "DocumentStorageClient.upload_file_for_document"
+    )
 
 
 def test_search_code_invalid_mode_returns_error_dict():

@@ -225,8 +225,21 @@ def build_server(
         mode="vector" без доступного embedder'а (или при рассинхроне модели с той,
         которой граф эмбеден) -- {"error": ...}; mode="hybrid" в той же ситуации
         молчаливо деградирует в text-only (mode_used="text" в ответе). Результат:
-        {"items": [{chunk_id, symbol_id, qualified_name, service, relpath,
-        start_line, end_line, snippet, score}, ...], "mode_used": ...}."""
+        {"items": [{chunk_id, symbol_id, qualified_name, enclosing_symbol,
+        chunk_kind, service, relpath, start_line, end_line, snippet, score}, ...],
+        "mode_used": ...}. enclosing_symbol -- qualified_name владеющего чанком
+        символа (то же значение, что qualified_name); chunk_kind -- его kind
+        ("Module"/"Class"/"Function") -- вместе показывают, покрывает ли чанк ровно
+        один метод (chunk_kind="Function") или содержимое уровня класса
+        (chunk_kind="Class": часть большого класса, либо класс целиком).
+
+        Клиент vs сервер (pilot §4.2): у вопроса вида «где ОБРАБАТЫВАЕТСЯ X» (сервер,
+        напр. HTTP/consumer-хендлер) и «кто ВЫЗЫВАЕТ X» (клиент) отвечают чанки из
+        РАЗНЫХ сервисов -- без service-фильтра клиентские методы (их обычно больше,
+        они чаще встречаются по всему workspace) склонны доминировать в топе даже
+        когда вопрос о серверной стороне. Для «где обрабатывается» -- фильтруйте
+        service=<серверный сервис> (владелец хендлера/обработчика); для «кто
+        вызывает» -- service=<сервис-клиент> либо вовсе без фильтра."""
         return gq.search_code(query, k=k, service=service, mode=mode)
 
     return mcp

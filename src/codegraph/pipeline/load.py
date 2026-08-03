@@ -287,7 +287,11 @@ _CHUNK_PROP_FIELDS = (
 )
 
 
-def _chunk_props(row: ChunkRow, qualified_names: dict[str, str] | None = None) -> dict:
+def _chunk_props(
+    row: ChunkRow,
+    qualified_names: dict[str, str] | None = None,
+    kinds: dict[str, str] | None = None,
+) -> dict:
     """`ChunkRow` -> Chunk node props: the T6 brief's own field list ({id, symbol_id,
     service, relpath, ord, start_line, end_line, content_hash, text, context_header,
     embed_model}) PLUS an explicit `kind: "Chunk"` -- every OTHER node kind in this
@@ -321,10 +325,27 @@ def _chunk_props(row: ChunkRow, qualified_names: dict[str, str] | None = None) -
     the field -- no migration concern. A `symbol_id` with no staged node (defensive:
     `chunk_embed` only derives symbol_ids from already-staged defs, but staging.db
     outlives any single run) simply gets no `qualified_name` property (`_omit_none`),
-    which `query.retrieval._chunk_item` reports as `qualified_name: None`."""
+    which `query.retrieval._chunk_item` reports as `qualified_name: None`.
+
+    `kinds` (M10 T3, pilot §4.1 -- "right class in top-1, wrong sub-chunk" misses):
+    a SECOND {node_id: kind} join map ("Module"/"Class"/"Function", i.e. `NodeRec.
+    kind`/`NODE_KINDS`), built by `load_graph` in the exact same `staging.iter_nodes()`
+    pass as `qualified_names` above -- same rationale (index-time-static, zero extra
+    I/O, hot-path-friendly), same defensive None-via-`_omit_none` when `row.symbol_id`
+    has no staged node. Denormalized onto the Chunk node as `chunk_kind` (kept
+    distinct from this function's own `"kind": "Chunk"` above, which is the CHUNK
+    node's own graph kind, not its owning symbol's) -- exposed by
+    `query.retrieval._chunk_item` alongside the already-existing `qualified_name` so a
+    search_code hit can self-describe whether it covers one specific method
+    (chunk_kind="Function") or class-level content (chunk_kind="Class": chunking/
+    splitter.py rule 3's header/gap pieces of an oversized class all share the
+    class's own qualified_name -- chunk_kind is what tells those apart from an
+    actual method chunk, which already carries the METHOD's own qualified_name)."""
     qualified = (qualified_names or {}).get(row.symbol_id)
+    chunk_kind = (kinds or {}).get(row.symbol_id)
     core = {
         "id": row.chunk_id, "kind": "Chunk", "qualified_name": qualified,
+        "chunk_kind": chunk_kind,
         **{f: getattr(row, f) for f in _CHUNK_PROP_FIELDS},
     }
     return _omit_none(core)
@@ -334,6 +355,7 @@ def _chunk_node_batches(
     staging: Staging,
     dim: int | None = None,
     qualified_names: dict[str, str] | None = None,
+    kinds: dict[str, str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Every staged chunk (`staging.iter_chunks()`, ALL services -- never `staging.
     iter_nodes()`, a completely separate table/id-space, see module docstring), split
@@ -391,7 +413,7 @@ def _chunk_node_batches(
     without_vector: list[dict] = []
     stale_skipped = 0
     for row in staging.iter_chunks():
-        entry = {"id": row.chunk_id, "props": _chunk_props(row, qualified_names)}
+        entry = {"id": row.chunk_id, "props": _chunk_props(row, qualified_names, kinds)}
         if row.embedding is None:
             without_vector.append(entry)
             continue
@@ -464,16 +486,19 @@ def load_graph(
 
     # -- 1. nodes: сгруппировать по labels-набору, попутно собрать known_ids +
     # qualified_names (M3 T7: symbol_id -> qualified_name join map для денормализации
-    # qualified_name на Chunk-узлы, см. _chunk_props -- ТОТ ЖЕ единственный проход
-    # iter_nodes(), ни одного дополнительного обращения к staging) --
+    # qualified_name на Chunk-узлы, см. _chunk_props) + kinds (M10 T3: тот же приём,
+    # symbol_id -> kind join map для chunk_kind, см. _chunk_props) -- ТОТ ЖЕ
+    # единственный проход iter_nodes(), ни одного дополнительного обращения к staging --
     nodes_by_labels: dict[tuple[str, ...], list[dict]] = defaultdict(list)
     known_ids: set[str] = set()
     qualified_names: dict[str, str] = {}
+    kinds: dict[str, str] = {}
     for n in staging.iter_nodes():
         labels = _labels_for_kind(n.kind, n.roles)
         nodes_by_labels[labels].append({"id": n.id, "props": _node_props(n)})
         known_ids.add(n.id)
         qualified_names[n.id] = n.qualified_name
+        kinds[n.id] = n.kind
 
     nodes_written = 0
     nodes_written_by_label: dict[str, int] = {}
@@ -487,7 +512,7 @@ def load_graph(
     # module docstring) + a singleton Meta node (ALWAYS written, even with zero chunks/
     # no embedder ever run -- see module docstring for both) --
     chunk_rows_with_vector, chunk_rows_without_vector = _chunk_node_batches(
-        staging, dim=dim, qualified_names=qualified_names
+        staging, dim=dim, qualified_names=qualified_names, kinds=kinds
     )
     # batch.upsert_nodes already no-ops (returns 0, no Cypher built) on an empty rows
     # list regardless of vector_props -- no need for an `if rows:` guard around either

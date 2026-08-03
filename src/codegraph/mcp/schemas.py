@@ -273,6 +273,16 @@ class SearchCodeItem(BaseModel):
     # Chunk-узел при load (pipeline/load._chunk_props, M3 T7 review fix); None, если
     # символ чанка отсутствовал в staged nodes (защитный edge case) или граф загружен
     # pre-T7 load'ом, ещё не материализовавшим это поле
+    enclosing_symbol: str | None = None  # M10 T3 (pilot §4.1): ТО ЖЕ значение, что
+    # qualified_name выше (та же денормализация, тот же None-edge-case) -- явное,
+    # однозначно поименованное аддитивное поле, а не замена qualified_name (который
+    # остаётся ради обратной совместимости), см. query.retrieval._chunk_item докстринг.
+    chunk_kind: str | None = None  # M10 T3: kind узла-владельца ("Module"/"Class"/
+    # "Function", см. core/schema.py NODE_KINDS) -- НЕ kind самого чанка (тот всегда
+    # "Chunk", см. pipeline/load._chunk_props). Денормализовано на Chunk-узел при load
+    # той же техникой, что qualified_name (см. _chunk_props' "kinds" join map); вместе
+    # с qualified_name/enclosing_symbol различает method-level чанк (chunk_kind=
+    # "Function") от class-level содержимого (chunk_kind="Class") -- пилот §4.1.
     service: str | None = None
     relpath: str | None = None
     start_line: int | None = None

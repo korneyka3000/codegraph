@@ -110,6 +110,31 @@ def _chunk_item(props: dict, score: float) -> dict:
         # в staged nodes (защитный edge case) либо граф загружен pre-T7 load'ом,
         # ещё не материализовавшим это поле.
         "qualified_name": props.get("qualified_name"),
+        # M10 T3 (pilot §4.1: "right class in top-1, wrong sub-chunk" -- big classes
+        # split into N chunks, method-level pieces already carry the METHOD's own
+        # qualified_name via chunking/splitter.py rule 3, but nothing on the item
+        # said so explicitly). enclosing_symbol is the SAME value as qualified_name
+        # above -- both ARE "the owning node's qualified_name", already resolved and
+        # denormalized onto this Chunk node at load time (no second store lookup, no
+        # N+1 -- see pipeline/load._chunk_props' own "kinds" docstring section). Kept
+        # as its own additive key (not a rename of qualified_name, which stays for
+        # back-compat) so the response is self-describing without the agent having to
+        # infer "this is the chunk's owning symbol" from an ambiguously-named field.
+        "enclosing_symbol": props.get("qualified_name"),
+        # M10 T3: the owning node's OWN kind ("Module"/"Class"/"Function" -- see
+        # core/schema.py NODE_KINDS; deliberately the SAME capitalization already
+        # used everywhere else a node's kind is surfaced, e.g. find_entrypoint's
+        # results -- not a second, lowercase convention for the identical concept),
+        # denormalized onto the Chunk node at load time exactly like qualified_name
+        # above (pipeline/load._chunk_props' "kinds" join map). Paired with
+        # qualified_name/enclosing_symbol this is what actually lets an agent tell a
+        # method-level chunk (chunk_kind="Function", qualified_name is
+        # "ClassName.method_name") apart from class-level content (chunk_kind=
+        # "Class": either a whole small class, or a header/gap piece of an oversized
+        # one -- both share the bare class qualified_name, see splitter.py rule 3) --
+        # qualified_name's dotted-vs-bare shape alone left that ambiguous. None for
+        # the same defensive/pre-T3-graph reasons as qualified_name.
+        "chunk_kind": props.get("chunk_kind"),
         "service": props.get("service"),
         "relpath": props.get("relpath"),
         "start_line": props.get("start_line"),

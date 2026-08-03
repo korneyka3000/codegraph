@@ -517,6 +517,10 @@ def test_mcp_contract_search_code_text_and_vector_mode_live(falkordb_cfg, tmp_pa
                 # qualified_name denormalized onto the Chunk at load (T7 review fix):
                 # the staged Sym node's own qualified_name, straight through MCP.
                 assert text_out.items[0].qualified_name == "app.orders.create_order"
+                # M10 T3 (pilot §4.1): enclosing_symbol/chunk_kind, same load-time
+                # join, straight through the full MCP stdio round trip.
+                assert text_out.items[0].enclosing_symbol == "app.orders.create_order"
+                assert text_out.items[0].chunk_kind == "Function"  # target_sym.kind
 
                 # -- vector-mode: FakeEmbedder substituted via embedder_factory,
                 # top-1 guaranteed by construction (identical query/chunk text) --
@@ -533,6 +537,9 @@ def test_mcp_contract_search_code_text_and_vector_mode_live(falkordb_cfg, tmp_pa
                 # item is guaranteed present).
                 other_item = next(i for i in vector_out.items if i.chunk_id == "c-other")
                 assert other_item.qualified_name is None
+                # Same honest-None convention extends to the M10 T3 additive fields.
+                assert other_item.enclosing_symbol is None
+                assert other_item.chunk_kind is None
 
                 # -- hybrid (default mode): still finds the same chunk, RRF-fused --
                 hybrid_res = await c.call_tool("search_code", {"query": target_text})

@@ -79,6 +79,35 @@ def test_search_code_item_qualified_name_optional_defaults_none():
     assert out.items[0].qualified_name is None
 
 
+# -- M10 T3 (pilot §4.1): SearchCodeItem.enclosing_symbol/chunk_kind -- additive,
+# same "prove additivity, don't just assert" precedent as TraceExit.channel/
+# WhoCallsOutput.callers[].mechanism above.
+
+
+def test_search_code_output_accepts_item_with_enclosing_symbol_and_chunk_kind():
+    out = SearchCodeOutput(
+        items=[{
+            "chunk_id": "c1", "symbol_id": "sym:a:x",
+            "qualified_name": "app.mod.X.method", "enclosing_symbol": "app.mod.X.method",
+            "chunk_kind": "Function", "service": "svc",
+            "relpath": "mod.py", "start_line": 1, "end_line": 2,
+            "snippet": "def method(self): pass", "score": 0.5,
+        }],
+        mode_used="hybrid",
+    )
+    assert out.items[0].enclosing_symbol == "app.mod.X.method"
+    assert out.items[0].chunk_kind == "Function"
+
+
+def test_search_code_item_enclosing_symbol_and_chunk_kind_optional_default_none():
+    # Pre-T3 result shape (neither key present at all) must keep validating exactly
+    # like every other additive field this schema has grown (qualified_name,
+    # external_exit_count, mechanism, ...).
+    out = SearchCodeOutput(items=[{"snippet": "x", "score": 0.1}], mode_used="text")
+    assert out.items[0].enclosing_symbol is None
+    assert out.items[0].chunk_kind is None
+
+
 def test_find_entrypoint_output_requires_mode_used():
     with pytest.raises(ValidationError):
         FindEntrypointOutput(results=[])

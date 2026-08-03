@@ -235,6 +235,56 @@ def test_chunk_node_batches_passes_qualified_names_through(tmp_path):
     assert with_vector[0]["props"]["qualified_name"] == "app.mod.c"
 
 
+# -- M10 T3 (pilot §4.1, mcp-pilot report): chunk_kind -- the OWNING node's kind
+# ("Module"/"Class"/"Function"), denormalized onto the Chunk node at load time via a
+# SECOND join map built in the exact same staging.iter_nodes() pass as
+# qualified_names above (see load_graph) -- same rationale, same shape, independent
+# key. Lets a search_code hit self-describe whether it covers one specific method
+# (chunk_kind="Function", paired with a method-level qualified_name like
+# "ClassName.method_name") or class-level content (chunk_kind="Class": either an
+# entire small class, or a header/gap piece of an oversized one split by
+# chunking/splitter.py's rule 3) -- the agent no longer has to infer this from
+# qualified_name's shape (dotted vs. bare) alone.
+
+
+def test_chunk_props_joins_chunk_kind_from_map():
+    props = _chunk_props(_row(symbol_id="sym:a:f"), kinds={"sym:a:f": "Function"})
+    assert props["chunk_kind"] == "Function"
+
+
+def test_chunk_props_omits_chunk_kind_when_symbol_not_in_map():
+    # Same defensive edge case as qualified_name: a chunk whose symbol_id has no
+    # staged node -- the property is simply absent, never a None value in the graph.
+    props = _chunk_props(_row(symbol_id="sym:a:ghost"), kinds={"sym:a:f": "Function"})
+    assert "chunk_kind" not in props
+
+
+def test_chunk_props_omits_chunk_kind_without_a_map_at_all():
+    # Direct callers passing no map (pre-T3 signature) keep the exact pre-T3 shape.
+    assert "chunk_kind" not in _chunk_props(_row())
+
+
+def test_chunk_props_joins_qualified_name_and_chunk_kind_independently():
+    # Both maps are keyed off the SAME row.symbol_id but are otherwise independent
+    # lookups -- proves one join can't silently clobber or gate the other.
+    props = _chunk_props(
+        _row(symbol_id="sym:a:f"),
+        qualified_names={"sym:a:f": "app.mod.f"},
+        kinds={"sym:a:f": "Function"},
+    )
+    assert props["qualified_name"] == "app.mod.f"
+    assert props["chunk_kind"] == "Function"
+
+
+def test_chunk_node_batches_passes_kinds_through(tmp_path):
+    st = _staged_chunk_with_embedding(tmp_path, [1.0, 2.0, 3.0])
+    with_vector, without_vector = _chunk_node_batches(
+        st, dim=3, kinds={"c": "Function"}  # symbol_id "c", see helper
+    )
+    assert without_vector == []
+    assert with_vector[0]["props"]["chunk_kind"] == "Function"
+
+
 # -- M3 T6 code-review fix: _chunk_node_batches routes a dimension-mismatched
 # embedding to the without-vector batch instead of vector_props, rather than letting
 # batch.upsert_nodes' own bisection silently drop that one row later with no context
