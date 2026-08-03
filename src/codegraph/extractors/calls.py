@@ -71,6 +71,7 @@ build_calls), and its edge carries `props["mechanism"] = "singleton_dispatch"`
 from __future__ import annotations
 
 import bisect
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -128,61 +129,6 @@ def _find_ref(
     return None
 
 
-# M11 T1 (rerun-5 open-gaps R6, docs/superpowers/reports/2026-08-03-pilot-
-# rerun-5-open-gaps.md): scip-python's own descriptor grammar (scip.proto's
-# `<parameter> ::= '(' <name> ')'`) renders a REFERENCE TO A BARE PARAMETER
-# TOKEN as a trailing `(<param-name>)` appended directly after the ENCLOSING
-# method's own complete `().` suffix -- e.g. `Widget#make().(cls)` for the
-# classmethod-factory idiom `return cls(name)` (facts.py's call-detection has
-# no "cls"/"self" special-casing: `cls(name)` is an ordinary bare-identifier
-# CallFact whose callee token IS the "cls" parameter, so the scip ref AT THAT
-# BYTE POSITION is the PARAMETER's own symbol, not the method's). Confirmed
-# empirically against REAL scip-python 0.6.6 on a synthetic fixture (task-1
-# Step 1, task-1-report.md has the full occurrence dump) BEFORE this fix was
-# written -- and it REFINES the pilot's own root-cause framing ("disambiguator
-# of a method called via class/cls"): TEN external/instance/subclass/sibling
-# call shapes were tried and NONE carry a tail (`Widget.make(...)`,
-# `w.make(...)`, `SubWidget.make(...)`, a `type[Widget]`-typed param's
-# `.make(...)`, `cls.make(...)`, `self.__class__.make(...)`/`type(self).
-# make(...)`, ... all resolve cleanly today already) -- ONLY a bare call whose
-# callee expression IS ITSELF a parameter token carries the tail, and it is
-# NOT classmethod-specific: a parameter literally named "method", bare-called
-# from a PLAIN function or an ordinary instance method, reproduces the
-# identical `(method)` shape with no `@classmethod` anywhere in sight (see
-# test_calls_join.py's own M11 T1 section for the full write-up).
-#
-# `ids.structural_descriptor` never emits a parameter-shaped descriptor for
-# any real Class/Function node (only trailing "#"/"()."), so this tail can
-# never correspond to a staged node -- stripping it converges the id back onto
-# the SAME id the extractor computes structurally for the ENCLOSING method
-# (`symbol_to_node_id`'s own documented contract: "id constructed structurally
-# == id derived from SCIP symbol").
-#
-# Placement (symbols.py vs calls.py, task-1-brief.md's own open decision):
-# HERE, beside `_is_callable_descriptor` (the existing "descriptor suffix
-# shape" helper this directly extends), NOT in resolvers/scip/symbols.py.
-# `parse_symbol`/`symbol_to_node_id` stay pure/general and untouched (pinned
-# by test_scip_symbols.py's own new regression test) -- their other 6 call
-# sites (kafka_ext/temporal_ext/fastapi_ext/python_core/module_singletons)
-# only ever resolve well-known class/decorator/handler DEFINITION symbols,
-# never an arbitrary call-site ref that could be parameter-shaped; only the
-# CALLS-join synthesizes one, from a bare-identifier CallFact.
-#
-# Honesty (rerun-5 R6 rules): ONLY the two CONFIRMED tails are stripped, and
-# ONLY when they directly follow a COMPLETE `().` method suffix (the suffix
-# itself is never touched). Any other trailing `(name)` -- codegraph has never
-# observed or verified one -- is left untouched; generalizing to "strip any
-# parenthesized tail" would silently paper over unverified shapes.
-_METHOD_DISAMBIGUATORS = ("(cls)", "(method)")
-
-
-def _strip_method_disambiguator(descriptors: str) -> str:
-    for tail in _METHOD_DISAMBIGUATORS:
-        if descriptors.endswith(tail) and descriptors[: -len(tail)].endswith("()."):
-            return descriptors[: -len(tail)]
-    return descriptors
-
-
 def _is_callable_descriptor(parsed: ParsedSymbol) -> bool:
     """Every node python_core.py ever stages for a Class/Function has descriptors
     ending in "#" (class) or "()." (function/method) -- `ids.structural_descriptor`'s
@@ -192,20 +138,14 @@ def _is_callable_descriptor(parsed: ParsedSymbol) -> bool:
     "module.attr symbol without a node" shape the M10 pilot diagnosed (a bare
     module-level term, `` `mod`/name. ``, one level deep, no "#"/"()." at all).
 
-    M11 T1 (rerun-5 R6): a descriptor ending in a KNOWN method-disambiguator
-    tail (see `_strip_method_disambiguator` immediately above) directly after a
-    complete `().` suffix is ALSO callable-shaped -- the tail is stripped
-    before the dst id is even computed (`_resolved_dst_id`), so treating it as
-    non-callable here would needlessly attempt (and always fail: a
-    bare-identifier CallFact never carries `receiver_text`, see
-    `_try_singleton` below) a singleton-dispatch redirect for every
-    classmethod's own `cls(...)`-idiom self-construction call."""
-    if parsed.descriptors is None:
-        return False
-    return (
-        parsed.descriptors.endswith("().")
-        or _strip_method_disambiguator(parsed.descriptors) != parsed.descriptors
-    )
+    M11 T1 note: a `(cls)` Parameter-tailed ref (`_cls_construction_dst` below)
+    returns False here and flows through build_calls' `not
+    _is_callable_descriptor` branch -- the SAME branch a direct ctor-call ref
+    (`Widget#`, descriptors ending "#") already flows through today; the
+    `_try_singleton` attempt there is a guaranteed no-op for both (a
+    bare-identifier call has no receiver_text), and the construction-dst
+    rewrite happens at dst-build time instead."""
+    return parsed.descriptors is not None and parsed.descriptors.endswith("().")
 
 
 def _try_singleton(
@@ -229,23 +169,88 @@ def _try_singleton(
     )
 
 
-def _resolved_dst_id(service: str, relpath: str, sym: str, parsed: ParsedSymbol) -> str:
-    """Same construction as `symbol_to_node_id(service, relpath, sym)` -- but
-    reuses the ALREADY-parsed `parsed` (M11 T1) so a KNOWN method-disambiguator
-    tail (`_strip_method_disambiguator`) can be stripped from its `descriptors`
-    before the id is built. Re-parsing `sym` from scratch inside plain
-    `symbol_to_node_id` would silently discard that strip -- it has no
-    knowledge of this CALLS-join-specific normalization by design (see
-    `_is_callable_descriptor`'s own M11 T1 docstring section for the full
-    placement rationale). Local symbols (`is_local`) never carry this tail
-    (the grammar only applies to non-local descriptor strings) and fall
-    straight through to the unchanged, pre-existing `symbol_to_node_id` path."""
+# M11 T1 (rerun-5 open-gaps R6, docs/superpowers/reports/2026-08-03-pilot-
+# rerun-5-open-gaps.md; construction semantics per the task-1 review):
+# scip-python's descriptor grammar (scip.proto's `<parameter> ::= '(' <name>
+# ')'`) renders a REFERENCE TO A BARE PARAMETER TOKEN as a trailing
+# `(<param-name>)` descriptor -- e.g. `Widget#make().(cls)` for the
+# classmethod-factory idiom `return cls(name)` (facts.py has no "cls"
+# special-casing: `cls(name)` is an ordinary bare-identifier CallFact whose
+# callee token IS the "cls" parameter, so the scip ref AT that byte is the
+# PARAMETER's own symbol, not the method's). Confirmed against REAL
+# scip-python 0.6.6 (task-1 Step 1, task-1-report.md has the dump) BEFORE
+# implementation; ten external/instance/subclass/sibling call shapes carry NO
+# tail and need no fix -- ONLY the internal `cls(...)` self-construction does.
+#
+# SEMANTICS (review Important-1): `cls` inside a @classmethod is the
+# language-guaranteed `type[EnclosingClass]` (the @classmethod calling
+# convention) -- `cls(...)` IS CONSTRUCTION of the enclosing class, so the dst
+# is the ENCLOSING CLASS NODE (`...#make().(cls)` -> `...Widget#`), mirroring
+# the pre-existing ctor convention exactly (a direct `Widget()` call's ref is
+# `Widget#` and its CALLS dst is the class node -- same branch, same node
+# kind). NOT the method node (a first-cut `make CALLS make` self-loop is
+# definitionally false -- who_calls(make) would list make itself), and NOT a
+# generic tail-strip: `(method)` is deliberately NOT rewritten (review
+# Important-2 -- a parameter named "method" is an arbitrary caller-supplied
+# callable, the same principled-dynamic class as the spec's own rejected
+# `registry.session`; its honest outcome is a dangling dst dropped at load,
+# exactly like any unknown `(name)` tail).
+#
+# The truncated remainder is guaranteed to end in "#" (a classmethod is
+# syntactically only ever inside a class) -- the regex's `(?<=#)` lookbehind
+# makes that structural guarantee load-bearing: no "#" before the method-name
+# segment (e.g. a module-level `def build(cls)`) -> no match -> no rewrite.
+_CLS_CONSTRUCTION_RE = re.compile(r"(?<=#)[^/#().`]+\(\)\.\(cls\)$")
+
+
+def _cls_construction_dst(
+    service: str,
+    relpath: str,
+    facts: FileFacts,
+    call: CallFact,
+    ref_symbol: str,
+    parsed: ParsedSymbol,
+    def_symbol_lookup: Callable[[str, int], str | None],
+) -> str | None:
+    """dst node id for a VERIFIED classmethod `cls(...)` self-construction call
+    -- the ENCLOSING CLASS node -- or None whenever the construction semantics
+    cannot be verified (the caller then takes the ORIGINAL, pre-M11 path
+    unchanged: raw dangling dst, honest drop at load). scip emits `(cls)` for
+    ANY parameter literally named "cls" -- including on a plain function, an
+    undecorated method, or a metaclass __call__, where `cls` is an arbitrary
+    caller-supplied callable with NO `type[EnclosingClass]` guarantee and a
+    construction edge would be a false match (worse than absence) -- so the
+    rewrite fires only when ALL of:
+
+      1. descriptors end `<method>().(cls)` with the method-name segment
+         directly after a "#" (structural: classmethod => inside a class;
+         remainder = the enclosing CLASS descriptor);
+      2. the call is a BARE `cls(...)` (no receiver -- `self.cls(...)` or any
+         dotted shape is never this idiom);
+      3. the call's enclosing def is a `function` carrying the literal
+         `classmethod` decorator (DefFact.decorators, "@"-stripped raw text --
+         same matching convention as idiom_match/fastapi_ext);
+      4. `ref_symbol` == the enclosing def's OWN scip symbol + "(cls)" -- ties
+         the referenced parameter to THIS call's own enclosing classmethod
+         exactly (rules out a closure-captured outer `cls` seen from a nested
+         def, or any lookup drift).
+
+    Local symbols never carry this tail (the grammar only applies to non-local
+    descriptor strings)."""
     if parsed.is_local or parsed.descriptors is None:
-        return symbol_to_node_id(service, relpath, sym)
-    stripped = _strip_method_disambiguator(parsed.descriptors)
-    if stripped == parsed.descriptors:
-        return symbol_to_node_id(service, relpath, sym)
-    return ids.node_id(service, stripped)
+        return None
+    m = _CLS_CONSTRUCTION_RE.search(parsed.descriptors)
+    if m is None:
+        return None
+    if call.receiver_text is not None or call.enclosing_def is None:
+        return None
+    d = facts.defs[call.enclosing_def]
+    if d.kind != "function" or "classmethod" not in d.decorators:
+        return None
+    enclosing_sym = def_symbol_lookup(relpath, d.name_start_byte)
+    if enclosing_sym is None or ref_symbol != enclosing_sym + "(cls)":
+        return None
+    return ids.node_id(service, parsed.descriptors[: m.start()])
 
 
 def build_calls(
@@ -341,14 +346,17 @@ def build_calls(
                 # itself (dst, mechanism prop) is unaffected.
                 dispatch = SingletonDispatch(dispatch.dst_id, resolution, confidence)
 
-            dst_id = (
-                dispatch.dst_id if dispatch is not None
-                # M11 T1: `parsed` (computed above, from this SAME `ref.symbol`)
-                # carries the disambiguator-strip normalization -- plain
-                # `symbol_to_node_id(service, relpath, ref.symbol)` would
-                # re-parse from scratch and silently lose it.
-                else _resolved_dst_id(service, relpath, ref.symbol, parsed)
-            )
+            if dispatch is not None:
+                dst_id = dispatch.dst_id
+            else:
+                # M11 T1: a VERIFIED classmethod `cls(...)` self-construction
+                # call resolves to the ENCLOSING CLASS node (ctor convention;
+                # `_cls_construction_dst`'s own docstring has the guards);
+                # every other call keeps the pre-existing dst path unchanged.
+                dst_id = _cls_construction_dst(
+                    service, relpath, facts, call, ref.symbol, parsed,
+                    def_symbol_lookup,
+                ) or symbol_to_node_id(service, relpath, ref.symbol)
             src_id = _caller_id(service, relpath, facts, call.enclosing_def, def_symbol_lookup)
 
             key = (src_id, dst_id)

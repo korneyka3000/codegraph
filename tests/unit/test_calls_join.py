@@ -640,75 +640,73 @@ registry = _DBRegistry("dsn")
     assert "mechanism" not in ctor_edge.props
 
 
+
 # ============================================================================
 # M11 T1 (rerun-5 open-gaps R6, docs/superpowers/reports/2026-08-03-pilot-
-# rerun-5-open-gaps.md): scip-python's trailing `(cls)`/`(method)` disambiguator
-# tail on a CALLS dst. MANDATORY Step 1 (task-1-brief.md) reproduced the EXACT
-# form against REAL scip-python 0.6.6 on a synthetic fixture BEFORE any
+# rerun-5-open-gaps.md; REVISED per the task-1 review): scip-python's trailing
+# `(cls)` Parameter-descriptor on a CALLS dst. MANDATORY Step 1 (task-1-brief.md)
+# reproduced the EXACT form against REAL scip-python 0.6.6 BEFORE any
 # implementation (task-1-report.md has the full dump) -- and it REFINES the
 # pilot's own root-cause framing ("disambiguator of a method called via
 # class/cls"): the tail is scip's OWN descriptor grammar (`<parameter> ::= '('
-# <name> ')'`) rendering a REFERENCE TO A BARE PARAMETER TOKEN, full stop --
-# NOT anything about classmethod-via-class-name calls specifically.
+# <name> ')'`) rendering a REFERENCE TO A BARE PARAMETER TOKEN. TEN external/
+# instance/subclass/sibling call shapes were tried and NONE carry a tail
+# (`Widget.make(...)`, `w.make(...)`, `SubWidget.make(...)`, a `type[Widget]`-
+# typed parameter's `.make(...)`, `cls.make(...)`, `self.__class__.make(...)`/
+# `type(self).make(...)` -- all resolve cleanly to `Widget#make().` today,
+# already, with no fix needed). The ONLY tail-carrying shape: a bare-identifier
+# call whose CALLEE EXPRESSION IS ITSELF a parameter token -- the classmethod
+# factory's own self-construction idiom, `@classmethod def make(cls, ...):
+# return cls(...)` (the pilot's own pydantic factories -- `from_decision`/
+# `with_all_steps`/`build_sdf_sof` -- all read as exactly this shape).
+# `codegraph.parsing.facts` has no "cls" special-casing (`cls(name)` is an
+# ordinary bare-identifier CallFact), so the scip ref AT the callee byte is the
+# "cls" PARAMETER's own symbol, `Widget#make().(cls)` -- which no staged node
+# ever corresponds to (`ids.structural_descriptor` only emits "#"/"()."
+# endings), hence permanently dangling pre-fix.
 #
-#   - `Widget.make(...)` (external call, by class name), `w.make(...)` (via an
-#     instance), `SubWidget.make(...)` (via a subclass, inherited), a
-#     `type[Widget]`-typed parameter's `.make(...)`, `cls.make(...)` (sibling
-#     classmethod dispatch), `self.__class__.make(...)`/`type(self).make(...)`
-#     -- TEN call shapes tried, NONE carry a tail; every one resolves cleanly
-#     to `Widget#make().` today, already, with no fix needed.
-#   - The ONLY shape that carries a tail: a bare-identifier call whose CALLEE
-#     EXPRESSION IS ITSELF a parameter token -- overwhelmingly the classmethod
-#     factory's own self-construction idiom, `@classmethod def make(cls, ...):
-#     return cls(...)` (the pilot's own "pydantic classmethod factories" --
-#     `from_decision`/`with_all_steps`/`build_sdf_sof` -- all read as exactly
-#     this shape). `codegraph.parsing.facts` treats ANY bare `identifier(...)`
-#     as a CallFact (no "cls"/"self" special-casing, see its own `node.type ==
-#     "call"` handling) -- so `cls(name)` inside `make`'s own body IS an
-#     ordinary CallFact whose callee token is "cls", and scip's occurrence AT
-#     THAT BYTE POSITION is the "cls" PARAMETER's own symbol,
-#     `Widget#make().(cls)` -- a Parameter-suffixed descriptor
-#     (`ids.structural_descriptor` never emits one for any real Class/Function
-#     node), hence permanently dangling pre-fix.
-#   - `(method)` symmetry (brief's own open question: "classmethod via
-#     instance? staticmethod?"): NEITHER reproduces it. The TRUE mechanism is
-#     identical to `(cls)` and NOT classmethod-specific at all -- confirmed via
-#     a parameter literally named "method", bare-called from within a PLAIN
-#     function AND an ordinary INSTANCE method (`Handler.run(self, method,
-#     *args): return method(*args)`), neither involving `@classmethod` in any
-#     way. Both tails share ONE mechanism; `(method)` is simply the one other
-#     parameter name the rerun-5 diff happened to observe once.
+# SEMANTICS (task-1 review, Important-1): `cls` inside a @classmethod is the
+# language-guaranteed `type[EnclosingClass]` (the @classmethod calling
+# convention), so `cls(...)` IS CONSTRUCTION of the enclosing class -- the dst
+# must be the ENCLOSING CLASS NODE (`...#make().(cls)` -> `...Widget#`),
+# mirroring the pre-existing ctor convention exactly (a direct `Widget()` /
+# `_DBRegistry("dsn")` call's dst is the CLASS node -- see
+# test_singleton_dispatch_end_to_end_via_real_harvest_and_index's own
+# `ctor_edge` assertion above). The first-cut self-loop (`make CALLS make`) was
+# a mislabel: who_calls(make) listing make itself is definitionally false --
+# and a false match is worse than absence.
 #
-# Fix placement (symbols.py vs calls.py, brief's own open decision): calls.py.
-# `_strip_method_disambiguator` lives beside `_is_callable_descriptor` (the
-# existing "descriptor suffix shape" helper this new one directly extends) and
-# is applied to the ALREADY-parsed `ParsedSymbol` before dst construction --
-# `resolvers/scip/symbols.py::parse_symbol`/`symbol_to_node_id` are left
-# completely UNTOUCHED (pinned by test_scip_symbols.py's own new regression
-# test) since none of their other 6 call sites (kafka_ext/temporal_ext/
-# fastapi_ext/python_core/module_singletons) ever process an arbitrary
-# call-site ref that could be parameter-shaped -- only the CALLS-join
-# synthesizes one. Ordering vs. M5 T1 def-membership (brief's own explicit
-# concern: "else classmethod calls classify external"): PROVABLY MOOT for this
-# shape specifically -- a `(cls)`/`(method)`-tailed CallFact can only ever
-# arise from a bare-identifier call CODEGRAPH'S OWN tree-sitter scanned (i.e.
-# first-party source), and the referenced parameter's OWN definition
-# occurrence is staged in that SAME scip run (same file) unconditionally
-# (`Staging.def_symbols`'s own docstring: "unfiltered by symbol shape -- every
-# def... ever staged") -- so `ref.symbol not in def_symbols_set` can never
-# fire for this tail, regardless of strip ordering. `_is_callable_descriptor`
-# is still taught to see through the KNOWN tail anyway (honesty + skips a
-# guaranteed-to-fail `_try_singleton` attempt), matching the brief's own
-# "before classification" framing even though it isn't strictly load-bearing
-# for correctness here.
+# HONESTY GUARDS (the rewrite fires ONLY when the construction semantics are
+# VERIFIABLE, never on tail-shape alone -- scip emits `(cls)` for ANY parameter
+# literally named "cls", including on a plain function or an undecorated
+# method, where `cls` is an arbitrary caller-supplied callable and a
+# construction edge would be exactly the false match the semantics above
+# forbid):
+#   1. structural: the descriptors end `<method>().(cls)` with the method name
+#      segment directly after a "#" -- a classmethod is syntactically only ever
+#      inside a class, so the truncated remainder is guaranteed to end in "#"
+#      (the enclosing CLASS descriptor);
+#   2. the call is a BARE `cls(...)` (no receiver);
+#   3. the enclosing def is a `function` carrying the literal `classmethod`
+#      decorator (DefFact.decorators, "@"-stripped raw text);
+#   4. the ref symbol == the enclosing def's OWN scip symbol + "(cls)" -- ties
+#      the parameter to THIS call's own enclosing classmethod exactly.
+# Any guard failing -> the ORIGINAL (pre-fix) path: raw dangling dst, honest
+# drop at load. `(method)` is NOT rewritten at all (review, Important-2): a
+# parameter named "method" is an arbitrary caller-supplied callable -- the same
+# principled-dynamic class as the spec's own rejected `registry.session` -- so
+# its honest outcome is a drop, exactly like any unknown tail.
 #
-# Resulting edges are SELF-REFERENTIAL by construction (src == dst): the call
-# textually lives inside the SAME classmethod/function whose parameter is
-# being referenced, so `_caller_id` (enclosing def) and the stripped dst
-# (enclosing def's own id) coincide. This is an HONEST, mechanical consequence
-# of what the strip actually recovers -- a reference to the "cls" parameter's
-# OWN binding site -- not a claim that `make` recursively calls itself; see
-# each test's own docstring.
+# Placement unchanged from the first cut: extractors/calls.py
+# (`_cls_construction_dst`), NOT resolvers/scip/symbols.py --
+# `parse_symbol`/`symbol_to_node_id` stay pure/untouched (pinned by
+# test_scip_symbols.py); only the CALLS-join ever synthesizes a
+# parameter-shaped call-site ref. M5-T1 def-membership ordering is provably
+# moot for this shape (the parameter's own def occurrence is staged in the
+# same file's scip run unconditionally, so `ref.symbol not in def_symbols_set`
+# can never fire) -- the `(cls)`-tailed ref flows through the SAME
+# `not _is_callable_descriptor` branch a direct ctor-call ref (`Widget#`)
+# already flows through today, then the dst rewrite happens at dst-build time.
 # ============================================================================
 
 _CLS_FACTORY_SRC = b'''class Widget:
@@ -720,14 +718,14 @@ _CLS_FACTORY_MAKE_SYM = "scip-python python svc 0.1 `w`/Widget#make()."
 _CLS_FACTORY_CLS_PARAM_SYM = "scip-python python svc 0.1 `w`/Widget#make().(cls)"
 
 
-def test_classmethod_self_construction_call_strips_cls_disambiguator_tail(tmp_path):
-    """The classmethod-factory `return cls(name)` idiom -- `cls(name)` is a bare
-    CallFact (facts.py has no "cls" special-casing) whose scip ref is the "cls"
-    PARAMETER's own symbol (`Widget#make().(cls)`, confirmed against real
-    scip-python 0.6.6 -- see this module's own M11 T1 section header). Pre-fix
-    this dst is un-stageable (no node for a Parameter) and silently drops at
-    load; post-fix it strips to `Widget#make().`, which DOES exist as a staged
-    node -- recovering exactly 48/48 of the rerun-5 R6 real-corpus drops."""
+def test_classmethod_cls_construction_resolves_to_enclosing_class_node(tmp_path):
+    """The classmethod-factory `return cls(name)` idiom: the scip ref at the
+    `cls` callee token is the "cls" PARAMETER's own symbol
+    (`Widget#make().(cls)`, confirmed against real scip-python 0.6.6). Pre-fix
+    this dst is un-stageable and silently drops at load; post-fix it rewrites
+    to the ENCLOSING CLASS node (`Widget#`) -- construction, per the ctor
+    convention (review Important-1) -- recovering all 48 rerun-5 R6 real-corpus
+    drops as make -> Class construction edges."""
     st = Staging(tmp_path / "s.db")
     st.begin_service("svc")
     facts = build_file_facts("w.py", _CLS_FACTORY_SRC)
@@ -738,10 +736,8 @@ def test_classmethod_self_construction_call_strips_cls_disambiguator_tail(tmp_pa
                make_def.name_end_byte, make_def.start_line),
         # mirrors REAL scip-python: the "cls" parameter's OWN definition
         # occurrence (in the `def make(cls, name):` signature) is staged too,
-        # same file, same run -- byte position irrelevant to def_symbols_set
-        # (a flat symbol-string set), so an arbitrary span is fine here (mirrors
-        # this file's own pre-existing convention, e.g. `DefRow("m.py", "local
-        # 5", 0, 1, 1)` above).
+        # same file, same run -- def-membership passes on the raw symbol, so
+        # the tailed ref classifies first-party exactly like pre-fix.
         DefRow("w.py", _CLS_FACTORY_CLS_PARAM_SYM, 0, 1, make_def.start_line),
     ])
     st.add_refs("svc", [RefRow("w.py", _CLS_FACTORY_CLS_PARAM_SYM,
@@ -759,8 +755,9 @@ def test_classmethod_self_construction_call_strips_cls_disambiguator_tail(tmp_pa
     assert len(edges) == 1
     e = edges[0]
     assert e.src == "sym:svc:`w`/Widget#make()."
-    # self-referential BY CONSTRUCTION -- see section header docstring.
-    assert e.dst == "sym:svc:`w`/Widget#make()."
+    # ENCLOSING CLASS node (construction), NOT a make->make self-loop (review
+    # Important-1) and NOT the raw dangling parameter symbol (pre-fix).
+    assert e.dst == "sym:svc:`w`/Widget#"
     assert e.resolution == "static" and e.confidence == 1.0
     assert "mechanism" not in e.props
     assert e.props == {"callsite_count": 1}
@@ -773,13 +770,15 @@ _METHOD_PARAM_DISPATCH_SYM = "scip-python python svc 0.1 `w2`/dispatch()."
 _METHOD_PARAM_PARAM_SYM = "scip-python python svc 0.1 `w2`/dispatch().(method)"
 
 
-def test_bare_call_to_method_named_parameter_strips_method_disambiguator_tail(tmp_path):
-    """`(method)`-symmetry (brief's own open question -- confirmed NOT
-    classmethod-specific, see section header): a PLAIN function with a
-    parameter literally named "method", bare-called from its own body
-    (`return method(arg)`), reproduces the identical shape as `(cls)` -- a
-    Parameter-descriptor tail, `dispatch().(method)`. No `@classmethod`/
-    `@staticmethod` anywhere in sight."""
+def test_bare_call_to_method_named_parameter_drops_honestly(tmp_path):
+    """Review Important-2 (reverses the first cut's symmetric `(method)` strip):
+    a parameter literally named "method", bare-called from its own function's
+    body, is an ARBITRARY CALLER-SUPPLIED CALLABLE -- the same principled-
+    dynamic class as the spec's own rejected `registry.session` (rerun-5
+    open-gaps §Переоценка). No static dst is true for it; the honest outcome
+    is the pre-fix one -- joined with the raw dangling parameter symbol,
+    silently dropped at load -- exactly like any unknown tail (see
+    test_unknown_parameter_tail_not_rewritten below)."""
     st = Staging(tmp_path / "s.db")
     st.begin_service("svc")
     facts = build_file_facts("w2.py", _METHOD_PARAM_SRC)
@@ -800,20 +799,83 @@ def test_bare_call_to_method_named_parameter_strips_method_disambiguator_tail(tm
     stats = build_calls("svc", st, {"w2.py": facts}, lookup,
                         def_symbols=st.def_symbols("svc"))
     assert stats.calls_joined == 1
-    assert stats.calls_external == 0 and stats.calls_unresolved == 0
     e = next(e for e in st.iter_edges() if e.type == "CALLS")
     assert e.src == "sym:svc:`w2`/dispatch()."
-    assert e.dst == "sym:svc:`w2`/dispatch()."
-    assert e.resolution == "static" and e.confidence == 1.0
-    assert "mechanism" not in e.props
+    assert e.dst == "sym:svc:`w2`/dispatch().(method)"  # raw -- dangles, drops at load
 
 
-def test_instance_method_call_dst_unaffected_by_disambiguator_stripping(tmp_path):
+def test_cls_named_param_without_classmethod_decorator_not_rewritten(tmp_path):
+    """Honesty-guard pin (guards 3+4 of the section header): scip emits `(cls)`
+    for ANY parameter literally named "cls" -- here an UNDECORATED instance
+    method takes one (`def route(self, cls): return cls()`), where `cls` is an
+    arbitrary caller-supplied callable with NO `type[EnclosingClass]` guarantee.
+    Rewriting to `Widget#` would claim route constructs Widget -- a false
+    match. The decorator guard rejects it -> raw dangling dst, honest drop."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    src = b'''class Widget:
+    def route(self, cls):
+        return cls()
+'''
+    facts = build_file_facts("w5.py", src)
+    route_def = next(d for d in facts.defs if d.name == "route")
+    cls_call = next(c for c in facts.calls if c.callee_name == "cls")
+    route_sym = "scip-python python svc 0.1 `w5`/Widget#route()."
+    cls_param_sym = "scip-python python svc 0.1 `w5`/Widget#route().(cls)"
+    st.add_defs("svc", [
+        DefRow("w5.py", route_sym, route_def.name_start_byte,
+               route_def.name_end_byte, route_def.start_line),
+        DefRow("w5.py", cls_param_sym, 0, 1, route_def.start_line),
+    ])
+    st.add_refs("svc", [RefRow("w5.py", cls_param_sym, cls_call.callee_start_byte,
+                               cls_call.callee_end_byte, cls_call.start_line, 0)])
+
+    def lookup(rp, sb):
+        return route_sym if sb == route_def.name_start_byte else None
+
+    stats = build_calls("svc", st, {"w5.py": facts}, lookup,
+                        def_symbols=st.def_symbols("svc"))
+    assert stats.calls_joined == 1
+    e = next(e for e in st.iter_edges() if e.type == "CALLS")
+    assert e.dst == "sym:svc:`w5`/Widget#route().(cls)"  # raw -- NOT `Widget#`
+
+
+def test_cls_named_param_on_module_level_function_not_rewritten(tmp_path):
+    """Honesty-guard pin (guard 1 of the section header): a PLAIN module-level
+    function with a parameter named "cls" -- descriptors `f().(cls)` have no
+    "#" before the method-name segment (a classmethod is syntactically only
+    ever inside a class), so the structural guard alone already rejects the
+    rewrite (there IS no enclosing class to construct)."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    src = b'''def build(cls):
+    return cls()
+'''
+    facts = build_file_facts("w6.py", src)
+    build_def = next(d for d in facts.defs if d.name == "build")
+    cls_call = next(c for c in facts.calls if c.callee_name == "cls")
+    build_sym = "scip-python python svc 0.1 `w6`/build()."
+    cls_param_sym = "scip-python python svc 0.1 `w6`/build().(cls)"
+    st.add_defs("svc", [
+        DefRow("w6.py", build_sym, build_def.name_start_byte,
+               build_def.name_end_byte, build_def.start_line),
+        DefRow("w6.py", cls_param_sym, 0, 1, build_def.start_line),
+    ])
+    st.add_refs("svc", [RefRow("w6.py", cls_param_sym, cls_call.callee_start_byte,
+                               cls_call.callee_end_byte, cls_call.start_line, 0)])
+    stats = build_calls("svc", st, {"w6.py": facts},
+                        lambda rp, sb: build_sym if sb == build_def.name_start_byte else None,
+                        def_symbols=st.def_symbols("svc"))
+    assert stats.calls_joined == 1
+    e = next(e for e in st.iter_edges() if e.type == "CALLS")
+    assert e.dst == "sym:svc:`w6`/build().(cls)"  # raw -- no class to rewrite onto
+
+
+def test_instance_method_call_dst_unaffected_by_cls_rewrite(tmp_path):
     """Regression pin (M11 T1): an ORDINARY instance-method call carries NO
-    disambiguator tail at all (Step 1 confirmed `w.inst_method()` resolves
-    cleanly today, pre- and post-fix identically) -- `_strip_method_
-    disambiguator` is a no-op whenever the descriptor doesn't end in a KNOWN
-    tail, so this must join EXACTLY as it always has."""
+    parameter tail at all (Step 1 confirmed `w.inst_method()` resolves cleanly
+    today, pre- and post-fix identically) -- the rewrite is a no-op for every
+    tail-less descriptor, so this must join EXACTLY as it always has."""
     st = Staging(tmp_path / "s.db")
     st.begin_service("svc")
     src = b'''class Widget:
@@ -850,14 +912,12 @@ def caller(w):
     assert e.dst == "sym:svc:`w3`/Widget#inst_method()."
 
 
-def test_unknown_disambiguator_tail_not_stripped(tmp_path):
-    """Honesty pin (M11 T1, rerun-5 R6 honesty rules): ONLY the two CONFIRMED
-    tails (`(cls)`, `(method)`) are stripped. An unrecognized tail like
-    `(weird)` -- codegraph has never observed or verified it against real scip
-    output -- is left completely untouched: still joined (a staged def exists
-    for it, same as `(cls)`/`(method)` would be), still carrying the raw
-    dangling dst, still silently dropped at load. Generalizing to "strip any
-    trailing `(name)`" would silently paper over shapes nobody has verified."""
+def test_unknown_parameter_tail_not_rewritten(tmp_path):
+    """Honesty pin (M11 T1, rerun-5 R6 honesty rules): ONLY the verifiable
+    classmethod `(cls)` construction shape is rewritten. Any other parameter
+    tail -- `(weird)` here, and `(method)` above -- is left completely
+    untouched: still joined (a staged def exists for it), still carrying the
+    raw dangling dst, still silently dropped at load."""
     st = Staging(tmp_path / "s.db")
     st.begin_service("svc")
     src = b'''def f():
