@@ -19,6 +19,21 @@
 # Каждая запись выведена ВРУЧНУЮ из fixtures/realstack/services/*/app/*.py +
 # workspace.yaml — см. комментарий у каждой группы для конкретного файла:строки.
 #
+# M10 (task-5, realstack legs): АДДИТИВНОЕ расширение, тот же протокол -- ОДНО
+# новое сечение (singleton-CALLS), задокументировано у своей группы ниже:
+#   1. module-level singleton dispatch (T1): worker's admin_ping (app/routes/
+#      admin.py) calls store.persist(...) on the module-level DocStore singleton
+#      (app/services/doc_store.py's `store = DocStore(...)`) -- CALLS isn't a
+#      gated type in this file (M6 scoped it out of the generic per-type P/R
+#      loop, see the top comment above); this ONE record is pinned the SAME way
+#      the temporal_start CALLS records below already are -- a dedicated,
+#      mechanism-filtered found/golden pair in test_m10_gate.py
+#      (`_found_singleton_dispatch`/`_load_golden_singleton_dispatch`, mirrors
+#      `_found_temporal_start`/`_load_golden_temporal_start` exactly), NOT the
+#      generic GATE_TYPES loop -- resolution/confidence/mechanism are pinned
+#      directly against staging by that same gate (this file carries no such
+#      fields, same convention as every other entry here).
+#
 # M9 (task-5, realstack legs): АДДИТИВНОЕ расширение, той же протокол ("verified
 # addition", M1b/M2 precedent) -- два новых сечения, каждое задокументировано у
 # своей группы ниже:
@@ -77,6 +92,23 @@ edges:
     type: CALLS
     dst: {service: gateway, symbol: app.workflows.submission.DocSubmissionWorkflow.run}
     mechanism: temporal_start
+  # --- M10 T1 (task-5) module-level singleton dispatch: worker's admin_ping
+  # (app/routes/admin.py) calls store.persist(...) on the module-level DocStore
+  # singleton (app/services/doc_store.py's `store = DocStore(...)`) --
+  # scip-python cannot trace the attribute access back to DocStore's own
+  # persist method through the module-level instance binding
+  # (parsing/module_singletons.py's own module docstring; the pilot's #1
+  # real-world dropped-CALLS shape, 53% of 149). extractors/calls.py's
+  # _try_singleton redirects this to a CALLS edge onto DocStore.persist,
+  # resolution=static/1.0 (scip resolves DocStore itself, same-file),
+  # props.mechanism="singleton_dispatch" -- pinned DIRECTLY by test_m10_gate.py
+  # (mirrors the temporal_start CALLS entry immediately above: a dedicated
+  # mechanism-filtered found/golden pair, NOT the generic GATE_TYPES loop --
+  # see this file's own top comment).
+  - src: {service: worker, symbol: app.routes.admin.admin_ping}
+    type: CALLS
+    dst: {service: worker, symbol: app.services.doc_store.DocStore.persist}
+    mechanism: singleton_dispatch
   - src: {service: gateway, symbol: app.workflows.submission.DocSubmissionWorkflow.run}
     type: CALLS
     dst: {service: gateway, symbol: app.workflows.notify.NotifyWorkflow.run}
