@@ -143,6 +143,23 @@ correctly across full and incremental runs alike). The index is threaded into ev
 file's `FileContext.class_attr_index` this call builds. No consumer reads it yet
 (T2/T3, later in this milestone, will) -- this task ships only the harvester, the
 index, and this wiring.
+
+M10 T1 (module-level singleton method-call resolution, MCP-pilot §5 --
+docs/superpowers/reports/2026-08-03-mcp-pilot.md, 53% of that pilot's dropped
+CALLS): mirrors M7 T1's own class_attrs mechanism almost exactly, ONE more claim
+kind ("module_singletons") harvested in the SAME pre-loop pass
+(`parsing.module_singletons.harvest_module_singletons`, needing `ref_symbol_lookup`
+too -- the one input class_attrs' own harvest never required) and assembled into a
+SERVICE-WIDE `SingletonIndex` the same way. Unlike class_attr_index (threaded
+through FileContext, read later by per-file domain extractors), singleton_index is
+consumed DIRECTLY by S6's `build_calls` below (a new keyword parameter) -- it has no
+FileContext-shaped consumer at all, since the join itself, not a domain extractor,
+is what needs it. Incremental coherence is the identical claims-reuse argument (see
+above) PLUS the identical staleness-escalation hole M7 T1 review Important-1 already
+fixed for class_attrs: a singleton's class TYPE is baked into OTHER files' CALLS
+edges exactly like a Settings value is baked into T2/T3's consumers, so 8a's own
+escalation check (`_analyze_incremental`, below) now compares a module_singletons
+digest too -- see `_module_singletons_digest`'s own docstring.
 """
 
 from __future__ import annotations
@@ -165,6 +182,7 @@ from codegraph.extractors.temporal_ext import extract_temporal
 from codegraph.parsing.class_attrs import build_class_attr_index, harvest_class_attrs
 from codegraph.parsing.consts import ConstTable
 from codegraph.parsing.facts import FileFacts, build_file_facts
+from codegraph.parsing.module_singletons import build_singleton_index, harvest_module_singletons
 from codegraph.resolvers import fallback
 from codegraph.resolvers.scip.reader import read_scip_into_staging
 from codegraph.resolvers.scip.runner import ScipRunError, ScipRunner
@@ -181,18 +199,37 @@ def _venv_for(svc: ServiceConfig) -> Path | None:
     return default_venv if default_venv.exists() else None
 
 
-def _class_attrs_digest(staging: Staging, service: str) -> str:
-    """sha256 over the service's CURRENT staged class_attrs claims (M7 T1 review
-    Important-1) -- the incremental path's "did any class-body literal change"
-    fingerprint. Byte-deterministic because `claims_for` orders rows by (relpath,
-    payload_json) (staging.py, M7 T1 review Minor-2 -- an order flip here would read
-    as a phantom change and escalate for no reason) and each payload dict round-trips
-    through sort_keys=True JSON on both write (`add_claims`) and re-dump (here).
-    Includes claims_for's injected "_service"/"_relpath" keys -- constant-per-row
-    metadata that only ever changes when the row itself does, so it never distorts
-    the comparison."""
-    rows = staging.claims_for("class_attrs", service)
+def _claims_digest(staging: Staging, service: str, kind: str) -> str:
+    """sha256 over the service's CURRENT staged claims of `kind` (M7 T1 review
+    Important-1; M10 T1 generalized this from a class_attrs-only helper to a shared
+    one -- module_singletons needs the EXACT same "did any cross-file-joined claim
+    change" fingerprint, see `_module_singletons_digest` below) -- the incremental
+    path's escalation-detection primitive. Byte-deterministic because `claims_for`
+    orders rows by (relpath, payload_json) (staging.py, M7 T1 review Minor-2 -- an
+    order flip here would read as a phantom change and escalate for no reason) and
+    each payload dict round-trips through sort_keys=True JSON on both write
+    (`add_claims`) and re-dump (here). Includes claims_for's injected "_service"/
+    "_relpath" keys -- constant-per-row metadata that only ever changes when the row
+    itself does, so it never distorts the comparison."""
+    rows = staging.claims_for(kind, service)
     return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+
+
+def _class_attrs_digest(staging: Staging, service: str) -> str:
+    return _claims_digest(staging, service, "class_attrs")
+
+
+def _module_singletons_digest(staging: Staging, service: str) -> str:
+    """M10 T1 (pilot §5): the module_singletons analog of `_class_attrs_digest` --
+    a singleton's CLASS TYPE (`registry = _DBRegistry(...)`) is baked into OTHER
+    files' CALLS edges by extractors/calls.py's own singleton-dispatch join exactly
+    the way a Settings default/env is baked into T2/T3's consumers -- refs_hash is
+    just as blind to it (editing the singleton-defining file's ctor argument, or
+    even swapping which class gets constructed, changes NOTHING about any consumer
+    file's own content or refs). Without this, an incremental re-analyze that only
+    touches `app/db/registry.py` would silently leave every OTHER file's
+    singleton-dispatched CALLS edges pointing at a stale (or now-wrong) method."""
+    return _claims_digest(staging, service, "module_singletons")
 
 
 def _apply_role_props_patch(
@@ -321,7 +358,20 @@ def _extract_join_and_stage(
         staging.add_claims(
             svc.name, rp, "class_attrs", harvest_class_attrs(rp, facts_by_file[rp]),
         )
+        # M10 T1 (pilot §5): module-level singleton assigns (`registry =
+        # _DBRegistry(...)`), harvested in the SAME pre-loop pass as class_attrs
+        # above and for the identical reason -- extractors/calls.py's own join (S6,
+        # below) needs the SERVICE-WIDE index fully assembled before it runs, and a
+        # singleton defined in file B must be visible when file A's calls are
+        # joined, regardless of relpaths' own sort order. `ref_symbol_lookup` is
+        # already built above (module_exists/def_symbol_lookup's own sibling) --
+        # this harvester is the first consumer that actually needs it.
+        staging.add_claims(
+            svc.name, rp, "module_singletons",
+            harvest_module_singletons(rp, facts_by_file[rp], ref_symbol_lookup),
+        )
     class_attr_index = build_class_attr_index(staging.claims_for("class_attrs", svc.name))
+    singleton_index = build_singleton_index(staging.claims_for("module_singletons", svc.name))
     fastapi_active = "fastapi" in active_idioms
     # T5: kafka is DATA-driven (effective ServiceIdioms), not active_idioms-gated --
     # see module docstring. idioms=None (default, matches active_idioms=frozenset()'s
@@ -520,6 +570,7 @@ def _extract_join_and_stage(
         svc.name, staging, facts_by_file, def_symbol_lookup, def_symbols,
         local_defs_for_file=local_defs_for_file,
         resolution=resolution, confidence=confidence,
+        singleton_index=singleton_index,
     )
 
     return {
@@ -667,9 +718,12 @@ def _analyze_incremental(
     # digest (M7 T1 review Important-1) must also be snapshotted HERE -- before
     # step 7's delete_file_layer wipes the stale files' claim rows, or the "before"
     # side of the escalation comparison (step 8a) would already be missing them.
+    # M10 T1: module_singletons gets the identical snapshot, same reasoning (see
+    # `_module_singletons_digest`'s own docstring).
     old_files = dict(staging.files_for_service(svc.name))
     old_refs = staging.refs_hash_by_file(svc.name)
     old_class_attrs_digest = _class_attrs_digest(staging, svc.name)
+    old_module_singletons_digest = _module_singletons_digest(staging, svc.name)
 
     # 2-3. make room, then re-scan+add_files fresh (same source of truth the full
     # path always re-scans from) and diff against the just-snapshotted OLD state.
@@ -730,15 +784,36 @@ def _analyze_incremental(
     # first-run incremental, where the digest ALWAYS moves from empty-to-populated):
     # the marker means "this run re-extracted more than the file delta demanded",
     # not "the digest moved".
+    # M10 T1: module_singletons re-harvested in the SAME loop, for the SAME reason
+    # (step 7's delete already wiped the stale files' old claim rows -- this write
+    # is the clean post-state) -- needs its own ref_symbol_lookup, cheap/stateless,
+    # built here rather than threaded in from the caller (mirrors
+    # _extract_join_and_stage's own identical partial).
+    ref_symbol_lookup = partial(staging.ref_symbol_at, svc.name)
     stale_escalation: str | None = None
     for rp in stale_sorted:
         staging.add_claims(
             svc.name, rp, "class_attrs", harvest_class_attrs(rp, facts_by_file[rp]),
         )
-    if _class_attrs_digest(staging, svc.name) != old_class_attrs_digest:
+        staging.add_claims(
+            svc.name, rp, "module_singletons",
+            harvest_module_singletons(rp, facts_by_file[rp], ref_symbol_lookup),
+        )
+    class_attrs_changed = _class_attrs_digest(staging, svc.name) != old_class_attrs_digest
+    module_singletons_changed = (
+        _module_singletons_digest(staging, svc.name) != old_module_singletons_digest
+    )
+    if class_attrs_changed or module_singletons_changed:
         all_scanned = {rp for rp, _, _ in rows}
         if all_scanned - stale:
-            stale_escalation = "class_attrs_changed"
+            # class_attrs takes precedence when BOTH moved in the same run (keeps
+            # the pre-existing marker value/test byte-identical for a pure
+            # class_attrs change); module_singletons gets its OWN distinct marker
+            # so a caller/test can tell which claim kind actually escalated.
+            stale_escalation = (
+                "class_attrs_changed" if class_attrs_changed
+                else "module_singletons_changed"
+            )
             stale = all_scanned
             stale_sorted = sorted(stale)
             staging.delete_file_layer(

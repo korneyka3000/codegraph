@@ -37,7 +37,33 @@ per-file-scoped `scip_defs` rows, `local_def_symbols`, not the service-wide
 at all (fully dynamic) are likewise counted unresolved. Matched first-party calls are
 aggregated per (src, dst) into one CALLS edge with a callsite_count and evidence from
 the first call site encountered.
-"""
+
+M10 T1 (pilot §5, docs/superpowers/reports/2026-08-03-mcp-pilot.md): module-level
+singleton method-call resolution -- `registry = _DBRegistry(config.database.dsn)` at
+module level, `registry.session()` call-sites elsewhere, previously resolved (when
+resolved at all) to a node-less `module.attr` symbol and got silently dropped at S9
+load (79/149 [53%] of the pilot's dropped CALLS, all this ONE pattern -- scip cannot
+connect an attribute access on a module-level INSTANCE back to its class's own
+method). The new OPTIONAL `singleton_index` parameter (default None, every
+pre-existing caller unaffected) is consulted as a FALLBACK, tried ONLY when the
+normal ref-based resolution above does not already point at a real, callable-shaped,
+staged node -- an unresolved call (no ref at all), a local ref with no matching local
+def, a non-local ref with no staged def (external), or -- the exact shape the pilot
+diagnosed -- a non-local ref that DOES have a staged def but whose descriptors are
+NOT function/method-shaped (`ids.structural_descriptor`'s own construction: every
+Class/Function node's descriptors end in "#" or "().", so anything else, e.g. a bare
+`` `mod`/name. `` module-attribute term, can never correspond to a real callable node
+python_core.py ever stages). `_try_singleton` (below) resolves a call's OWN
+`receiver_text`/`callee_name` (facts.py's M8 T1 fields) against the service-wide
+`SingletonIndex` (parsing/module_singletons.py) and VERIFIES the candidate against
+`def_symbols` before ever using it -- never overriding an already-good resolution,
+never guessing when the candidate can't be verified (the ORIGINAL, pre-M10 path is
+then taken completely unchanged, including staying "dangling" when that was already
+going to happen). A successful redirect's resolution/confidence come from the
+SingletonIndex entry's OWN tier (static/1.0 or heuristic/0.6 -- see that module's
+docstring), not from this function's `resolution`/`confidence` parameters, and its
+edge carries `props["mechanism"] = "singleton_dispatch"` (existing edges' props stay
+exactly `{"callsite_count": N}`, unchanged)."""
 
 from __future__ import annotations
 
@@ -48,9 +74,14 @@ from dataclasses import dataclass
 from codegraph.core import ids
 from codegraph.core.schema import EdgeRec
 from codegraph.extractors.python_core import nesting_chain
-from codegraph.parsing.facts import FileFacts
+from codegraph.parsing.facts import CallFact, FileFacts
+from codegraph.parsing.module_singletons import (
+    SingletonDispatch,
+    SingletonIndex,
+    resolve_singleton_call,
+)
 from codegraph.resolvers.base import RefRow
-from codegraph.resolvers.scip.symbols import parse_symbol, symbol_to_node_id
+from codegraph.resolvers.scip.symbols import ParsedSymbol, parse_symbol, symbol_to_node_id
 from codegraph.stores.staging import Staging
 
 _EXTRACTOR = "calls"
@@ -94,6 +125,38 @@ def _find_ref(
     return None
 
 
+def _is_callable_descriptor(parsed: ParsedSymbol) -> bool:
+    """Every node python_core.py ever stages for a Class/Function has descriptors
+    ending in "#" (class) or "()." (function/method) -- `ids.structural_descriptor`'s
+    own construction, mirrored by every def-id path (`_def_id`, resolvers/fallback.py's
+    `_symbol`). A resolved+staged symbol whose descriptors do NOT end in "()." can
+    therefore never correspond to a real function/method node -- exactly the
+    "module.attr symbol without a node" shape the M10 pilot diagnosed (a bare
+    module-level term, `` `mod`/name. ``, one level deep, no "#"/"()." at all)."""
+    return parsed.descriptors is not None and parsed.descriptors.endswith("().")
+
+
+def _try_singleton(
+    call: CallFact,
+    singleton_index: SingletonIndex | None,
+    def_symbols_set: set[str],
+    service: str,
+) -> SingletonDispatch | None:
+    """M10 T1: try a module-level-singleton redirect for `call` -- None whenever
+    there is nothing to try (no index wired) or the receiver isn't a bare (dot-free)
+    name (mirrors `idiom_match._match_receiver`'s own "receiver -- ПРОСТОЕ имя [без
+    точек]" convention: `self.registry.session()`/`mod.registry.session()` are never
+    attempted, only this task's own claimed shape -- a bare module-level binding)."""
+    if singleton_index is None:
+        return None
+    receiver = call.receiver_text
+    if receiver is None or "." in receiver:
+        return None
+    return resolve_singleton_call(
+        singleton_index, receiver, call.callee_name, def_symbols_set, service,
+    )
+
+
 def build_calls(
     service: str,
     staging: Staging,
@@ -103,6 +166,7 @@ def build_calls(
     local_defs_for_file: Callable[[str], set[str]] | None = None,
     resolution: str = "static",
     confidence: float = 1.0,
+    singleton_index: SingletonIndex | None = None,
 ) -> JoinStats:
     calls_joined = 0
     calls_unresolved = 0
@@ -112,8 +176,12 @@ def build_calls(
     # zero-arg callable (tests' preferred style, mirroring local_defs_for_file's own
     # lambda pattern) -- never re-queried per file or per call-site either way.
     def_symbols_set = def_symbols() if callable(def_symbols) else def_symbols
-    # (src, dst) -> {"count": int, "file": str, "line": int} — evidence is the FIRST
-    # call site encountered for that pair (dict only set once, per key).
+    # (src, dst) -> {"count", "file", "line", "resolution", "confidence", "mechanism"}
+    # — evidence AND classification are the FIRST call site encountered for that pair
+    # (dict only set once, per key). "resolution"/"confidence"/"mechanism" (M10 T1)
+    # default to this call's own (function-parameter) resolution/confidence and
+    # mechanism=None; a successful singleton redirect overrides all three with the
+    # SingletonDispatch's own values -- see build_calls' own module-docstring addendum.
     agg: dict[tuple[str, str], dict] = {}
 
     for relpath, facts in facts_by_file.items():
@@ -123,38 +191,64 @@ def build_calls(
 
         for call in facts.calls:
             ref = _find_ref(call.callee_start_byte, by_start, refs, starts)
-            if ref is None:
-                calls_unresolved += 1
-                continue
+            dispatch: SingletonDispatch | None = None
 
-            parsed = parse_symbol(ref.symbol)
-            if parsed.is_local:
-                # ВНИМАНИЕ (M1b): pyright деградирует нерезолвленные 3rd-party в 'local N' —
-                # такие "first-party" локалы без def-occurrence в том же документе на деле
-                # unresolved (см. m1a-task-10-report §2). Unaffected by M5 Task 1 below --
-                # local-ness is decided by SCIP's own symbol shape, not by def_symbols.
-                if (local_defs_for_file is not None
-                        and ref.symbol not in local_defs_for_file(relpath)):
+            if ref is None:
+                dispatch = _try_singleton(call, singleton_index, def_symbols_set, service)
+                if dispatch is None:
                     calls_unresolved += 1
                     continue
-            # M5 Task 1 (pilot Bug B, see module docstring): first-party for a
-            # non-local symbol is decided by EXISTENCE OF A STAGED DEF, not by
-            # `parsed.package == service` -- --project-name makes that comparison
-            # unreliable (it stamps package=service on every resolved symbol,
-            # including third-party library calls resolvable via this service's own
-            # venv). `parsed.package`/`.descriptors` are deliberately not consulted
-            # here at all any more.
-            elif ref.symbol not in def_symbols_set:
-                calls_external += 1
-                continue
+            else:
+                parsed = parse_symbol(ref.symbol)
+                if parsed.is_local:
+                    # ВНИМАНИЕ (M1b): pyright деградирует нерезолвленные 3rd-party в 'local N' —
+                    # такие "first-party" локалы без def-occurrence в том же документе на деле
+                    # unresolved (см. m1a-task-10-report §2). Unaffected by M5 Task 1 below --
+                    # local-ness is decided by SCIP's own symbol shape, not by def_symbols.
+                    if (local_defs_for_file is not None
+                            and ref.symbol not in local_defs_for_file(relpath)):
+                        dispatch = _try_singleton(
+                            call, singleton_index, def_symbols_set, service,
+                        )
+                        if dispatch is None:
+                            calls_unresolved += 1
+                            continue
+                # M5 Task 1 (pilot Bug B, see module docstring): first-party for a
+                # non-local symbol is decided by EXISTENCE OF A STAGED DEF, not by
+                # `parsed.package == service` -- --project-name makes that comparison
+                # unreliable (it stamps package=service on every resolved symbol,
+                # including third-party library calls resolvable via this service's own
+                # venv). `parsed.package`/`.descriptors` are deliberately not consulted
+                # here at all any more.
+                elif ref.symbol not in def_symbols_set:
+                    dispatch = _try_singleton(call, singleton_index, def_symbols_set, service)
+                    if dispatch is None:
+                        calls_external += 1
+                        continue
+                elif not _is_callable_descriptor(parsed):
+                    # M10 T1: resolved + staged def, but NOT function/method-shaped
+                    # (the exact "module.attr" shape the pilot diagnosed) -- try the
+                    # redirect; on failure dst below still falls back to the
+                    # ORIGINAL (dangling) symbol, unchanged from pre-M10 behavior
+                    # (still "joined", still silently dropped at load -- this task
+                    # narrows, never widens, what gets dropped).
+                    dispatch = _try_singleton(call, singleton_index, def_symbols_set, service)
 
-            dst_id = symbol_to_node_id(service, relpath, ref.symbol)
+            dst_id = (
+                dispatch.dst_id if dispatch is not None
+                else symbol_to_node_id(service, relpath, ref.symbol)
+            )
             src_id = _caller_id(service, relpath, facts, call.enclosing_def, def_symbol_lookup)
 
             key = (src_id, dst_id)
             entry = agg.get(key)
             if entry is None:
-                entry = {"count": 0, "file": relpath, "line": call.start_line}
+                entry = {
+                    "count": 0, "file": relpath, "line": call.start_line,
+                    "resolution": dispatch.resolution if dispatch is not None else resolution,
+                    "confidence": dispatch.confidence if dispatch is not None else confidence,
+                    "mechanism": "singleton_dispatch" if dispatch is not None else None,
+                }
                 agg[key] = entry
             entry["count"] += 1
             calls_joined += 1
@@ -162,9 +256,14 @@ def build_calls(
     edges = [
         EdgeRec(
             src=src, dst=dst, type="CALLS",
-            resolution=resolution, confidence=confidence, extractor=_EXTRACTOR,
+            resolution=entry["resolution"], confidence=entry["confidence"],
+            extractor=_EXTRACTOR,
             evidence_file=entry["file"], evidence_line=entry["line"],
-            props={"callsite_count": entry["count"]},
+            props=(
+                {"callsite_count": entry["count"], "mechanism": entry["mechanism"]}
+                if entry["mechanism"] is not None
+                else {"callsite_count": entry["count"]}
+            ),
         )
         for (src, dst), entry in agg.items()
     ]

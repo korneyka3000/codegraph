@@ -121,6 +121,23 @@ class AssignFact:
     # with a default so every pre-existing positional AssignFact(...) construction
     # site keeps working unchanged.
     target_start_byte: int | None = None
+    # M10 T1 sanctioned additive extension (module-level singleton method-call
+    # resolution, mirrors ClassAttrFact.enclosing_def's own M7 T1 precedent):
+    # `enclosing_def` is the index into FileFacts.defs of the immediately-enclosing
+    # def, None at module level -- needed to filter AssignFact's own scope-blind
+    # collection down to MODULE-LEVEL `name = ClassName(...)` singleton assigns
+    # (parsing/module_singletons.py's harvest). `callee_start_byte`/`callee_end_byte`
+    # are the byte span of the callee TOKEN itself (identifier as-is, or an attribute
+    # chain's LAST segment -- mirrors CallFact's own `callee_start_byte`/
+    # `callee_end_byte` and ArgFact's "attr" value_kind span convention), needed to
+    # resolve ClassName to a scip/structural symbol via ctx.ref_symbol_lookup (an
+    # occurrence table keyed by byte offset) -- `callee_name` alone is decoded TEXT
+    # with no position. Three new LAST fields, all defaulting to None, so every
+    # pre-existing positional/keyword AssignFact(...) construction site keeps working
+    # unchanged.
+    enclosing_def: int | None = None
+    callee_start_byte: int | None = None
+    callee_end_byte: int | None = None
 
 
 @dataclass(frozen=True)
@@ -382,6 +399,27 @@ def _call_callee_name(fn_node) -> str | None:
         attr = fn_node.child_by_field_name("attribute")
         if attr is not None:
             return attr.text.decode("utf-8", errors="replace")
+    return None
+
+
+# M10 T1 sanctioned additive extension: byte span of the SAME token `_call_callee_name`
+# reads text from -- a bare identifier spans whole; a dotted chain spans only its LAST
+# segment (mirrors `_call_callee_name`'s own identifier/attribute split, and ArgFact's
+# "attr" value_kind span convention). Kept as a separate helper (not folded into
+# `_call_callee_name`) so every pre-existing `_call_callee_name`-only call site
+# (ClassAttrFact's call-shaped RHS) stays untouched -- only AssignFact's own
+# construction below needs the span too.
+
+
+def _call_callee_span(fn_node) -> tuple[int, int] | None:
+    if fn_node is None:
+        return None
+    if fn_node.type == "identifier":
+        return fn_node.start_byte, fn_node.end_byte
+    if fn_node.type == "attribute":
+        attr = fn_node.child_by_field_name("attribute")
+        if attr is not None:
+            return attr.start_byte, attr.end_byte
     return None
 
 
@@ -684,12 +722,16 @@ def build_file_facts(relpath: str, source: bytes) -> FileFacts:
                     call_fn = call_node.child_by_field_name("function")
                     callee_name = _call_callee_name(call_fn)
                     if call_fn is not None and call_fn.type in ("identifier", "attribute"):
+                        callee_span = _call_callee_span(call_fn)
                         assigns.append(AssignFact(
                             target=left.text.decode("utf-8", errors="replace"),
                             callee_name=callee_name,
                             call_args=_build_call_args(call_node.child_by_field_name("arguments")),
                             start_line=node.start_point[0] + 1,
                             target_start_byte=left.start_byte,
+                            enclosing_def=parent_def,
+                            callee_start_byte=callee_span[0] if callee_span else None,
+                            callee_end_byte=callee_span[1] if callee_span else None,
                         ))
             # M7 T3 sanctioned additive extension: `self.<attr> = <expr>` -- see
             # SelfAttrFact's own docstring for the full rationale (http_client_ext's

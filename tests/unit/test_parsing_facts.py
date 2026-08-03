@@ -429,6 +429,66 @@ def test_assign_fact_target_start_byte_function_level_assignment():
     assert source[producer_ctor.target_start_byte:end] == b"_producer"
 
 
+# -- AssignFact.enclosing_def / callee_start_byte / callee_end_byte: M10 T1 sanctioned
+# additive extension (module-level singleton method-call resolution). AssignFact
+# carried NEITHER a scope field (module vs. function/class body -- unlike
+# ClassAttrFact's own `enclosing_def`, M7 T1 precedent) NOR the callee token's own
+# byte span (unlike CallFact's `callee_start_byte`/`callee_end_byte`) -- both needed
+# to harvest module-level `name = ClassName(...)` singleton assigns (enclosing_def is
+# None) and resolve ClassName to a scip/structural symbol via ctx.ref_symbol_lookup
+# (which needs the callee TOKEN's own span, not the call's argument spans). Three new
+# LAST fields, all defaulting to None -- every pre-existing positional/keyword
+# AssignFact(...) construction site (incl. the field-order contract test and the
+# target_start_byte tests above) keeps working unchanged.
+
+
+def test_assign_fact_new_fields_default_to_none():
+    a = AssignFact("x", "Callee", [], 3, 7)
+    assert a.enclosing_def is None
+    assert a.callee_start_byte is None
+    assert a.callee_end_byte is None
+    a2 = AssignFact("x", "Callee", [], 3, 7, 0, 10, 16)
+    assert a2.enclosing_def == 0
+    assert a2.callee_start_byte == 10
+    assert a2.callee_end_byte == 16
+
+
+def test_assign_fact_enclosing_def_none_at_module_level():
+    src = b"client = make_client()\n"
+    facts = build_file_facts("x.py", src)
+    client_assign = next(a for a in facts.assigns if a.target == "client")
+    assert client_assign.enclosing_def is None
+
+
+def test_assign_fact_enclosing_def_points_at_enclosing_function():
+    src = b'''def handler():
+    result = process()
+    return result
+'''
+    facts = build_file_facts("x.py", src)
+    handler_def = next(d for d in facts.defs if d.name == "handler")
+    result_assign = next(a for a in facts.assigns if a.target == "result")
+    assert result_assign.enclosing_def == handler_def.index
+
+
+def test_assign_fact_callee_span_points_at_bare_identifier():
+    src = b"registry = _DBRegistry(x)\n"
+    facts = build_file_facts("x.py", src)
+    a = next(a for a in facts.assigns if a.target == "registry")
+    assert a.callee_start_byte is not None and a.callee_end_byte is not None
+    assert src[a.callee_start_byte:a.callee_end_byte] == b"_DBRegistry"
+
+
+def test_assign_fact_callee_span_points_at_attribute_last_segment_only():
+    """Mirrors ArgFact's own "attr" value_kind span convention (and CallFact's
+    receiver_start_byte/receiver_end_byte, M8 T1): a dotted callee's span is its LAST
+    segment only -- the actual class name being referenced, not the module prefix."""
+    src = b"registry = mod.sub.DBRegistry(x)\n"
+    facts = build_file_facts("x.py", src)
+    a = next(a for a in facts.assigns if a.target == "registry")
+    assert src[a.callee_start_byte:a.callee_end_byte] == b"DBRegistry"
+
+
 # -- ParamFact: typed_parameter / typed_default_parameter (Depends) with spans --
 
 

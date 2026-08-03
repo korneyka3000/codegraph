@@ -1348,3 +1348,138 @@ def test_analyze_incremental_stale_settings_file_claims_replaced_not_duplicated(
     assert config_claims[0]["fields"]["verification_requests_url"]["default"] == (
         "http://localhost:9000"
     )
+
+
+# ============================================================================
+# M10 T1 (pilot §5, docs/superpowers/reports/2026-08-03-mcp-pilot.md): module-level
+# singleton method-call resolution -- `registry = _DBRegistry(...)` at module level
+# (app/db/registry.py), `registry.session()` elsewhere (app/handlers.py). Mirrors
+# the M7 T1 class_attrs section above almost exactly: unconditional harvest, an
+# end-to-end CALLS-edge proof through the REAL analyze_service pipeline (degraded
+# path -- resolvers/fallback.py's own same-file class-reference resolution turns out
+# to be enough to reach the STATIC tier even with no real scip-python at all, see
+# the dedicated test below), and the SAME 8a staleness-escalation mechanism, now
+# keyed off a module_singletons digest change too.
+# ============================================================================
+
+_SINGLETON_DEFINING_SRC = (
+    "class _DBRegistry:\n"
+    "    def __init__(self, dsn):\n"
+    "        self.dsn = dsn\n"
+    "\n"
+    "    async def session(self):\n"
+    "        pass\n"
+    "\n"
+    "\n"
+    "registry = _DBRegistry(\"dsn\")\n"
+)
+
+_SINGLETON_CONSUMER_SRC = (
+    "from app.db.registry import registry\n"
+    "\n"
+    "\n"
+    "async def handler():\n"
+    "    async with registry.session() as s:\n"
+    "        pass\n"
+)
+
+
+def _singleton_service_tree(tmp_path):
+    svc_root = tmp_path / "svc"
+    (svc_root / "app" / "db").mkdir(parents=True)
+    (svc_root / "app" / "__init__.py").write_text("")
+    (svc_root / "app" / "db" / "__init__.py").write_text("")
+    (svc_root / "app" / "db" / "registry.py").write_text(_SINGLETON_DEFINING_SRC)
+    (svc_root / "app" / "handlers.py").write_text(_SINGLETON_CONSUMER_SRC)
+    return svc_root
+
+
+def test_analyze_full_writes_module_singletons_claims_unconditionally(tmp_path):
+    """No idioms/active_idioms passed at all -- proves the harvest pass is NOT gated
+    behind any domain-extractor activation flag (mirrors the class_attrs precedent
+    test above)."""
+    svc = ServiceConfig(name="svc", path=_singleton_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+
+    claims = st.claims_for("module_singletons", "svc")
+    by_name = {c["name"]: c for c in claims}
+    assert "registry" in by_name
+    assert by_name["registry"]["class_name_text"] == "_DBRegistry"
+    # app/handlers.py has no module-level ctor assign of its own -- no claim.
+    assert all(rp != "app/handlers.py" for rp in (c["_relpath"] for c in claims))
+
+
+def test_analyze_full_resolves_module_level_singleton_method_call_end_to_end(tmp_path):
+    """The brief's own repro, driven through the REAL analyze_service pipeline (not
+    build_calls directly): a degraded (_AlwaysFailRunner) run still reaches the
+    STATIC tier here -- resolvers/fallback.py's own ref-building resolves a
+    same-file class reference (`_DBRegistry` referenced by the ctor call inside its
+    OWN defining file) exactly as scip would, so the singleton's class type is
+    "static"-resolved even with no real scip-python involved at all."""
+    svc = ServiceConfig(name="svc", path=_singleton_service_tree(tmp_path))
+    st = Staging(tmp_path / "s.db")
+    report = analyze_service(svc, st, tmp_path / "cache", runner=_AlwaysFailRunner())
+    assert report["degraded"] is True
+
+    edges = [e for e in st.iter_edges() if e.type == "CALLS"]
+    dispatched = [e for e in edges if e.props.get("mechanism") == "singleton_dispatch"]
+    assert len(dispatched) == 1
+    e = dispatched[0]
+    assert e.dst.endswith("_DBRegistry#session().")
+    assert e.resolution == "static" and e.confidence == 1.0
+
+
+def test_analyze_incremental_singleton_class_change_escalates_stale_to_all_files(tmp_path):
+    svc_root = _singleton_service_tree(tmp_path)
+    svc = ServiceConfig(name="svc", path=svc_root)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    # ONLY the singleton-defining file changes -- and only WHICH CLASS it
+    # constructs (registry's own TYPE), same "one file's own literal/type moves,
+    # every OTHER file's derived edges must not silently go stale" shape as the
+    # class_attrs settings-change escalation test above.
+    (svc_root / "app" / "db" / "registry.py").write_text(
+        _SINGLETON_DEFINING_SRC.replace("_DBRegistry", "_OtherRegistry"),
+    )
+
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["stale_escalation"] == "module_singletons_changed"
+    # ALL 4 scanned files re-extracted, not just app/db/registry.py itself.
+    assert report["stale_files"] == report["files"] == 4
+    assert report["stale_relpaths"] == (
+        "app/__init__.py", "app/db/__init__.py", "app/db/registry.py", "app/handlers.py",
+    )
+    by_name = {c["name"]: c for c in st.claims_for("module_singletons", "svc")}
+    assert by_name["registry"]["class_name_text"] == "_OtherRegistry"
+
+
+def test_analyze_incremental_non_singleton_change_does_not_escalate(tmp_path):
+    """The negative: an edit that does NOT move any module-level singleton claim
+    (app/handlers.py only CONSUMES the singleton, never defines one) keeps the
+    narrow stale set and reports stale_escalation=None -- escalation keys off the
+    module_singletons claims DIGEST, not off 'some file changed' (mirrors the
+    class_attrs negative test above)."""
+    svc_root = _singleton_service_tree(tmp_path)
+    svc = ServiceConfig(name="svc", path=svc_root)
+    st = Staging(tmp_path / "s.db")
+    analyze_service(svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True))
+
+    (svc_root / "app" / "handlers.py").write_text(
+        _SINGLETON_CONSUMER_SRC + "\n\ndef other():\n    pass\n",
+    )
+
+    report = analyze_service(
+        svc, st, tmp_path / "cache", runner=_FakeSuccessRunner(from_cache=True),
+        incremental=True,
+    )
+
+    assert report["mode"] == "incremental"
+    assert report["stale_escalation"] is None
+    assert report["stale_relpaths"] == ("app/handlers.py",)

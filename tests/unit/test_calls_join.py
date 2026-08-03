@@ -2,6 +2,7 @@ from codegraph.extractors.base import FileContext
 from codegraph.extractors.calls import build_calls
 from codegraph.extractors.python_core import extract as extract_python_core
 from codegraph.parsing.facts import build_file_facts
+from codegraph.parsing.module_singletons import build_singleton_index, harvest_module_singletons
 from codegraph.resolvers.base import DefRow, RefRow
 from codegraph.resolvers.fallback import resolve_service
 from codegraph.stores.staging import Staging
@@ -308,3 +309,307 @@ def test_calls_edge_into_id_collision_family_lands_on_first_branch_never_dangles
     # just a member of def_symbols (a symbol-string set); this checks the disjoint
     # NODE id-space extract() itself populated above.
     assert e.dst in staged_ids
+
+
+# ============================================================================
+# M10 T1 (pilot §5, docs/superpowers/reports/2026-08-03-mcp-pilot.md): module-level
+# singleton method-call resolution. `registry = _DBRegistry(...)` at module level,
+# `registry.session()` elsewhere -- 79/149 (53%) of the pilot's dropped CALLS, all
+# this ONE pattern (scip resolves the call to a node-less `module.attr` symbol, or
+# doesn't resolve it at all). build_calls' new OPTIONAL `singleton_index` parameter
+# (default None -- every test ABOVE this section passes none, unaffected byte-for-
+# byte) is tried ONLY as a fallback when the normal ref-based resolution does not
+# already point at a real, callable-shaped, staged node -- never overriding an
+# already-good resolution.
+# ============================================================================
+
+_REGISTRY_CLASS_SYM = "scip-python python svc 0.1 `app.db.registry`/_DBRegistry#"
+_REGISTRY_SESSION_SYM = "scip-python python svc 0.1 `app.db.registry`/_DBRegistry#session()."
+
+
+def _singleton_call_facts():
+    src = b'''async def handler():
+    async with registry.session() as s:
+        pass
+'''
+    facts = build_file_facts("app/handlers.py", src)
+    call = next(c for c in facts.calls if c.callee_name == "session")
+    return facts, call
+
+
+def _registry_singleton_index(tier="static"):
+    claim = {
+        "name": "registry",
+        "class_symbol": _REGISTRY_CLASS_SYM if tier == "static" else None,
+        "class_name_text": "_DBRegistry",
+        "resolution_tier": tier,
+    }
+    return build_singleton_index([claim])
+
+
+def test_singleton_dispatch_redirects_fully_unresolved_call(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    facts, _call = _singleton_call_facts()
+    st.add_defs("svc", [DefRow("app/db/registry.py", _REGISTRY_SESSION_SYM, 0, 1, 1)])
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=_registry_singleton_index(),
+    )
+    assert stats.calls_joined == 1 and stats.calls_unresolved == 0
+    edges = [e for e in st.iter_edges() if e.type == "CALLS"]
+    assert len(edges) == 1
+    e = edges[0]
+    assert e.dst == "sym:svc:`app.db.registry`/_DBRegistry#session()."
+    assert e.resolution == "static" and e.confidence == 1.0
+    assert e.props == {"callsite_count": 1, "mechanism": "singleton_dispatch"}
+
+
+def test_singleton_dispatch_redirects_local_without_local_def(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    facts, call = _singleton_call_facts()
+    st.add_defs("svc", [DefRow("app/db/registry.py", _REGISTRY_SESSION_SYM, 0, 1, 1)])
+    st.add_refs("svc", [RefRow("app/handlers.py", "local 9", call.callee_start_byte,
+                               call.callee_end_byte, call.start_line, 0)])
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=_registry_singleton_index(),
+        local_defs_for_file=lambda rp: st.local_def_symbols("svc", rp),
+    )
+    assert stats.calls_joined == 1 and stats.calls_unresolved == 0
+    e = next(e for e in st.iter_edges() if e.type == "CALLS")
+    assert e.dst == "sym:svc:`app.db.registry`/_DBRegistry#session()."
+
+
+def test_singleton_dispatch_redirects_external_call(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    facts, call = _singleton_call_facts()
+    st.add_defs("svc", [DefRow("app/db/registry.py", _REGISTRY_SESSION_SYM, 0, 1, 1)])
+    third_party_sym = "scip-python python svc deadbeef `some.thirdparty`/Thing#session()."
+    st.add_refs("svc", [RefRow("app/handlers.py", third_party_sym, call.callee_start_byte,
+                               call.callee_end_byte, call.start_line, 0)])
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=_registry_singleton_index(),
+    )
+    assert stats.calls_joined == 1 and stats.calls_external == 0
+    e = next(e for e in st.iter_edges() if e.type == "CALLS")
+    assert e.dst == "sym:svc:`app.db.registry`/_DBRegistry#session()."
+
+
+def test_singleton_dispatch_redirects_non_callable_shaped_resolved_symbol(tmp_path):
+    """The EXACT pilot-diagnosed shape: scip resolved the call to a bare module-level
+    term (descriptors ending in a plain "." -- no "#"/"()." anywhere) that DOES have
+    a staged def, so pre-M10 code would silently join with a dangling dst. This is
+    what actually made 79/149 dropped CALLS look "joined" in the pilot's own
+    staging.db diff (`edges WHERE type='CALLS'` minus materialized `nodes.id`)."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    facts, call = _singleton_call_facts()
+    bogus_sym = "scip-python python svc 0.1 `app.db.registry`/session."
+    st.add_defs("svc", [
+        DefRow("app/db/registry.py", _REGISTRY_SESSION_SYM, 0, 1, 1),
+        DefRow("app/db/registry.py", bogus_sym, 2, 3, 1),
+    ])
+    st.add_refs("svc", [RefRow("app/handlers.py", bogus_sym, call.callee_start_byte,
+                               call.callee_end_byte, call.start_line, 0)])
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=_registry_singleton_index(),
+    )
+    assert stats.calls_joined == 1
+    e = next(e for e in st.iter_edges() if e.type == "CALLS")
+    assert e.dst == "sym:svc:`app.db.registry`/_DBRegistry#session()."
+    assert e.props["mechanism"] == "singleton_dispatch"
+
+
+def test_singleton_dispatch_heuristic_tier_redirects_and_carries_lower_confidence(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    facts, _call = _singleton_call_facts()
+    st.add_defs("svc", [DefRow("app/db/registry.py", _REGISTRY_SESSION_SYM, 0, 1, 1)])
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"),
+        singleton_index=_registry_singleton_index(tier="heuristic"),
+    )
+    assert stats.calls_joined == 1
+    e = next(e for e in st.iter_edges() if e.type == "CALLS")
+    assert e.dst == "sym:svc:`app.db.registry`/_DBRegistry#session()."
+    assert e.resolution == "heuristic" and e.confidence == 0.6
+
+
+def test_singleton_dispatch_method_missing_stays_unresolved(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    facts, _call = _singleton_call_facts()
+    # no _REGISTRY_SESSION_SYM staged at all -- the singleton candidate can't be
+    # verified against def_symbols, so it is NEVER GUESSED.
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=_registry_singleton_index(),
+    )
+    assert stats.calls_joined == 0 and stats.calls_unresolved == 1
+    assert list(st.iter_edges()) == []
+
+
+def test_singleton_dispatch_method_missing_non_callable_shaped_falls_through_dangling(tmp_path):
+    """Redirect fails (the singleton class has no such method staged) -- the
+    ORIGINAL (dangling) dst still joins, EXACTLY as it did before this task: M10
+    narrows what silently drops at load, it never widens it."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    facts, call = _singleton_call_facts()
+    bogus_sym = "scip-python python svc 0.1 `app.db.registry`/session."
+    st.add_defs("svc", [DefRow("app/db/registry.py", bogus_sym, 2, 3, 1)])
+    st.add_refs("svc", [RefRow("app/handlers.py", bogus_sym, call.callee_start_byte,
+                               call.callee_end_byte, call.start_line, 0)])
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=_registry_singleton_index(),
+    )
+    assert stats.calls_joined == 1  # unchanged pre-M10 behavior: joined, dangling dst
+    e = next(e for e in st.iter_edges() if e.type == "CALLS")
+    assert e.dst == "sym:svc:`app.db.registry`/session."
+    assert "mechanism" not in e.props
+
+
+def test_singleton_dispatch_absent_receiver_not_in_map_stays_unresolved(tmp_path):
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    src = b'''def handler():
+    other.session()
+'''
+    facts = build_file_facts("app/handlers.py", src)
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=_registry_singleton_index(),
+    )
+    assert stats.calls_unresolved == 1 and stats.calls_joined == 0
+
+
+def test_singleton_dispatch_dotted_receiver_not_attempted(tmp_path):
+    """Mirrors idiom_match._match_receiver's own bare-name-only convention -- a
+    dotted receiver (`self.registry.session()`) is never attempted, even though its
+    LAST segment equals a known singleton name."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    src = b'''class C:
+    def handler(self):
+        self.registry.session()
+'''
+    facts = build_file_facts("app/handlers.py", src)
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=_registry_singleton_index(),
+    )
+    assert stats.calls_unresolved == 1 and stats.calls_joined == 0
+
+
+def test_singleton_dispatch_never_overrides_already_resolved_callable_call(tmp_path):
+    """A call that ALREADY resolves to a real, callable-shaped, staged node is left
+    completely untouched, even though its receiver equals a known singleton name --
+    singleton dispatch is a fallback for FAILURE paths only, never an override of a
+    working resolution."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    facts, call = _singleton_call_facts()
+    real_sym = "scip-python python svc 0.1 `app.handlers`/_LocalRegistry#session()."
+    st.add_defs("svc", [
+        DefRow("app/db/registry.py", _REGISTRY_SESSION_SYM, 0, 1, 1),
+        DefRow("app/handlers.py", real_sym, 2, 3, 1),
+    ])
+    st.add_refs("svc", [RefRow("app/handlers.py", real_sym, call.callee_start_byte,
+                               call.callee_end_byte, call.start_line, 0)])
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=_registry_singleton_index(),
+    )
+    assert stats.calls_joined == 1
+    e = next(e for e in st.iter_edges() if e.type == "CALLS")
+    assert e.dst == "sym:svc:`app.handlers`/_LocalRegistry#session()."
+    assert "mechanism" not in e.props
+
+
+def test_build_calls_without_singleton_index_unaffected(tmp_path):
+    """Backward compatibility: build_calls' new parameter defaults to None -- a
+    caller that never passes it (every pre-existing test in this file) behaves
+    exactly as before, even for a receiver-shaped call whose name would otherwise
+    match a singleton."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+    facts, _call = _singleton_call_facts()
+    stats = build_calls(
+        "svc", st, {"app/handlers.py": facts}, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"),
+    )
+    assert stats.calls_unresolved == 1 and stats.calls_joined == 0
+
+
+def test_singleton_dispatch_end_to_end_via_real_harvest_and_index(tmp_path):
+    """Full chain, no hand-built SingletonIndex: harvest_module_singletons ->
+    build_singleton_index -> build_calls, exactly like analyze.py's own wiring --
+    the brief's own synthetic repro (`registry = _DBRegistry(...)` in one file,
+    `async with registry.session() as s` in ANOTHER)."""
+    st = Staging(tmp_path / "s.db")
+    st.begin_service("svc")
+
+    defining_src = b'''class _DBRegistry:
+    async def session(self):
+        pass
+
+
+registry = _DBRegistry("dsn")
+'''
+    defining_facts = build_file_facts("app/db/registry.py", defining_src)
+    consumer_facts, _call = _singleton_call_facts()
+
+    session_def = next(d for d in defining_facts.defs if d.name == "session")
+    class_def = next(d for d in defining_facts.defs if d.name == "_DBRegistry")
+    registry_assign = next(a for a in defining_facts.assigns if a.target == "registry")
+
+    st.add_defs("svc", [
+        DefRow("app/db/registry.py", _REGISTRY_SESSION_SYM,
+               session_def.name_start_byte, session_def.name_end_byte,
+               session_def.start_line),
+        DefRow("app/db/registry.py", _REGISTRY_CLASS_SYM,
+               class_def.name_start_byte, class_def.name_end_byte, class_def.start_line),
+    ])
+    # the ctor call's OWN ref: "_DBRegistry" at the assignment RHS resolves (as a
+    # REFERENCE occurrence) to the class's own def symbol.
+    st.add_refs("svc", [RefRow(
+        "app/db/registry.py", _REGISTRY_CLASS_SYM,
+        registry_assign.callee_start_byte, registry_assign.callee_end_byte,
+        registry_assign.start_line, 0,
+    )])
+
+    ref_symbol_lookup = lambda rp, sb: st.ref_symbol_at("svc", rp, sb)  # noqa: E731
+    st.add_claims(
+        "svc", "app/db/registry.py", "module_singletons",
+        harvest_module_singletons("app/db/registry.py", defining_facts, ref_symbol_lookup),
+    )
+    singleton_index = build_singleton_index(st.claims_for("module_singletons", "svc"))
+
+    facts_by_file = {
+        "app/db/registry.py": defining_facts, "app/handlers.py": consumer_facts,
+    }
+    stats = build_calls(
+        "svc", st, facts_by_file, lambda rp, sb: None,
+        def_symbols=st.def_symbols("svc"), singleton_index=singleton_index,
+    )
+    # 2 joined, not 1: `defining_facts` (in facts_by_file too) also has its OWN
+    # CallFact for the `_DBRegistry("dsn")` ctor call itself, which joins normally
+    # (module -> class, pre-existing behavior, nothing to do with singleton dispatch
+    # -- a bare-identifier call has no receiver_text, so _try_singleton never even
+    # fires for it, see the dedicated dst assertion below).
+    assert stats.calls_joined == 2 and stats.calls_unresolved == 0
+    edges = [e for e in st.iter_edges() if e.type == "CALLS"]
+    assert len(edges) == 2
+    dispatched = next(e for e in edges if e.dst.endswith("session()."))
+    assert dispatched.dst == "sym:svc:`app.db.registry`/_DBRegistry#session()."
+    assert dispatched.resolution == "static" and dispatched.confidence == 1.0
+    assert dispatched.props["mechanism"] == "singleton_dispatch"
+    ctor_edge = next(e for e in edges if e.dst.endswith("_DBRegistry#"))
+    assert "mechanism" not in ctor_edge.props
