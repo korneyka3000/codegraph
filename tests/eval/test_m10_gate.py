@@ -61,6 +61,32 @@ golden.
       part of "every M1-M10 gate", so it keeps re-proving T4 on every full gate
       run, including this milestone's own final one -- reuse, not silence.
 
+  (M11 T1, task-1, rerun-5 open-gaps R6, docs/superpowers/reports/2026-08-03-
+      pilot-rerun-5-open-gaps.md): classmethod-factory `(cls)` scip
+      disambiguator strip (`extractors/calls.py::_strip_method_disambiguator`).
+      `app/services/step_factory.py`'s new `StepDetails.from_label` classmethod
+      does `return cls(label)` internally -- scip-python's own descriptor
+      grammar renders that AS A REFERENCE TO THE "cls" PARAMETER ITSELF
+      (`...#from_label().(cls)`), not a real callable node; the strip recovers
+      the CALLS edge onto `from_label`'s own id -- SELF-REFERENTIAL by
+      construction (see that fixture module's own docstring for the full
+      mechanism, empirically confirmed against real scip-python 0.6.6 in
+      task-1-report.md's Step 1). PROTOCOL NOTE (task-1-brief.md's own explicit
+      call): a SINGLE pin does not warrant a dedicated gate file -- extended
+      HERE via one more `_pin_calls_edge` call, reusing the SAME pipeline
+      run/staging as every other M10/M11 leg above, mirroring how this module
+      itself already carries T1-T4 additions onto what was originally an M9
+      gate. Deliberately NOT added to `golden/edges.yaml`: unlike
+      singleton_dispatch/temporal_start, this recovered edge carries NO
+      `mechanism` prop (an ordinary ref-based join, not a redirect --
+      `dispatch` stays `None` on this path in `build_calls`), so there is no
+      tag a mechanism-filtered golden pair could select on, and
+      `golden/edges.yaml`'s own top comment states the generic CALLS graph is
+      deliberately untracked there -- an entry nothing would ever read would
+      silently violate that file's own documented scope. The direct pin below
+      is the complete proof (and was sabotage-verified against the pre-fix
+      `calls.py`, task-1-report.md).
+
 Deliberately NOT ported from test_m9_gate.py: the ~15 individual M6/M7/M8/M9-era
 `_pin_edge` calls (SETTINGS_PRODUCER, ENUM_PRODUCER, SIGNAL_CHANNEL/SENDER/
 HANDLER, HTTP_PINS, the funnel negative, multi-mount compose-back, ...) -- the
@@ -126,6 +152,12 @@ GATE_TYPES = ("INVOKES_ACTIVITY", "CALLS_HTTP", "CONSUMES", "PRODUCES", "HANDLES
 # -- M10 T1 (task-5) pin targets: module-level singleton dispatch ---------------
 SINGLETON_CALLER = ("worker", "app.routes.admin.admin_ping")
 SINGLETON_METHOD = ("worker", "app.services.doc_store.DocStore.persist")
+
+# -- M11 T1 (task-1, rerun-5 R6) pin target: classmethod-factory `cls(...)`
+# self-construction call -- SELF-REFERENTIAL by construction (src == dst), see
+# fixtures/realstack/services/worker/app/services/step_factory.py's own
+# docstring and this module's own M11 T1 docstring paragraph above.
+CLASSMETHOD_FACTORY = ("worker", "app.services.step_factory.StepDetails.from_label")
 
 # -- M10 T2 (task-5) pin targets: who_calls x INVOKES_ACTIVITY, live ------------
 # Pre-existing M6-era fixture data (gap 2, golden/edges.yaml) -- no new fixture
@@ -355,6 +387,19 @@ def test_m10_gate(tmp_path, falkordb_cfg):
             SINGLETON_CALLER, SINGLETON_METHOD,
             resolution="static", confidence=1.0,
             props_subset={"mechanism": "singleton_dispatch"},
+        )
+
+        # -- M11 T1 (task-1, rerun-5 R6): classmethod-factory `cls(...)` scip
+        # disambiguator strip -- see module docstring's own M11 T1 paragraph.
+        # SELF-REFERENTIAL by construction (src == dst): `from_label`'s own
+        # `return cls(label)` call strips onto `from_label`'s own id, not a
+        # redirect (no `mechanism` prop, unlike the singleton_dispatch pin
+        # immediately above -- an ordinary ref-based join).
+        _pin_calls_edge(
+            problems, staging, "classmethod cls(...) disambiguator strip",
+            CLASSMETHOD_FACTORY, CLASSMETHOD_FACTORY,
+            resolution="static", confidence=1.0,
+            props_subset={"callsite_count": 1},
         )
 
         # -- capture node ids needed post-close (staging.iter_nodes() only works
