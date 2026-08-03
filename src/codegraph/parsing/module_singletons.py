@@ -5,7 +5,13 @@ database.dsn)` at module level, then `registry.session()` call-sites elsewhere,
 resolve to a node-less `module.attr` symbol (scip can't connect the attribute access
 back to `_DBRegistry`'s own `session` method through the module-level instance
 binding) and get silently dropped at load -- 79 of 149 dropped CALLS (53%) on the
-pilot's real corpus, all this ONE pattern.
+pilot's real corpus, all this ONE pattern. Hedge (T5's own raw-scip-occurrence
+finding, fixtures/realstack/services/worker/app/services/doc_store.py's own
+docstring): this scip limitation is narrower in simple, self-contained synthetics
+than the phrasing above suggests -- a minimal two-file case resolves straight
+through the module-level binding with no drop at all; real-world messiness (a
+gradual-typing `: Any` escape hatch, confirmed empirically) is what still triggers
+it.
 
 Mirrors class_attrs.py's own M7 T1 shape almost exactly (harvest -> per-file claims
 kind="module_singletons" -> service-wide index assembled from `staging.claims_for`,
@@ -310,7 +316,9 @@ def _heuristic_candidate(
         if parsed.is_local or parsed.descriptors is None:
             continue
         if parsed.descriptors.endswith(suffix):
-            matches.add(parsed.descriptors)
+            i = len(parsed.descriptors) - len(suffix) - 1
+            if i >= 0 and parsed.descriptors[i] in "/#":
+                matches.add(parsed.descriptors)
     if len(matches) != 1:
         return None  # not found, or ambiguous (2+ same-named classes) -- never guess
     return SingletonDispatch(ids.node_id(service, next(iter(matches))), "heuristic", 0.6)

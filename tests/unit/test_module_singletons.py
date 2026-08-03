@@ -29,6 +29,11 @@ from codegraph.parsing.module_singletons import (
 _SVC = "scip-python python svc 0.1"
 _DB_REGISTRY_CLASS_SYM = f"{_SVC} `app.db.registry`/_DBRegistry#"
 _DB_REGISTRY_SESSION_SYM = f"{_SVC} `app.db.registry`/_DBRegistry#session()."
+# M10 final review IMPORTANT-1: "HTTPClient" ends with "Client" -- these two
+# specifically exercise the suffix-boundary check (see the resolve_singleton_call
+# heuristic-tier tests below).
+_CLIENT_GET_SYM = f"{_SVC} `app.http`/Client#get()."
+_HTTP_CLIENT_GET_SYM = f"{_SVC} `app.http`/HTTPClient#get()."
 
 
 def _claims(relpath: str, src: bytes, lookup=None) -> list[dict]:
@@ -299,6 +304,60 @@ def test_resolve_singleton_call_heuristic_tier_ambiguous_class_name_never_guesse
         idx, "registry", "session", _def_symbols(other_sym), "svc",
     )
     assert dispatch is None
+
+
+def test_resolve_singleton_call_heuristic_tier_suffix_boundary_false_match_refused():
+    """M10 FINAL review IMPORTANT-1: `parsed.descriptors.endswith(suffix)` alone is a
+    plain STRING suffix check, not a segment-boundary one -- "...HTTPClient#get()."
+    textually ENDS WITH "...Client#get()." (HTTPClient itself ends with "Client"),
+    so a `bar = Client(...)` singleton (heuristic tier -- class `Client` itself
+    never staged) would wrongly dispatch to HTTPClient's OWN #get() method at
+    heuristic/0.6 confidence: the false match is UNIQUE (only one symbol
+    collides), so the `len(matches) != 1` ambiguity guard never even fires.
+    "False match worse than no match" (module docstring's own binding policy,
+    the same one `_heuristic_candidate`'s own docstring already invokes for
+    class-shape) -- reviewer's LIVE repro, staged-fixture shape."""
+    idx = build_singleton_index([{
+        "name": "bar", "class_symbol": None,
+        "class_name_text": "Client", "resolution_tier": "heuristic",
+    }])
+    dispatch = resolve_singleton_call(idx, "bar", "get", {_HTTP_CLIENT_GET_SYM}, "svc")
+    assert dispatch is None
+
+
+def test_resolve_singleton_call_heuristic_tier_true_suffix_match_unaffected():
+    """Positive control for the boundary-check fix above: the TRUE class (`Client`
+    itself -- the char immediately preceding the scanned suffix is "/", a real
+    top-level-class descriptor boundary) still resolves, unaffected by the
+    stricter check."""
+    idx = build_singleton_index([{
+        "name": "bar", "class_symbol": None,
+        "class_name_text": "Client", "resolution_tier": "heuristic",
+    }])
+    dispatch = resolve_singleton_call(idx, "bar", "get", {_CLIENT_GET_SYM}, "svc")
+    assert dispatch == SingletonDispatch(
+        dst_id="sym:svc:`app.http`/Client#get().",
+        resolution="heuristic", confidence=0.6,
+    )
+
+
+def test_resolve_singleton_call_heuristic_tier_boundary_check_resolves_true_collision():
+    """Symmetric false-NEGATIVE half of the same bug: pre-fix, a TRUE `Client#get().`
+    staged ALONGSIDE a suffix-colliding `HTTPClient#get().` produced 2 textual
+    matches -- an honest-ambiguity None for a call site that in fact has exactly
+    ONE true target. The boundary check excludes the non-boundary sibling, so
+    this now resolves to the single true match instead of losing the edge."""
+    idx = build_singleton_index([{
+        "name": "bar", "class_symbol": None,
+        "class_name_text": "Client", "resolution_tier": "heuristic",
+    }])
+    dispatch = resolve_singleton_call(
+        idx, "bar", "get", {_CLIENT_GET_SYM, _HTTP_CLIENT_GET_SYM}, "svc",
+    )
+    assert dispatch == SingletonDispatch(
+        dst_id="sym:svc:`app.http`/Client#get().",
+        resolution="heuristic", confidence=0.6,
+    )
 
 
 def test_resolve_singleton_call_unknown_receiver_returns_none():

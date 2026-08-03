@@ -21,8 +21,10 @@ inference is good enough to trace a SIMPLE, self-contained class through the
 module-level binding directly, landing on a properly callable-shaped ref
 (`DocStore#persist().`) with no redirect needed at all (confirmed via a raw
 scip occurrence dump, not guessed). The explicit `: Any` annotation below is
-the one variation empirically confirmed (same raw-occurrence method) to
-reproduce the pilot's OWN diagnosed dst shape: it suppresses scip's own
+the one variation empirically confirmed (same raw-occurrence method) that
+reproduces the pilot's OUTCOME via the ref-is-None branch; the pilot's own
+diagnosed dst shape is the non-callable-descriptor branch -- both trigger
+branches unit-covered (test_calls_join.py). It suppresses scip's own
 occurrence for the `.persist` callee token entirely (no ref at that byte
 range at all -- `build_calls`' `ref is None` branch), while the CTOR
 callee's OWN ref (`DocStore` on the line below) is COMPLETELY UNAFFECTED and
