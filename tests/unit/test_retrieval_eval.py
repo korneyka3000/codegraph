@@ -58,6 +58,19 @@ def _item(symbol_id: str, qualified_name: str | None, service: str, score: float
     }
 
 
+def _item_kind(
+    symbol_id: str, qualified_name: str | None, service: str, score: float, chunk_kind: str,
+) -> dict:
+    """Same shape as `_item`, plus `chunk_kind` -- for the R7 granularity-bridging
+    tests below, which need to exercise the chunk_kind-aware branches of the hit
+    predicate that `_item` alone (no `chunk_kind` key at all) never reaches. Kept as
+    its OWN helper rather than an added optional param on `_item` itself, so every
+    pre-R7 test above stays untouched -- this file's R7 section is purely additive."""
+    item = _item(symbol_id, qualified_name, service, score)
+    item["chunk_kind"] = chunk_kind
+    return item
+
+
 def _search_fn(items_by_query: dict[str, list[dict]]):
     """Fake search_fn(query, k) -> {"items": [...]} -- the same shape
     GraphQuery.search_code returns. Ignores k itself (run_questions is responsible
@@ -240,3 +253,173 @@ def test_run_questions_passes_per_question_k_to_search_fn():
     run_questions(search_fn, q)
 
     assert seen == [("q1", 3), ("q2", 7)]
+
+
+# -- run_questions: R7 -- granularity-aware hit predicate, class<->method bridging --
+# (docs/superpowers/reports/2026-08-05-pilot-rerun-7-open-gaps.md). M12 aggregates a
+# "fat" class's sibling chunks into ONE class-representative item, and the SAME class
+# is separately chunked per-method too (chunking/splitter.py rule 3) -- so the
+# correct answer to a question can legitimately land on EITHER granularity. Strict
+# (service, qualified_name) equality alone can't bridge the two; these tests pin the
+# dotted-prefix + chunk_kind bridging rules that do.
+
+
+def test_run_questions_class_item_credits_accept_on_its_own_method():
+    # Class-representative item (chunk_kind="Class", qualified_name="DocClient") at
+    # rank 0 -- accept names one of ITS OWN methods (dotted-prefix child) -- must hit
+    # at rank 0: the aggregated class item stands in for that very method among its
+    # (collapsed) sibling chunks.
+    q = [{
+        "question": "q1", "k": 3,
+        "accept": [{"service": "svc", "symbol": "DocClient.upload_file"}],
+    }]
+    search_fn = _search_fn({
+        "q1": [_item_kind("sym:svc:DocClient", "DocClient", "svc", 0.9, "Class")],
+    })
+
+    results = run_questions(search_fn, q)
+
+    assert results[0]["hit"] is True
+    assert results[0]["rank"] == 0
+
+
+def test_run_questions_function_item_credits_accept_on_its_own_class():
+    # Mirror image: a method-chunk item (chunk_kind="Function",
+    # qualified_name="Settings.validate_urls") at rank 0 -- accept names its
+    # enclosing class (bare, no dot) -- must hit at rank 0.
+    q = [{
+        "question": "q1", "k": 3,
+        "accept": [{"service": "svc", "symbol": "Settings"}],
+    }]
+    search_fn = _search_fn({
+        "q1": [_item_kind("sym:svc:validate", "Settings.validate_urls", "svc", 0.9, "Function")],
+    })
+
+    results = run_questions(search_fn, q)
+
+    assert results[0]["hit"] is True
+    assert results[0]["rank"] == 0
+
+
+def test_run_questions_class_item_does_not_credit_a_different_class_method():
+    # Negative pin: a class item only bridges to ITS OWN methods, never another
+    # class's -- accept names OtherCls.upload_file, item is class DocClient.
+    q = [{
+        "question": "q1", "k": 3,
+        "accept": [{"service": "svc", "symbol": "OtherCls.upload_file"}],
+    }]
+    search_fn = _search_fn({
+        "q1": [_item_kind("sym:svc:DocClient", "DocClient", "svc", 0.9, "Class")],
+    })
+
+    results = run_questions(search_fn, q)
+
+    assert results[0]["hit"] is False
+    assert results[0]["rank"] is None
+
+
+def test_run_questions_function_item_does_not_credit_a_different_class():
+    # Same negative pin, mirrored: a method-chunk item only bridges to ITS OWN
+    # enclosing class -- accept names OtherCls.upload_file, item is the (unrelated)
+    # method DocClient.upload_file.
+    q = [{
+        "question": "q1", "k": 3,
+        "accept": [{"service": "svc", "symbol": "OtherCls.upload_file"}],
+    }]
+    search_fn = _search_fn({
+        "q1": [_item_kind("sym:svc:upload", "DocClient.upload_file", "svc", 0.9, "Function")],
+    })
+
+    results = run_questions(search_fn, q)
+
+    assert results[0]["hit"] is False
+    assert results[0]["rank"] is None
+
+
+def test_run_questions_class_prefix_match_requires_dot_boundary():
+    # Prefix-trap: "Cls" must NOT match item "ClsOther.method" -- a bare (non-dotted)
+    # prefix check would false-positive on an unrelated, similarly-named class; the
+    # mandatory "." boundary right after the class name rules that out.
+    q = [{
+        "question": "q1", "k": 3,
+        "accept": [{"service": "svc", "symbol": "Cls"}],
+    }]
+    search_fn = _search_fn({
+        "q1": [_item_kind("sym:svc:method", "ClsOther.method", "svc", 0.9, "Function")],
+    })
+
+    results = run_questions(search_fn, q)
+
+    assert results[0]["hit"] is False
+    assert results[0]["rank"] is None
+
+
+def test_run_questions_bridging_still_requires_service_match():
+    # A correct dotted-prefix pairing on the WRONG service must not hit -- bridging
+    # is additive on top of the (service, ...) requirement, not a replacement for it.
+    q = [{
+        "question": "q1", "k": 3,
+        "accept": [{"service": "svc-a", "symbol": "DocClient.upload_file"}],
+    }]
+    search_fn = _search_fn({
+        "q1": [_item_kind("sym:svc-b:DocClient", "DocClient", "svc-b", 0.9, "Class")],
+    })
+
+    results = run_questions(search_fn, q)
+
+    assert results[0]["hit"] is False
+    assert results[0]["rank"] is None
+
+
+def test_run_questions_missing_chunk_kind_falls_back_to_exact_match_only():
+    # Pre-M10 graph: item carries no chunk_kind key at all (plain `_item`, not
+    # `_item_kind`) -- a class/method dotted-prefix pairing that WOULD bridge if
+    # chunk_kind were known must NOT hit; only rule 1 (exact equality) applies.
+    q = [{
+        "question": "q1", "k": 3,
+        "accept": [{"service": "svc", "symbol": "DocClient.upload_file"}],
+    }]
+    search_fn = _search_fn({"q1": [_item("sym:svc:DocClient", "DocClient", "svc", 0.9)]})
+
+    results = run_questions(search_fn, q)
+
+    assert results[0]["hit"] is False
+    assert results[0]["rank"] is None
+
+
+def test_run_questions_module_chunk_kind_falls_back_to_exact_match_only():
+    # chunk_kind="Module" deliberately does NOT bridge (a whole-file chunk crediting
+    # ANY accept in that file would be far too weak a match) -- only exact equality.
+    q = [{
+        "question": "q1", "k": 3,
+        "accept": [{"service": "svc", "symbol": "pkg.mod.DocClient.upload_file"}],
+    }]
+    search_fn = _search_fn({
+        "q1": [_item_kind("sym:svc:mod", "pkg.mod", "svc", 0.9, "Module")],
+    })
+
+    results = run_questions(search_fn, q)
+
+    assert results[0]["hit"] is False
+    assert results[0]["rank"] is None
+
+
+def test_run_questions_rank_is_first_item_satisfying_predicate_across_rules():
+    # Class-bridge match at i=0, exact match (of the SAME accept) at i=2 -- rank
+    # must be 0 (first item satisfying the predicate), not 2 (first EXACT match).
+    q = [{
+        "question": "q1", "k": 3,
+        "accept": [{"service": "svc", "symbol": "DocClient.upload_file"}],
+    }]
+    search_fn = _search_fn({
+        "q1": [
+            _item_kind("sym:svc:DocClient", "DocClient", "svc", 0.9, "Class"),
+            _item("sym:svc:other", "app.other", "svc", 0.8),
+            _item_kind("sym:svc:upload", "DocClient.upload_file", "svc", 0.7, "Function"),
+        ],
+    })
+
+    results = run_questions(search_fn, q)
+
+    assert results[0]["hit"] is True
+    assert results[0]["rank"] == 0

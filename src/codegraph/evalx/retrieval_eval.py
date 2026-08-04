@@ -64,18 +64,61 @@ def run_questions(
     actually retrieved instead of a row of bare `None`s.
 
     `hit`/`rank`: `accept` (`question["accept"]`, `[{service, symbol}, ...]`) is an
-    OR-set of `(service, qualified_name)` pairs -- `hit` is `True` iff ANY top-k
-    item's `(service, qualified_name)` is in that set (an item with `qualified_name
-    is None` can never match -- `accept` only ever names real qualified names, so
-    this falls out of plain tuple equality with no special-casing needed); `rank`
-    is the 0-based index of the FIRST such matching item, `None` if `hit` is
-    `False`.
+    OR-set of `(service, symbol)` pairs -- `hit` is `True` iff ANY top-k item counts
+    as a hit for ANY accept pair; `rank` is the 0-based index of the FIRST such item,
+    `None` if `hit` is `False`.
+
+    R7 (docs/superpowers/reports/2026-08-05-pilot-rerun-7-open-gaps.md): an item
+    counts as a hit for accept pair `(service, symbol)` iff `item.service == service`
+    AND ANY of --
+      1. `item.qualified_name == symbol` -- original exact match (pre-R7 behaviour,
+         unchanged); the ONLY rule that ever applies when `item.chunk_kind` is
+         missing/`None` (pre-M10 graph, no `chunk_kind` denormalized onto the Chunk
+         node yet) or `"Module"` (a whole-file chunk crediting ANY accept anywhere in
+         that file would be far too weak a match -- deliberately not bridged);
+      2. `item.chunk_kind == "Class"` and `symbol` is a dotted-prefix child of
+         `item.qualified_name` (`symbol.startswith(item.qualified_name + ".")`) --
+         M12's symbol-aggregation (see `query.retrieval._aggregate_by_symbol`)
+         collapses a "fat" class's sibling chunks -- including its own separately
+         chunked methods, `chunking/splitter.py` rule 3 -- into ONE class-
+         representative item, so that item stands in for an accept naming one of
+         ITS OWN methods too;
+      3. `item.chunk_kind == "Function"` and `item.qualified_name` is a dotted-prefix
+         child of `symbol` (`item.qualified_name.startswith(symbol + ".")`) -- the
+         mirror case: a method-chunk item credits an accept naming its OWN enclosing
+         class.
+    The mandatory `"."` boundary in 2/3 is load-bearing: `Cls` must NOT match an item
+    qualified_name of `ClsOther.method` (a bare, non-dotted prefix check would
+    false-positive on an unrelated, merely similarly-named class) -- and `service`
+    must match regardless of which rule fires. `enclosing_symbol`
+    (`query.retrieval._chunk_item`) is deliberately NOT used here -- it is
+    denormalized to the SAME value as `qualified_name` (see that function's own M10
+    comment), so keying off it would be a no-op; dotted-prefix + `chunk_kind` is the
+    real signal. `qualified_name is None` (owning symbol wasn't in staged nodes) can
+    never satisfy any rule, same as before R7.
 
     A `search_fn` result with no `"items"` key (e.g. `{"error": ...}`, mode="vector"
     with no usable embedder -- see `query.retrieval.search_code`'s own docstring)
     degrades to zero items for that question (`hit=False`, `rank=None`, `top=[]`),
     not a `KeyError` -- one degraded/errored question shouldn't crash the whole
     batch any more than one broken row would in `calls_eval`/`edges_eval`."""
+
+    def accepts(item: dict, service: str, symbol: str) -> bool:
+        """R7 hit predicate for one (item, accept-pair) -- see this function's own
+        docstring above for the full rule table; kept as a nested closure (rather
+        than a module-level helper) since it exists purely to serve this loop."""
+        qn = item.get("qualified_name")
+        if qn is None or item.get("service") != service:
+            return False
+        if qn == symbol:
+            return True
+        kind = item.get("chunk_kind")
+        if kind == "Class":
+            return symbol.startswith(qn + ".")
+        if kind == "Function":
+            return qn.startswith(symbol + ".")
+        return False
+
     results: list[dict] = []
     for q in questions:
         k = q["k"]
@@ -95,7 +138,7 @@ def run_questions(
         hit = False
         rank: int | None = None
         for i, it in enumerate(items):
-            if (it.get("service"), it.get("qualified_name")) in accept:
+            if any(accepts(it, service, symbol) for service, symbol in accept):
                 hit = True
                 rank = i
                 break
