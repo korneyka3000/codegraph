@@ -304,9 +304,13 @@ class SearchCodeItem(BaseModel):
     # query.retrieval._aggregate_by_symbol) -- sibling_chunks считает ДРУГИЕ чанки
     # ТОГО ЖЕ symbol_id, которые были в (over-fetched) пуле кандидатов; 0, если символ
     # был в пуле единственным чанком (typичный случай -- класс, целиком влезающий в
-    # один чанк, chunking/splitter.py rule 2). Default 0 (не Optional/None) -- так же
-    # аддитивно, как TraceProcessOutput.external_exit_count: старый result-dict без
-    # этого ключа валидируется как прежде (см. tests/unit/test_mcp_schemas.py).
+    # один чанк, chunking/splitter.py rule 2). Значение зависит от запрошенного k
+    # (пул = k * _SEARCH_POOL_FACTOR на каждую ногу): тот же символ по тому же
+    # запросу может дать РАЗНЫЕ counts при разных k -- это счёт кандидат-пула
+    # ЭТОГО вызова, не граф-факт «сколько всего чанков у символа». Default 0 (не
+    # Optional/None) -- так же аддитивно, как TraceProcessOutput.external_exit_count:
+    # старый result-dict без этого ключа валидируется как прежде (см.
+    # tests/unit/test_mcp_schemas.py).
 
 
 class SearchCodeOutput(BaseModel):

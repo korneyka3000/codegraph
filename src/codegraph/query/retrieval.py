@@ -179,7 +179,12 @@ def _aggregate_by_symbol(
     pool); deliberately counted over the FULL pool, not just the chunks ranked ahead
     of the representative -- it answers "how many other chunks of this symbol did
     the search see at all" (an agent-facing fact about the match), not "how many
-    were beaten" (an internal ranking detail).
+    were beaten" (an internal ranking detail). Consequently the value is
+    k-DEPENDENT: the pool itself is sized `k * _SEARCH_POOL_FACTOR` per leg, so the
+    SAME symbol can legitimately report different sibling_chunks for the same query
+    at different k -- it is a count over THIS call's candidate pool, not a
+    graph-level fact ("how many chunks does this symbol have in total" would be a
+    store lookup, which this deliberately is not).
 
     A chunk whose symbol_id can't be resolved (missing from `props_by_id` --
     defensive edge case, see `_search_code_result`'s own None-guard below -- or a
