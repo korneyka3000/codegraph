@@ -403,8 +403,31 @@ def _receiver_provenance_ok(
     mirrors `idiom_match._match_import_name_method_form`'s (name, target_module)
     PAIR check, not the looser any-import-with-that-name form (that looseness is
     exactly the shadowing hole this closes). `entry.origin_relpaths` being empty (no
-    relpath info recorded at all -- a hand-built claim predating this task) is
-    honestly "nothing to verify against", not a guessed refusal.
+    relpath info recorded at all) is honestly "nothing to verify against", not a
+    guessed refusal -- see the paragraph below for exactly which claims reach this
+    empty state, in tests AND in real production alike.
+
+    M12 backlog (honesty correction -- M11's own final review flagged the prior
+    wording here, "a hand-built claim predating this task", as an overstated
+    "unreachable in production" claim): empty `origin_relpaths` is reachable
+    outside tests too. Claims are an opaque `payload_json` blob (`stores/
+    staging.py`'s own `claims` DDL), and `SCHEMA_VERSION` did not bump when
+    `harvest_module_singletons` started writing "relpath" (still 6, unchanged
+    since M5 T4 -- `core/schema.py`'s own history comment has no M6-M11 entry),
+    so a PRE-M11 staging.db loads under post-M11 code without complaint;
+    `--incremental` (`pipeline/analyze.py::_analyze_incremental`) only
+    re-harvests the STALE subset of files (its own S5 pre-loop pass), so a
+    non-stale file's persisted claim keeps missing "relpath" until that file
+    itself goes stale -- this branch then fires SILENTLY for its singleton,
+    exactly M10's own pre-provenance behavior (fail-OPEN to the older, looser
+    semantics, not a NEW false-accept risk M10 didn't already carry
+    service-wide). Self-healing either way: the file's own next edit re-harvests
+    it directly with current code, or ANY module_singletons claim changing shape
+    moves `_module_singletons_digest` and escalates that very run to a full
+    re-harvest (`stale_escalation`, `pipeline/analyze.py`) -- which in practice
+    fires on the first post-upgrade incremental run touching even one
+    singleton-bearing file, closing the gap service-wide in one step; a full
+    (non-incremental) re-analyze closes it immediately either way.
 
     RELATIVE imports (M11 T2 review fix): `ImportFact.target_module` carries the
     raw dotted form (`from .registry import registry` -> ".registry"), which can
@@ -416,7 +439,23 @@ def _receiver_provenance_ok(
     use -- see ids.py's own module docstring). An absolute target passes through
     `resolve_relative_import` unchanged, so the absolute-import behavior above is
     untouched; a relative-but-FOREIGN import (`from ..other import registry`)
-    resolves to its real absolute module and still refuses honestly."""
+    resolves to its real absolute module and still refuses honestly.
+
+    Known miss (fail-closed, M12 backlog documentation -- not a regression this
+    check introduces, see below): a RE-EXPORTED name (`app/db/__init__.py`
+    holding `from .registry import registry`; a consumer doing `from app.db
+    import registry`) refuses here, because `imp.target_module` ("app.db") is
+    matched against the singleton's own origin module ("app.db.registry")
+    DIRECTLY -- no re-export chase. A STAR import (`from app.db.registry import
+    *`) refuses too: `parsing/facts.py`'s own `import_from_statement` handling
+    never records a name for a `wildcard_import` (`ImportFact.names` stays
+    `[]`), so `entry.name in imp.names` can never match it. Both are the SAME
+    known-miss shape as the M6-T3 precedent this mirrors --
+    `idiom_match._match_import_name_method_form`'s own `(name, target_module)`
+    pair check has the identical two blind spots (exact-string `target_module`
+    comparison never chases a re-export either; `name in imp.names` membership
+    is equally empty for a wildcard) -- so neither miss is a hole THIS check
+    opens on its own."""
     if not entry.origin_relpaths:
         return True
     if caller_relpath in entry.origin_relpaths:

@@ -234,6 +234,28 @@ def test_build_singleton_index_duplicate_identical_claim_not_a_collision():
     assert idx.get("registry") is not None
 
 
+def test_build_singleton_index_multi_origin_relpaths_union_across_files():
+    """M12 backlog (M11 T2 report's own "Concerns": the per-name set-union
+    accumulation in build_singleton_index had no DEDICATED test -- only the
+    identity-collision bookkeeping above is directly pinned). TWO DIFFERENT files
+    independently assigning the IDENTICAL (class_symbol, class_name_text) identity
+    under the SAME name is "a merge, not a collision" (build_singleton_index's own
+    docstring, same precedent as the duplicate-claim pin above) -- origin_relpaths
+    must be the UNION of BOTH files' relpaths, not just the last one seen."""
+    claim_a = {
+        "name": "registry", "class_symbol": _DB_REGISTRY_CLASS_SYM,
+        "class_name_text": "_DBRegistry", "resolution_tier": "static",
+        "relpath": "app/db/registry.py",
+    }
+    claim_b = {**claim_a, "relpath": "app/other/registry_alias.py"}
+    idx = build_singleton_index([claim_a, claim_b])
+    assert idx.get("registry") == SingletonEntry(
+        name="registry", class_symbol=_DB_REGISTRY_CLASS_SYM,
+        class_name_text="_DBRegistry", resolution_tier="static",
+        origin_relpaths=frozenset({"app/db/registry.py", "app/other/registry_alias.py"}),
+    )
+
+
 # -- resolve_singleton_call: join-time candidate resolution (calls.py's consumer) --
 
 
