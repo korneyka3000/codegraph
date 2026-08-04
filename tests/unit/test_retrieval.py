@@ -187,10 +187,15 @@ def test_search_code_text_mode_never_touches_embedder_even_if_one_is_given():
 
 
 def test_search_code_text_mode_passes_k_and_service_through():
+    # M12 T1 (pilot §4.1): the store is asked for a wider POOL than the caller's own
+    # k, not k itself -- symbol-aggregation needs headroom beyond k raw chunks to
+    # even HAVE a chance at k distinct symbols (see _SEARCH_POOL_FACTOR's own
+    # docstring and the aggregation tests below). service still passes through
+    # unchanged.
     store = _FakeStore()
     store.text_chunks = [(_chunk("c1"), 1.0)]
     retrieval.search_code(store, None, "q", k=3, service="svc-a", mode="text")
-    assert store.text_calls == [("q", 3, "svc-a")]
+    assert store.text_calls == [("q", 3 * retrieval._SEARCH_POOL_FACTOR, "svc-a")]
 
 
 def test_search_code_snippet_truncated_to_600_chars():
@@ -216,6 +221,8 @@ def test_search_code_item_shape_has_exactly_the_contract_fields():
     assert set(result["items"][0]) == {
         "chunk_id", "symbol_id", "qualified_name", "enclosing_symbol", "chunk_kind",
         "service", "relpath", "start_line", "end_line", "snippet", "score",
+        "sibling_chunks",  # M12 T1 (pilot §4.1): count of OTHER same-symbol chunks
+        # that were in the candidate pool -- see the aggregation tests below.
     }
 
 
@@ -427,14 +434,18 @@ def test_search_code_hybrid_fuses_both_rankings_document_in_both_wins():
 
 
 def test_search_code_hybrid_calls_both_text_and_vector_search():
+    # M12 T1: both legs are over-fetched by the SAME pool (k * _SEARCH_POOL_FACTOR),
+    # not just one -- an oversized class's sibling chunks can crowd either leg's
+    # literal top-k, so both need the extra headroom (see _SEARCH_POOL_FACTOR).
     store = _FakeStore()
     store.meta = _meta("fake-4d")
     store.text_chunks = [(_chunk("a"), 1.0)]
     store.vector_chunks = [(_chunk("b"), 0.1)]
     embedder = FakeEmbedder(dim=4, model_id="fake-4d")
     retrieval.search_code(store, embedder, "q", k=5, service="svc-a", mode="hybrid")
-    assert store.text_calls == [("q", 5, "svc-a")]
-    assert store.vector_calls == [(embedder.embed_query("q"), 5, "svc-a")]
+    pool = 5 * retrieval._SEARCH_POOL_FACTOR
+    assert store.text_calls == [("q", pool, "svc-a")]
+    assert store.vector_calls == [(embedder.embed_query("q"), pool, "svc-a")]
 
 
 # -- search_code: exact=True (M5 T2, pilot Bug A) -- vector leg routes through
@@ -451,7 +462,10 @@ def test_search_code_vector_mode_exact_true_calls_exact_method_not_ann():
     assert result["mode_used"] == "vector"
     assert [i["chunk_id"] for i in result["items"]] == ["c1", "c2"]
     assert store.vector_calls == []  # ANN method never touched
-    assert store.vector_exact_calls == [(embedder.embed_query("q"), 8, None)]
+    # M12 T1: default k=8 -> pool = 8 * _SEARCH_POOL_FACTOR, not a bare 8.
+    assert store.vector_exact_calls == [
+        (embedder.embed_query("q"), 8 * retrieval._SEARCH_POOL_FACTOR, None)
+    ]
 
 
 def test_search_code_vector_mode_exact_defaults_to_false_uses_ann_method():
@@ -474,7 +488,10 @@ def test_search_code_hybrid_exact_true_routes_vector_leg_through_exact_method():
     assert result["mode_used"] == "hybrid"
     assert {i["chunk_id"] for i in result["items"]} == {"a", "b"}
     assert store.vector_calls == []
-    assert store.vector_exact_calls == [(embedder.embed_query("q"), 2, None)]
+    # M12 T1: pool, not bare k=2 -- see test_search_code_hybrid_calls_both_text_and_vector_search.
+    assert store.vector_exact_calls == [
+        (embedder.embed_query("q"), 2 * retrieval._SEARCH_POOL_FACTOR, None)
+    ]
 
 
 def test_search_code_text_mode_ignores_exact_flag_never_touches_any_vector_method():
@@ -494,6 +511,133 @@ def test_search_code_hybrid_no_embedder_exact_true_still_degrades_to_text():
     result = retrieval.search_code(store, None, "q", mode="hybrid", exact=True)
     assert result["mode_used"] == "text"
     assert store.vector_exact_calls == []
+
+
+# -- M12 T1 (pilot §4.1/§4.2): post-RRF symbol aggregation -- top-k becomes k
+# DISTINCT symbols, each represented by its best-ranked chunk; sibling_chunks counts
+# the OTHER same-symbol chunks that were in the (post-overfetch) candidate pool. The
+# concrete pilot failure this closes: DocumentStorageClient's top-1..8 were ALL
+# sibling chunks of the SAME class (differing only by ##cN in chunk_id, sharing one
+# symbol_id -- chunking/splitter.py rule 3), crowding the target method-chunk
+# (upload_file_for_document, a DIFFERENT symbol_id) out of the top-8 entirely.
+
+
+def test_search_code_aggregates_sibling_chunks_of_same_symbol_to_one_position():
+    # 5 raw chunks, only 2 DISTINCT symbols: "sym:big" contributes 4 sibling chunks
+    # (an oversized class's header/gap pieces, all sharing one symbol_id), "sym:small"
+    # contributes exactly 1. Aggregation must collapse the 4 "sym:big" chunks down to
+    # ONE position (its best-ranked chunk, big#c0) -- 2 positions total, not 5.
+    store = _FakeStore()
+    store.text_chunks = [
+        (_chunk("big#c0", symbol_id="sym:big"), 5.0),
+        (_chunk("big#c1", symbol_id="sym:big"), 4.0),
+        (_chunk("small#c0", symbol_id="sym:small"), 3.0),
+        (_chunk("big#c2", symbol_id="sym:big"), 2.0),
+        (_chunk("big#c3", symbol_id="sym:big"), 1.0),
+    ]
+    result = retrieval.search_code(store, None, "q", k=8, mode="text")
+    assert result["mode_used"] == "text"
+    assert [i["chunk_id"] for i in result["items"]] == ["big#c0", "small#c0"]
+    assert [i["symbol_id"] for i in result["items"]] == ["sym:big", "sym:small"]
+    # best rank represents: big#c0 (rank0), not any of the other 3 "sym:big" chunks.
+    assert result["items"][0]["score"] > result["items"][1]["score"]
+    # sibling_chunks: 3 OTHER "sym:big" chunks (big#c1/c2/c3) were in the pool.
+    assert result["items"][0]["sibling_chunks"] == 3
+    assert result["items"][1]["sibling_chunks"] == 0  # "sym:small" -- unique, no siblings
+
+
+def test_search_code_all_unique_symbols_output_unchanged_from_pre_aggregation_shape():
+    # The common case (and every OTHER test in this file): every chunk belongs to a
+    # DIFFERENT symbol -- aggregation must be a complete no-op. Same items, same
+    # order, same scores as plain per-chunk RRF, just with the additive
+    # sibling_chunks=0 on every item (pinned byte-identical-prior-behavior contract).
+    store = _FakeStore()
+    store.text_chunks = [(_chunk("c1"), 5.0), (_chunk("c2"), 3.0), (_chunk("c3"), 1.0)]
+    result = retrieval.search_code(store, None, "q", mode="text")
+    assert [i["chunk_id"] for i in result["items"]] == ["c1", "c2", "c3"]
+    assert all(i["sibling_chunks"] == 0 for i in result["items"])
+    plain = retrieval.rrf([["c1", "c2", "c3"]])
+    assert [i["score"] for i in result["items"]] == [s for _id, s in plain]
+
+
+def test_search_code_chunks_without_symbol_id_do_not_merge_with_each_other():
+    # Defensive/pre-M10-T3 edge case: symbol_id absent on MULTIPLE chunks must NOT
+    # collapse them into one false group -- they are unrelated chunks that merely
+    # share the ABSENCE of a symbol_id, not siblings of a real symbol. Falls back to
+    # grouping by the chunk's own (unique) chunk_id instead.
+    store = _FakeStore()
+    store.text_chunks = [
+        (_chunk("c1", symbol_id=None), 3.0),
+        (_chunk("c2", symbol_id=None), 2.0),
+    ]
+    result = retrieval.search_code(store, None, "q", mode="text")
+    assert [i["chunk_id"] for i in result["items"]] == ["c1", "c2"]
+    assert all(i["sibling_chunks"] == 0 for i in result["items"])
+
+
+def test_search_code_text_mode_pool_overfetch_yields_k_distinct_symbols():
+    # k semantics: k now means k DISTINCT SYMBOLS. "sym:a" dominates the top 8 RAW
+    # rank positions (8 sibling chunks); "sym:b"/"sym:c" each contribute exactly one
+    # chunk, ranked LAST (positions 8-9 of 10 total). A naive top-k=3 fetch (no
+    # overfetch) would return chunks a0..a2 -- ALL "sym:a" -- aggregating down to
+    # just ONE distinct symbol, never reaching k=3. The pool overfetch (k *
+    # _SEARCH_POOL_FACTOR) must reach far enough into the ranking to surface
+    # "sym:b"/"sym:c" too, so k=3 distinct symbols actually come back.
+    store = _FakeStore()
+    store.text_chunks = [
+        (_chunk(f"a{i}", symbol_id="sym:a"), 10.0 - i) for i in range(8)
+    ] + [
+        (_chunk("b0", symbol_id="sym:b"), 1.5),
+        (_chunk("c0", symbol_id="sym:c"), 1.0),
+    ]
+    result = retrieval.search_code(store, None, "q", k=3, mode="text")
+    assert result["mode_used"] == "text"
+    symbol_ids = [i["symbol_id"] for i in result["items"]]
+    assert symbol_ids == ["sym:a", "sym:b", "sym:c"]  # k=3 DISTINCT symbols, not 1
+    assert result["items"][0]["chunk_id"] == "a0"  # best-ranked "sym:a" chunk
+    assert result["items"][0]["sibling_chunks"] == 7  # a1..a7
+    assert result["items"][1]["sibling_chunks"] == 0
+    assert result["items"][2]["sibling_chunks"] == 0
+    # proves the store was actually asked for MORE than the bare k=3 (a pool).
+    assert store.text_calls == [("q", 3 * retrieval._SEARCH_POOL_FACTOR, None)]
+
+
+def test_search_code_vector_mode_aggregates_sibling_chunks_too():
+    # Mode coverage: the vector-only leg goes through the SAME aggregation point as
+    # text (both funnel through _search_code_result) -- not a text-only special case.
+    store = _FakeStore()
+    store.meta = _meta("fake-4d")
+    store.vector_chunks = [
+        (_chunk("big#c0", symbol_id="sym:big"), 0.01),
+        (_chunk("big#c1", symbol_id="sym:big"), 0.02),
+        (_chunk("small#c0", symbol_id="sym:small"), 0.5),
+    ]
+    embedder = FakeEmbedder(dim=4, model_id="fake-4d")
+    result = retrieval.search_code(store, embedder, "q", mode="vector")
+    assert result["mode_used"] == "vector"
+    assert [i["chunk_id"] for i in result["items"]] == ["big#c0", "small#c0"]
+    assert result["items"][0]["sibling_chunks"] == 1
+    assert result["items"][1]["sibling_chunks"] == 0
+
+
+def test_search_code_hybrid_mode_aggregates_across_fused_text_and_vector_legs():
+    # Mode coverage (hybrid): "sym:big" appears via TWO different chunks split
+    # across the two legs -- one found ONLY by text, the other ONLY by vector.
+    # Neither leg alone repeats the symbol, so aggregation/sibling-counting must
+    # look at the FUSED pool (post-RRF), not either leg in isolation.
+    store = _FakeStore()
+    store.meta = _meta("fake-4d")
+    store.text_chunks = [(_chunk("big#c0", symbol_id="sym:big"), 9.0)]
+    store.vector_chunks = [
+        (_chunk("big#c1", symbol_id="sym:big"), 0.01),
+        (_chunk("small#c0", symbol_id="sym:small"), 0.3),
+    ]
+    embedder = FakeEmbedder(dim=4, model_id="fake-4d")
+    result = retrieval.search_code(store, embedder, "q", mode="hybrid")
+    assert result["mode_used"] == "hybrid"
+    assert [i["symbol_id"] for i in result["items"]] == ["sym:big", "sym:small"]
+    assert result["items"][0]["chunk_id"] == "big#c0"
+    assert result["items"][0]["sibling_chunks"] == 1  # big#c1, found only via vector
 
 
 # -- find_entrypoint v2 --

@@ -47,6 +47,25 @@ _META_NODE_ID = "meta"  # singleton Meta-узел, см. pipeline/load.py
 # в Python), что store.search_vector_chunks использует для СВОЕГО service-фильтра.
 _ENTRYPOINT_POOL_FACTOR = 4
 
+# M12 T1 (pilot §4.1: sibling chunks of ONE class crowd the method-chunk target out
+# of top-k -- DocumentStorageClient's top-1..8 were ALL sibling chunks of the SAME
+# class). search_code's top-k now means k DISTINCT SYMBOLS (see
+# _aggregate_by_symbol below), not k raw chunks -- a literal k-sized fetch per leg
+# often can't even PRODUCE k distinct symbols after aggregation: an oversized class
+# contributing more than k sibling chunks (all sharing one symbol_id, differing only
+# by ##cN in chunk_id -- chunking/splitter.py rule 3) can fill a k-sized fetch
+# ENTIRELY with itself, and a method chunk ranked just past that cutoff never enters
+# the candidate pool at all, regardless of how well aggregation collapses what DID
+# get fetched. Over-fetch (k * this factor) per leg before fusion -- same
+# over-fetch-then-trim-in-Python trick find_entrypoint already uses for its own
+# post-fusion kind-filter (_ENTRYPOINT_POOL_FACTOR above); reusing that SAME factor
+# (4) here rather than tuning a second constant -- hybrid mode already unions TWO
+# separate k*4 per-leg pools (up to 8k distinct candidates pre-aggregation,
+# comfortably wider than find_entrypoint's own single-leg 4x pool), and text-only/
+# vector-only mode (a single leg, no second list to widen the union) is exactly
+# where the extra headroom matters most.
+_SEARCH_POOL_FACTOR = 4
+
 
 def rrf(rankings: Sequence[Sequence[str]], k: int = 60) -> list[tuple[str, float]]:
     """Reciprocal Rank Fusion: score(id) = Σ 1/(k + rank_i + 1) по всем `rankings`,
@@ -144,22 +163,80 @@ def _chunk_item(props: dict, score: float) -> dict:
     }
 
 
+def _aggregate_by_symbol(
+    fused: list[tuple[str, float]], props_by_id: dict[str, dict],
+) -> list[tuple[str, float, int]]:
+    """M12 T1 (pilot §4.1): groups the (already post-RRF) `fused` candidate pool by
+    symbol_id -- each DISTINCT symbol's representative is its best-ranked chunk
+    (`fused` is already best-first, so "first occurrence of a symbol_id while
+    walking `fused`" IS "that symbol's best-ranked chunk" -- no separate max/sort
+    step needed). Returns one `(representative_chunk_id, representative_score,
+    sibling_chunks)` tuple per distinct symbol, in the SAME best-first order as
+    `fused` (i.e. ordered by each group's own representative's rank -- exactly what
+    walking `fused` and skipping every chunk whose symbol was already seen gives
+    you). `sibling_chunks` -- count of OTHER chunk ids anywhere in the WHOLE `fused`
+    pool that share this symbol_id (0 when the symbol had only one chunk in the
+    pool); deliberately counted over the FULL pool, not just the chunks ranked ahead
+    of the representative -- it answers "how many other chunks of this symbol did
+    the search see at all" (an agent-facing fact about the match), not "how many
+    were beaten" (an internal ranking detail).
+
+    A chunk whose symbol_id can't be resolved (missing from `props_by_id` --
+    defensive edge case, see `_search_code_result`'s own None-guard below -- or a
+    pre-M10-T3 graph that never denormalized `symbol_id` onto the Chunk node at
+    all) falls back to grouping by its OWN chunk_id: it becomes its own singleton
+    group rather than being merged with every OTHER symbol_id-less chunk into one
+    false mega-group. This is what makes "all-unique symbols" (in practice: every
+    graph before this field existed, and still the common case after -- a class
+    small enough to fit in one chunk, chunking/splitter.py rule 2) a byte-identical
+    no-op: with no shared symbol_id anywhere in the pool, every chunk is already its
+    own group, in the exact order `fused` already had them."""
+
+    def group_key(chunk_id: str) -> str:
+        props = props_by_id.get(chunk_id)
+        symbol_id = props.get("symbol_id") if props else None
+        return symbol_id if symbol_id else chunk_id
+
+    sibling_counts: dict[str, int] = {}
+    for chunk_id, _score in fused:
+        key = group_key(chunk_id)
+        sibling_counts[key] = sibling_counts.get(key, 0) + 1
+
+    groups: list[tuple[str, float, int]] = []
+    seen: set[str] = set()
+    for chunk_id, score in fused:
+        key = group_key(chunk_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        groups.append((chunk_id, score, sibling_counts[key] - 1))
+    return groups
+
+
 def _search_code_result(
     fused: list[tuple[str, float]], props_by_id: dict[str, dict], k: int, mode_used: str,
 ) -> dict:
+    """k distinct SYMBOLS (M12 T1), not k raw chunks -- see _aggregate_by_symbol.
+    `fused` is expected to already be the OVER-FETCHED (pool-sized, not bare-k)
+    candidate pool -- see _SEARCH_POOL_FACTOR -- so aggregation has real headroom to
+    find k distinct symbols instead of just deduping whatever k raw chunks happened
+    to be fetched."""
     items = []
-    for chunk_id, score in fused[:k]:
+    for chunk_id, score, sibling_chunks in _aggregate_by_symbol(fused, props_by_id)[:k]:
         props = props_by_id.get(chunk_id)
         if props is None:
             continue  # defensive: каждый fused id обязан прийти из props_by_id ниже
-        items.append(_chunk_item(props, score))
+        item = _chunk_item(props, score)
+        item["sibling_chunks"] = sibling_chunks
+        items.append(item)
     return {"items": items, "mode_used": mode_used}
 
 
 def _text_only_search_code(
     store: GraphStore, query: str, k: int, service: str | None,
 ) -> dict:
-    text_hits = store.search_text_chunks(query, k, service)
+    pool = k * _SEARCH_POOL_FACTOR  # M12 T1 -- see _SEARCH_POOL_FACTOR's own docstring
+    text_hits = store.search_text_chunks(query, pool, service)
     ranking = [props["id"] for props, _score in text_hits]
     props_by_id = {props["id"]: props for props, _score in text_hits}
     fused = rrf([ranking])
@@ -184,6 +261,25 @@ def search_code(
     масштаб очков независимо от режима; сырые оценки text (RediSearch relevance,
     больше -- лучше) и vector (cosine-дистанция, МЕНЬШЕ -- лучше, см.
     store.search_vector_chunks) иначе несовместимы по знаку/масштабу между режимами).
+
+    M12 T1 (pilot §4.1): `k` -- k DISTINCT SYMBOLS, not k raw chunks. Post-RRF-fusion,
+    candidates are aggregated by symbol_id (see _aggregate_by_symbol) -- each symbol
+    is represented by its single best-ranked chunk, so several sibling chunks of ONE
+    oversized class (chunking/splitter.py rule 3) collapse to ONE position instead of
+    crowding out other, genuinely different, symbols. Each item additively carries
+    `sibling_chunks: int` -- how many OTHER chunks of that SAME symbol were in the
+    (over-fetched) candidate pool, 0 when the symbol was unique there. This one
+    aggregation point sits inside `_search_code_result`, downstream of ALL three
+    modes' own fusion (text/vector/hybrid all funnel through it) -- so the k-distinct-
+    symbols contract holds identically regardless of `mode`. Getting k distinct
+    symbols back needs more raw candidates than a literal k-sized fetch would ever
+    provide (an oversized class alone can fill a k-sized fetch), so each per-leg
+    store call now asks for `k * _SEARCH_POOL_FACTOR` chunks, not k -- see that
+    constant's own docstring for the exact number and why it's shared with
+    find_entrypoint's pool. Graphs where every symbol maps to exactly one chunk (no
+    class was ever big enough to split, chunking/splitter.py rule 2 -- e.g. every
+    fixture in this repo's own test suite) see byte-identical output to before this
+    aggregation existed, just with `sibling_chunks=0` added to every item.
 
     `exact` (M5 T2, pilot Bug A -- no-op unless mode is "vector"/"hybrid" AND a
     vector search actually runs): routes the vector leg through
@@ -213,9 +309,11 @@ def search_code(
 
     # reason is None только когда embedder не None (см. _vector_unusable_reason) --
     # можно безопасно звать embedder.embed_query ниже. exact selects WHICH store
-    # method runs the vector leg -- see this function's own docstring.
+    # method runs the vector leg -- see this function's own docstring. pool (not a
+    # bare k) -- M12 T1, see _SEARCH_POOL_FACTOR's own docstring.
     vector_search = store.search_vector_chunks_exact if exact else store.search_vector_chunks
-    vector_hits = vector_search(embedder.embed_query(query), k, service)
+    pool = k * _SEARCH_POOL_FACTOR
+    vector_hits = vector_search(embedder.embed_query(query), pool, service)
     vector_ranking = [props["id"] for props, _score in vector_hits]
     props_by_id = {props["id"]: props for props, _score in vector_hits}
 
@@ -223,8 +321,8 @@ def search_code(
         fused = rrf([vector_ranking])
         return _search_code_result(fused, props_by_id, k, "vector")
 
-    # hybrid: тоже собираем text ranking и фьюзим оба
-    text_hits = store.search_text_chunks(query, k, service)
+    # hybrid: тоже собираем text ranking (тем же pool) и фьюзим оба
+    text_hits = store.search_text_chunks(query, pool, service)
     text_ranking = [props["id"] for props, _score in text_hits]
     for props, _score in text_hits:
         props_by_id.setdefault(props["id"], props)

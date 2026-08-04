@@ -220,18 +220,29 @@ def build_server(
         mode: Literal["hybrid", "vector", "text"] = "hybrid",
     ) -> dict:
         """Поиск по коду (Chunk-узлам) -- text (fulltext по тексту/заголовку чанка),
-        vector (по embedding'у) или hybrid (RRF-фьюжн обоих, по умолчанию); k
-        клампится к 1..20, service -- опциональный фильтр по владеющему сервису.
-        mode="vector" без доступного embedder'а (или при рассинхроне модели с той,
-        которой граф эмбеден) -- {"error": ...}; mode="hybrid" в той же ситуации
-        молчаливо деградирует в text-only (mode_used="text" в ответе). Результат:
+        vector (по embedding'у) или hybrid (RRF-фьюжн обоих, по умолчанию); k --
+        top-k РАЗНЫХ СИМВОЛОВ, не сырых чанков (M12 T1, см. ниже), клампится к 1..20;
+        service -- опциональный фильтр по владеющему сервису. mode="vector" без
+        доступного embedder'а (или при рассинхроне модели с той, которой граф
+        эмбеден) -- {"error": ...}; mode="hybrid" в той же ситуации молчаливо
+        деградирует в text-only (mode_used="text" в ответе). Результат:
         {"items": [{chunk_id, symbol_id, qualified_name, enclosing_symbol,
-        chunk_kind, service, relpath, start_line, end_line, snippet, score}, ...],
-        "mode_used": ...}. enclosing_symbol -- qualified_name владеющего чанком
-        символа (то же значение, что qualified_name); chunk_kind -- его kind
-        ("Module"/"Class"/"Function") -- вместе показывают, покрывает ли чанк ровно
-        один метод (chunk_kind="Function") или содержимое уровня класса
+        chunk_kind, service, relpath, start_line, end_line, snippet, score,
+        sibling_chunks}, ...], "mode_used": ...}. enclosing_symbol -- qualified_name
+        владеющего чанком символа (то же значение, что qualified_name); chunk_kind --
+        его kind ("Module"/"Class"/"Function") -- вместе показывают, покрывает ли
+        чанк ровно один метод (chunk_kind="Function") или содержимое уровня класса
         (chunk_kind="Class": часть большого класса, либо класс целиком).
+
+        Top-k различных символов (M12 T1, pilot §4.1): большие классы режутся на N
+        чанков, часть которых делит один symbol_id (различаются лишь ##cN в
+        chunk_id) -- раньше это позволяло sibling-чанкам ОДНОГО такого класса забить
+        весь top-k, вытеснив чанки других, реально разных символов (напр. нужный
+        метод-чанк). Теперь кандидаты агрегируются по symbol_id ПОСЛЕ RRF-фьюжна:
+        каждый символ представлен ровно одним (лучшим по рангу) чанком, top-k -- это
+        k РАЗНЫХ символов. sibling_chunks на каждом item -- сколько ЕЩЁ чанков ТОГО
+        ЖЕ символа было в пуле кандидатов (0 -- символ был в пуле единственным
+        чанком, типичный случай для класса, целиком влезающего в один чанк).
 
         Клиент vs сервер (pilot §4.2): у вопроса вида «где ОБРАБАТЫВАЕТСЯ X» (сервер,
         напр. HTTP/consumer-хендлер) и «кто ВЫЗЫВАЕТ X» (клиент) отвечают чанки из

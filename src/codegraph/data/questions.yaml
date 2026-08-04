@@ -129,23 +129,56 @@
 # untouched), the block below now LEADS with the current measured snapshot and
 # demotes the M3-close numbers to a History line.
 #
-# REAL GATE RESULTS (2026-07-17, M4 T3 -- CURRENT snapshot, measured with the
-# OR-fallback active, i.e. as of the commit introducing it, "feat(m4): fulltext
-# OR-fallback for mixed-language queries"; jina-embeddings-v2-base-code, dim=768,
+# M12 T1 GATE RE-RUN FINDING (delta, reported per this task's brief -- pool
+# over-fetch side effect, NOT symbol-aggregation itself; see .superpowers/sdd/
+# task-1-report.md for the full A/B measurement): query/retrieval.py's search_code
+# now aggregates post-RRF candidates by symbol_id (top-k becomes k DISTINCT symbols,
+# each represented by its best-ranked chunk -- see that module's own docstring) and,
+# to give aggregation real headroom, over-fetches each leg (text AND vector) to
+# `k * _SEARCH_POOL_FACTOR` (=12 for this gate's k=3) chunks instead of a bare k.
+# Every symbol in THIS fixture corpus maps to exactly one chunk (chunking/
+# splitter.py rule 2 -- no class here is big enough to split, see CORRECTION 1
+# above), so aggregation itself is a proven no-op on this graph (pinned unit test:
+# tests/unit/test_retrieval.py::
+# test_search_code_all_unique_symbols_output_unchanged_from_pre_aggregation_shape).
+# The pool over-fetch is NOT a no-op, though: with only 34 chunks total, asking each
+# leg for 12 instead of 3 candidates measurably widens cross-list overlap before RRF
+# fusion. hit@3 remains 6/6 (gate still green, no pass/fail regression), but
+# questions 1 and 2 swap ranks versus the M4 T3 baseline below (question 1 rank
+# 2->1, question 2 rank 1->2); questions 3-6 unchanged. Root-caused, not assumed: a
+# `git stash` A/B against the pre-T1 commit reproduced the M4 T3 numbers (2, 1)
+# exactly on unmodified code, and 3 repeated runs of the T1 code all landed on the
+# SAME (1, 2) -- ruling out the vector index's own documented per-load ANN
+# nondeterminism as the explanation; this is a deterministic consequence of the
+# wider pool, not run-to-run noise. Per the SAME honest-gates path the M4 T3 finding
+# above already established (golden documentation reflects measured reality; the
+# hit@3 threshold and every accept list are untouched -- no golden-fitting), the
+# block below now LEADS with the current measured snapshot and demotes the M4 T3
+# numbers to a History line.
+#
+# REAL GATE RESULTS (2026-08-04, M12 T1 -- CURRENT snapshot, measured with symbol
+# aggregation + pool over-fetch active, i.e. as of the commit introducing them,
+# "feat(m12): symbol-aggregated ranking -- k distinct symbols in search_code top-k
+# (pilot 4.1)"; jina-embeddings-v2-base-code, dim=768, k=3, mode_used=hybrid for all
+# 6; full run detail: .superpowers/sdd/task-1-report.md):
+#   1. hit=True rank=1   2. hit=True rank=2   3. hit=True rank=0
+#   4. hit=True rank=0   5. hit=True rank=0   6. hit=True rank=0
+# hit@3 = 6/6. Question 2 hits at rank 2 (the very last position within k=3) -- a
+# real, occasionally-close-to-the-edge result of fusing cross-lingual semantic
+# search with a widened candidate pool over a tiny (34-chunk) fixture corpus, left
+# as-is (not curve-fit) since the contract is hit@k, not rank==0.
+# History (M4 T3, PRE-T1 pool over-fetch; jina-embeddings-v2-base-code, dim=768,
 # k=3, mode_used=hybrid for all 6; full run detail + per-question fulltext-hit
 # table: .superpowers/sdd/task-3-report.md):
-#   1. hit=True rank=2   2. hit=True rank=1   3. hit=True rank=0
-#   4. hit=True rank=0   5. hit=True rank=0   6. hit=True rank=0
-# hit@3 = 6/6. Question 1 hits at rank 2 (the very last position within k=3) -- a
-# real, occasionally-close-to-the-edge result of fusing cross-lingual semantic
-# search with the newly-alive fulltext leg over a tiny (34-chunk) fixture corpus,
-# left as-is (not curve-fit) since the contract is hit@k, not rank==0.
+#   1. rank=2   2. rank=1   3. rank=0   4. rank=0   5. rank=0   6. rank=0
+# (all hit=True; question 1 sat at rank 2, the edge of k=3, back then -- see the
+# M12 T1 GATE RE-RUN FINDING above.)
 # History (M3-close, PRE-OR-fallback -- the ranks all M3-era reports reference; see
 # m3-task-8-report.md for questions 1-5's full per-question top-3 dump, and
 # .superpowers/sdd/m3-final-fix-report.md for question 6's):
 #   1. rank=1   2. rank=2   3. rank=0   4. rank=2   5. rank=0   6. rank=0
 # (all hit=True; questions 2 and 4 sat at rank 2, the edge of k=3, back then --
-# both since lifted by the text leg, see the GATE RE-RUN FINDING above.)
+# both since lifted by the text leg, see the M4 T3 GATE RE-RUN FINDING above.)
 version: 1
 questions:
   - question: "где создаётся заказ и пишется событие в outbox"

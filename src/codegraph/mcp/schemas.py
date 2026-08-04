@@ -299,6 +299,14 @@ class SearchCodeItem(BaseModel):
     snippet: str  # chunk text, truncated to <=600 chars (see query.retrieval._snippet)
     score: float  # ВСЕГДА fused RRF-score, даже для mode="text"/"vector" (единая,
     # всегда-desc-лучше шкала независимо от режима -- см. query.retrieval.search_code)
+    sibling_chunks: int = 0  # M12 T1 (pilot §4.1/§4.2): этот item -- представитель
+    # своего symbol_id (post-RRF агрегация по символу, лучший ранг представляет, см.
+    # query.retrieval._aggregate_by_symbol) -- sibling_chunks считает ДРУГИЕ чанки
+    # ТОГО ЖЕ symbol_id, которые были в (over-fetched) пуле кандидатов; 0, если символ
+    # был в пуле единственным чанком (typичный случай -- класс, целиком влезающий в
+    # один чанк, chunking/splitter.py rule 2). Default 0 (не Optional/None) -- так же
+    # аддитивно, как TraceProcessOutput.external_exit_count: старый result-dict без
+    # этого ключа валидируется как прежде (см. tests/unit/test_mcp_schemas.py).
 
 
 class SearchCodeOutput(BaseModel):

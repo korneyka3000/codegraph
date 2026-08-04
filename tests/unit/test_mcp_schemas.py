@@ -108,6 +108,34 @@ def test_search_code_item_enclosing_symbol_and_chunk_kind_optional_default_none(
     assert out.items[0].chunk_kind is None
 
 
+# -- M12 T1 (pilot §4.1/§4.2): SearchCodeItem.sibling_chunks -- additive, same
+# "prove additivity, don't just assert" precedent as enclosing_symbol/chunk_kind
+# above and TraceExit.channel/WhoCallsOutput.callers[].mechanism before that.
+
+
+def test_search_code_output_accepts_item_with_sibling_chunks():
+    out = SearchCodeOutput(
+        items=[{
+            "chunk_id": "c1", "symbol_id": "sym:a:x",
+            "qualified_name": "app.mod.X", "service": "svc",
+            "relpath": "mod.py", "start_line": 1, "end_line": 2,
+            "snippet": "class X: ...", "score": 0.5, "sibling_chunks": 3,
+        }],
+        mode_used="hybrid",
+    )
+    assert out.items[0].sibling_chunks == 3
+
+
+def test_search_code_item_sibling_chunks_defaults_to_zero_when_absent():
+    # Pre-M12-T1 result shape (key absent entirely) must keep validating exactly
+    # like every other additive field this schema has grown -- default 0 (an int,
+    # like TraceProcessOutput.external_exit_count), not None: "no siblings seen" and
+    # "field predates this response" are the same observable fact to a caller, so
+    # they share the same falsy default.
+    out = SearchCodeOutput(items=[{"snippet": "x", "score": 0.1}], mode_used="text")
+    assert out.items[0].sibling_chunks == 0
+
+
 def test_find_entrypoint_output_requires_mode_used():
     with pytest.raises(ValidationError):
         FindEntrypointOutput(results=[])

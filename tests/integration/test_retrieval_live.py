@@ -156,46 +156,75 @@ HYBRID_MIX_GRAPH = "__t7_retrieval_hybrid_mix__"
 
 
 def test_search_code_hybrid_mode_rrf_actually_mixes_both_rankings(falkordb_cfg, tmp_path):
-    """3 chunks: doc-a matches the TEXT query only (doc-b/doc-c don't contain the
-    keyword); doc-b is the closest VECTOR match only (identical to the query vector);
-    doc-c is a plausible-but-not-top vector match (rank1, NOT rank0) that ALSO
-    matches the text query -- i.e. doc-c is the only one appearing in BOTH rankings.
-    k=2 (not 3) is load-bearing: it caps each per-modality search to its top-2, so
-    doc-a (3rd-closest by vector) is genuinely ABSENT from the vector ranking, not
-    merely poorly ranked in it -- otherwise its own worst-rank vector contribution
-    would nearly close the RRF gap this test is trying to demonstrate (see this
-    module's own math notes / tests/unit/test_retrieval.py's pure-rrf equivalent).
+    """3 "real" chunks: doc-a matches the TEXT query only (doc-b/doc-c don't contain
+    the keyword); doc-b is the closest VECTOR match only (identical to the query
+    vector); doc-c is a plausible-but-not-top vector match (rank1, NOT rank0) that
+    ALSO matches the text query -- i.e. doc-c is the only one appearing in BOTH
+    rankings.
 
-    RRF(text=[doc-a, doc-c], vector=[doc-b, doc-c]): doc-c is rank<=1 in BOTH ->
-    score >= 2/62; doc-a/doc-b are rank0 in exactly ONE list each -> score <= 1/61.
-    doc-c must win even though it is never rank0 anywhere."""
+    RRF(text=[doc-a, doc-c], vector=[doc-b, doc-c, ...]): doc-c is rank<=1 in BOTH ->
+    score >= 2/62; doc-a is rank0 in text but NOT rank0 in vector -> its score stays
+    below that even if it also appears in the vector ranking somewhere. doc-c must
+    win even though it is never rank0 anywhere.
+
+    M12 T1: search_code now over-fetches each leg to `k * _SEARCH_POOL_FACTOR`
+    chunks (symbol-aggregation headroom, see query/retrieval.py's own docstring) --
+    with only 3 real chunks in the graph, that pool (k=2 -> 8) swallows doc-a into
+    the vector ranking too (previously, pre-T1, a plain k=2 vector fetch excluded it
+    outright). FOUR filler chunks (vector-closer to the query than doc-a, but
+    text-silent and each its own distinct symbol -- no aggregation collapsing) are
+    added so doc-a still lands at vector-rank6, not rank2: its dampened
+    1/(60+6+1)=1/67 vector contribution is too small to lift doc-a's total
+    (1/61 + 1/67 ~= 0.0313) past doc-c's dual-list total (2/62 ~= 0.0323) -- the
+    same "doc-c wins despite never being rank0" property the original (pre-overfetch)
+    version of this test demonstrated via outright exclusion instead of damping."""
     query = "widget"
     embedder = FakeEmbedder(dim=8)
     query_vec = embedder.embed_query(query)
-    # doc-c: blend query_vec with a rotated copy of itself -- some OTHER direction,
-    # not proportional to query_vec for any real (hash-derived) query_vec -- giving a
-    # vector strictly between "identical" and "opposite".
+    # doc-c / fillers: blend query_vec with a rotated copy of itself -- some OTHER
+    # direction, not proportional to query_vec for any real (hash-derived)
+    # query_vec -- giving vectors strictly between "identical" and "opposite",
+    # ordered by their own blend weight (higher weight -> closer to query_vec).
     rotated = query_vec[1:] + query_vec[:1]
-    doc_c_vec = _normalize(
-        [0.7 * q + 0.3 * p for q, p in zip(query_vec, rotated, strict=True)]
-    )
+
+    def _blend(weight: float) -> list[float]:
+        return _normalize(
+            [weight * q + (1 - weight) * p for q, p in zip(query_vec, rotated, strict=True)]
+        )
+
+    doc_c_vec = _blend(0.7)
     doc_a_vec = _normalize([-q for q in query_vec])  # exactly opposite -- maximally far
+    # Weights all < doc-c's 0.7 (so doc-c stays vector-rank1, ahead of every filler)
+    # and > -1/"opposite" (so every filler stays closer to query_vec than doc-a).
+    filler_weights = [0.6, 0.45, 0.3, 0.15]
+    filler_vecs = {f"filler-{i}": _blend(w) for i, w in enumerate(filler_weights)}
 
     chunks = [
         _chunk("doc-a", "sym:svc:a", "gizmo widget special-marker-alpha"),
         _chunk("doc-b", "sym:svc:b", "totally unrelated content, no keyword here"),
         _chunk("doc-c", "sym:svc:c", "gizmo widget appears in this one too"),
+    ] + [
+        _chunk(f"filler-{i}", f"sym:svc:filler{i}", f"irrelevant filler content marker {i}")
+        for i in range(len(filler_weights))
     ]
     try:
         store = _build_chunk_graph(
             falkordb_cfg, HYBRID_MIX_GRAPH, chunks, tmp_path,
-            embeddings={"doc-a": doc_a_vec, "doc-b": query_vec, "doc-c": doc_c_vec},
+            embeddings={
+                "doc-a": doc_a_vec, "doc-b": query_vec, "doc-c": doc_c_vec, **filler_vecs,
+            },
             embed_model=embedder.model_id,
         )
         # Sanity on the constructed geometry itself, so a failure below points at
-        # retrieval.py's fusion logic, not at a broken test-vector assumption.
-        vector_only = store.search_vector_chunks(query_vec, k=3)
-        assert [props["id"] for props, _score in vector_only] == ["doc-b", "doc-c", "doc-a"]
+        # retrieval.py's fusion logic, not at a broken test-vector assumption:
+        # doc-b closest, doc-c next, then the 4 fillers (relative order among
+        # themselves doesn't matter), doc-a last of all 7.
+        vector_only = store.search_vector_chunks(query_vec, k=7)
+        ids = [props["id"] for props, _score in vector_only]
+        assert len(ids) == 7
+        assert ids[0] == "doc-b"
+        assert ids[1] == "doc-c"
+        assert ids[-1] == "doc-a"
 
         result = retrieval.search_code(store, embedder, query, k=2, mode="hybrid")
         assert result["mode_used"] == "hybrid"
