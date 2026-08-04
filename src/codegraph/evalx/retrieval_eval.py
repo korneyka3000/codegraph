@@ -78,11 +78,14 @@ def run_questions(
          that file would be far too weak a match -- deliberately not bridged);
       2. `item.chunk_kind == "Class"` and `symbol` is a dotted-prefix child of
          `item.qualified_name` (`symbol.startswith(item.qualified_name + ".")`) --
-         M12's symbol-aggregation (see `query.retrieval._aggregate_by_symbol`)
-         collapses a "fat" class's sibling chunks -- including its own separately
-         chunked methods, `chunking/splitter.py` rule 3 -- into ONE class-
-         representative item, so that item stands in for an accept naming one of
-         ITS OWN methods too;
+         a "fat" class's separately chunked methods (`chunking/splitter.py` rule 3)
+         carry their OWN symbol_id/qualified_name, so M12's symbol-aggregation
+         (`query.retrieval._aggregate_by_symbol`, keyed on symbol_id) does NOT fold
+         them into the class item -- a method-chunk can rank below every class-body
+         chunk or miss the candidate pool entirely (re-run №7: the accept-named
+         method absent even at k=20 while its class sat at rank 1), so the class
+         item is the honest container answer for an accept naming one of its own
+         methods;
       3. `item.chunk_kind == "Function"` and `item.qualified_name` is a dotted-prefix
          child of `symbol` (`item.qualified_name.startswith(symbol + ".")`) -- the
          mirror case: a method-chunk item credits an accept naming its OWN enclosing
