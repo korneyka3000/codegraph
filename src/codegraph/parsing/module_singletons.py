@@ -197,9 +197,11 @@ class SingletonEntry:
     name (a merge, not a collision, per `build_singleton_index`'s own policy) --
     either origin file then verifies a receiver at join time (see
     `resolve_singleton_call`'s own docstring). Empty for an entry built from claims
-    that never carried a "relpath" key (hand-built claims/tests predating this
-    task) -- `resolve_singleton_call` treats that honestly as "nothing to verify
-    against", never a guessed refusal."""
+    that never carried a "relpath" key -- hand-built claims/tests, AND one real
+    production path (pre-M11 staging.db surviving into an `--incremental` run; see
+    `_receiver_provenance_ok`'s docstring for the full mechanism and why it is
+    fail-open-to-M10 and self-healing) -- `resolve_singleton_call` treats that
+    honestly as "nothing to verify against", never a guessed refusal."""
 
     name: str
     class_symbol: str | None
