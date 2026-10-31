@@ -7,6 +7,9 @@
 
 ## 0. Подготовка (две сессии Claude Code)
 
+Новая машина без прежнего workspace → сначала `WORK-MACHINE-FRESH-SETUP-BRIEF.md` (установка,
+ws.yaml, индекс, MCP), затем сюда.
+
 Смоук как в брифе №7: `git pull` (HEAD ≥ 4ca894a) → `docker compose up -d` →
 `uv sync --extra local-emb` → `uv run codegraph doctor` →
 `uv run pytest -m "scip and falkordb" tests/eval/test_m10_gate.py -q --junit-xml=/tmp/g.xml`
